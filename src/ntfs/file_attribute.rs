@@ -1,7 +1,5 @@
 use std::ops::Range;
 
-const ATTRIBUTE_DATA_OFFSET: usize = 0x18;
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
 pub enum AttributeType {

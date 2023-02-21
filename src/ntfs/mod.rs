@@ -6,6 +6,7 @@ use windows::Win32::System::Diagnostics::Debug::{FormatMessageW, FORMAT_MESSAGE_
 pub mod file_attribute;
 pub mod file_record;
 pub mod volume;
+pub mod mft;
 
 pub fn get_last_error_message() -> Result<String> {
     let mut buf = [0u16; 500];

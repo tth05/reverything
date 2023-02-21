@@ -1,14 +1,12 @@
-use std::ffi::c_void;
+use std::ffi::OsString;
+use std::ops::Range;
+use std::os::windows::ffi::OsStringExt;
+use std::process::exit;
 
-use eyre::{eyre, Result};
+use eyre::{ContextCompat, Result};
 use widestring::Utf16Str;
-use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-use windows::Win32::Storage::FileSystem::ReadFile;
-use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
-use windows::Win32::System::IO::OVERLAPPED;
 
 use crate::ntfs::file_attribute::{Attribute, AttributeType};
-use crate::ntfs::volume::create_overlapped;
 
 pub struct FileRecord<'a> {
     pub header: &'a FileRecordHeader,
@@ -64,71 +62,43 @@ impl<'a> FileRecord<'a> {
         })
     }
 
-    pub fn read_data_attribute(&self, handle: HANDLE, bytes_per_cluster: usize) -> Result<Vec<u8>> {
-        let Some((total_size, runs)) = self
-            .get_attribute(AttributeType::Data)
-            .and_then(|a| a.decode_data_runs(bytes_per_cluster)) else {
-            return Err(eyre!("Cannot find data attribute"));
-        };
-
-        let mut buf = Vec::<u8>::with_capacity(total_size);
-        let mut read_offset = 0usize;
-
-        let mut events = Vec::with_capacity(runs.len());
-        for run in runs {
-            let mut ov = create_overlapped(run.start);
-
-            let event_handle =
-                unsafe { CreateEventW(None, false, false, None) }.expect("CreateEventW failed");
-            ov.hEvent = event_handle;
-            events.push(event_handle);
-
-            unsafe {
-                ReadFile(
-                    handle,
-                    Some((buf.as_mut_ptr() as *mut c_void).add(read_offset)),
-                    run.len() as u32,
-                    None,
-                    Some(&mut ov as *mut OVERLAPPED),
-                )
-            };
-
-            read_offset += run.len();
-        }
-
-        unsafe {
-            let res = WaitForMultipleObjects(&events, true, 50000u32);
-            if res != WAIT_OBJECT_0 {
-                return Err(eyre!("WaitForMultipleObjects failed {:?}", res));
-            }
-
-            buf.set_len(total_size)
-        }
-
-        Ok(buf)
+    pub fn read_data_runs(&self, bytes_per_cluster: usize) -> Result<(usize, Vec<Range<usize>>)> {
+        self.get_attribute(AttributeType::Data)
+            .and_then(|a| a.decode_data_runs(bytes_per_cluster))
+            .with_context(|| "Cannot find data attribute")
     }
 
-    pub fn get_file_name(&self) -> Option<&Utf16Str> {
+    pub fn get_file_name_info(&self) -> Option<(u64, String)> {
         self.attributes()
             .filter(|a| {
                 let attribute_type = a.header.attribute_type;
                 attribute_type == AttributeType::FileName && !a.header.non_resident
             })
-            .filter_map(|a| unsafe {
+            .filter(|a| unsafe {
                 let base = a.header.last.resident.value_offset as usize + 0x38;
                 let flags = a.data[base..base + 4].align_to::<u32>().1[0];
-                if flags & 0x0400 != 0 {
-                    // Skip reparse points
-                    return None;
-                }
-
+                // Skip reparse points
+                flags & 0x0400 == 0
+            })
+            .last()
+            .map(|a| unsafe {
                 let base = a.header.last.resident.value_offset as usize + 0x40;
                 let length = a.data[base] as usize * 2;
                 let name = &a.data[base + 2..base + 2 + length];
+                let base = base - 0x40;
+                let parent: u64 =
+                    u64::from_le_bytes(a.data[base..base + 8].try_into().unwrap()) & 0x0000_ffff_ffff_ffff;
 
-                Some(Utf16Str::from_slice_unchecked(name.align_to::<u16>().1))
+               /* if OsString::from_wide(name.align_to().1).to_string_lossy().to_string() {
+                    println!("Invalid file name: {:?} {:?}", name, name.align_to::<u16>());
+                    exit(0);
+                }*/
+
+                (
+                    parent,
+                    OsString::from_wide(name.align_to().1).to_string_lossy().into_owned(),
+                )
             })
-            .last()
     }
 
     pub fn fixup(data: &mut [u8], sector_size: usize) {
