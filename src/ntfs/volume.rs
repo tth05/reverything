@@ -3,11 +3,11 @@ use windows::core::HSTRING;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetVolumeNameForVolumeMountPointW, SetFilePointer, FILE_ACCESS_FLAGS, FILE_BEGIN,
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, INVALID_SET_FILE_POINTER,
+    FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, INVALID_SET_FILE_POINTER,
     OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
-use windows::Win32::System::IO::DeviceIoControl;
+use windows::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
 
 use super::get_last_error_message;
 
@@ -19,26 +19,21 @@ pub fn create_file_handle(path: &str, access: FILE_ACCESS_FLAGS) -> Result<HANDL
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES::default(),
+            FILE_FLAG_OVERLAPPED,
             None,
         )
         .with_context(|| format!("CreateFileW failed for '{path}'"))
     }
 }
 
-pub fn offset_file_pointer(handle: HANDLE, move_distance: i64) -> Result<()> {
-    let low = move_distance as i32;
-    let mut high = (move_distance >> 32) as i32;
-    if unsafe { SetFilePointer(handle, low, Some(&mut high as *mut i32), FILE_BEGIN) }
-        == INVALID_SET_FILE_POINTER
-    {
-        Err(eyre!(
-            "SetFilePointer failed with '{}'",
-            get_last_error_message().unwrap()
-        ))
-    } else {
-        Ok(())
-    }
+pub fn create_overlapped(offset: usize) -> OVERLAPPED {
+    let low = offset & 0xffffffff;
+    let high = offset >> 32;
+    let mut ov = OVERLAPPED::default();
+    ov.Anonymous.Anonymous.Offset = low as u32;
+    ov.Anonymous.Anonymous.OffsetHigh = high as u32;
+
+    ov
 }
 
 pub fn query_volume_data(handle: HANDLE) -> Result<NTFS_VOLUME_DATA_BUFFER> {

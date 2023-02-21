@@ -1,11 +1,14 @@
-use crate::ntfs::file_attribute::{Attribute, AttributeType};
-use crate::ntfs::volume::offset_file_pointer;
 use std::ffi::c_void;
-use eyre::{Result, eyre};
+
+use eyre::{eyre, Result};
 use widestring::Utf16Str;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::ReadFile;
-use crate::ntfs::get_last_error_message;
+use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
+use windows::Win32::System::IO::OVERLAPPED;
+
+use crate::ntfs::file_attribute::{Attribute, AttributeType};
+use crate::ntfs::volume::create_overlapped;
 
 pub struct FileRecord<'a> {
     pub header: &'a FileRecordHeader,
@@ -43,6 +46,10 @@ impl<'a> FileRecord<'a> {
         self.header.magic == *b"FILE"
     }
 
+    pub fn is_used(&self) -> bool {
+        self.header.flags & 0x1 != 0
+    }
+
     pub fn attributes(&self) -> impl Iterator<Item = Attribute> {
         AttributeIterator {
             file: self,
@@ -66,50 +73,86 @@ impl<'a> FileRecord<'a> {
 
         let mut buf = Vec::<u8>::with_capacity(total_size);
         let mut read_offset = 0usize;
-        for run in runs {
-            offset_file_pointer(handle, run.start as i64)?;
 
-            let mut just_read = 0u32;
-            let res = unsafe {
+        let mut events = Vec::with_capacity(runs.len());
+        for run in runs {
+            let mut ov = create_overlapped(run.start);
+
+            let event_handle =
+                unsafe { CreateEventW(None, false, false, None) }.expect("CreateEventW failed");
+            ov.hEvent = event_handle;
+            events.push(event_handle);
+
+            unsafe {
                 ReadFile(
                     handle,
                     Some((buf.as_mut_ptr() as *mut c_void).add(read_offset)),
                     run.len() as u32,
-                    Some(&mut just_read as *mut u32),
                     None,
+                    Some(&mut ov as *mut OVERLAPPED),
                 )
             };
-
-            if !res.as_bool() {
-                return Err(eyre!("ReadFile failed"));
-            }
-
-            println!("just_read: {} {} {:?} {:?}", res.0, just_read, run, run.len());
 
             read_offset += run.len();
         }
 
-        unsafe { buf.set_len(total_size) };
+        unsafe {
+            let res = WaitForMultipleObjects(&events, true, 50000u32);
+            if res != WAIT_OBJECT_0 {
+                return Err(eyre!("WaitForMultipleObjects failed {:?}", res));
+            }
+
+            buf.set_len(total_size)
+        }
+
         Ok(buf)
     }
 
     pub fn get_file_name(&self) -> Option<&Utf16Str> {
-        self.attributes().filter(|a| {
-            let attribute_type = a.header.attribute_type;
-            attribute_type == AttributeType::FileName && !a.header.non_resident
-        }).filter_map(|a| unsafe {
-            let base = a.header.last.resident.value_offset as usize + 0x38;
-            let flags = a.data[base..base + 4].align_to::<u32>().1[0];
-            if flags & 0x0400 != 0 {
-                return None;
-            }
+        self.attributes()
+            .filter(|a| {
+                let attribute_type = a.header.attribute_type;
+                attribute_type == AttributeType::FileName && !a.header.non_resident
+            })
+            .filter_map(|a| unsafe {
+                let base = a.header.last.resident.value_offset as usize + 0x38;
+                let flags = a.data[base..base + 4].align_to::<u32>().1[0];
+                if flags & 0x0400 != 0 {
+                    // Skip reparse points
+                    return None;
+                }
 
-            let base = a.header.last.resident.value_offset as usize + 0x40;
-            let length = a.data[base] as usize * 2;
-            let name = &a.data[base + 2..base + 2 + length];
+                let base = a.header.last.resident.value_offset as usize + 0x40;
+                let length = a.data[base] as usize * 2;
+                let name = &a.data[base + 2..base + 2 + length];
 
-            Some(Utf16Str::from_slice_unchecked(name.align_to::<u16>().1))
-        }).last()
+                Some(Utf16Str::from_slice_unchecked(name.align_to::<u16>().1))
+            })
+            .last()
+    }
+
+    pub fn fixup(data: &mut [u8], sector_size: usize) {
+        let file = FileRecord::new(data);
+        if !file.is_valid() {
+            return;
+        }
+
+        let us_offset = file.header.usa_offset as usize;
+        let usa_size = file.header.usa_word_count as usize * 2;
+
+        let start = us_offset + 2;
+        let end = start + (usa_size - 2);
+
+        let mut sector_offset = sector_size - 2;
+        for offset in (start..end).step_by(2) {
+            let mut buf = [0u8; 2];
+            buf.copy_from_slice(&data[offset..offset + 2]);
+
+            debug_assert!(data[sector_offset..sector_offset + 2] == data[start - 2..start]);
+
+            data[sector_offset..sector_offset + 2].copy_from_slice(&buf);
+            sector_offset += sector_size;
+        }
     }
 }
 

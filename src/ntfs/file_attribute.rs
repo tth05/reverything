@@ -44,29 +44,47 @@ impl<'a> Attribute<'a> {
                 return None;
             }
 
+            let total_size = self.header.last.non_resident.real_size as usize;
+            if total_size == 0 {
+                return Some((0, Vec::new()));
+            }
+
+            let data = {
+                let start = self.header.last.non_resident.data_runs_offset as usize;
+                let end = start + self.header.length as usize;
+                &self.data[start..end]
+            };
+
             let mut data_runs = Vec::new();
-            let mut offset = self.header.last.non_resident.data_runs_offset as usize;
-            let mut total_size = 0usize;
+            let mut offset = 0usize;
             let mut previous_offset = 0usize;
 
-            while self.data[offset] != 0 {
+            while data[offset] != 0 {
                 // Read header
-                let cluster_count_size = (self.data[offset] & 0xF) as usize;
-                let cluster_offset_size = (self.data[offset] >> 4) as usize;
+                let cluster_count_size = (data[offset] & 0xF) as usize;
+                let cluster_offset_size = (data[offset] >> 4) as usize;
+                debug_assert!(cluster_count_size > 0 && cluster_count_size <= 8);
+                debug_assert!(cluster_offset_size > 0 && cluster_offset_size <= 8);
+
                 offset += 1;
 
                 // Read run length
                 let mut buf: [u8; 8] = [0; 8];
                 buf[..cluster_count_size]
-                    .copy_from_slice(&self.data[offset..offset + cluster_count_size]);
-                let cluster_count = i64::from_le_bytes(buf);
+                    .copy_from_slice(&data[offset..offset + cluster_count_size]);
+                let cluster_count = usize::from_le_bytes(buf);
 
                 offset += cluster_count_size;
 
                 // Read run offset
                 buf[..cluster_offset_size]
-                    .copy_from_slice(&self.data[offset..offset + cluster_offset_size]);
+                    .copy_from_slice(&data[offset..offset + cluster_offset_size]);
                 let cluster_offset = i64::from_le_bytes(buf);
+                let empty_bits = (8 - cluster_offset_size) * 8;
+                // This is basically a sign extension, required because we're putting a signed
+                // number into a buffer that's most likely bigger than the number of bits we need,
+                // which leads to the sign bit being 0.
+                let cluster_offset = (cluster_offset << empty_bits) >> empty_bits;
 
                 offset += cluster_offset_size;
 
@@ -78,9 +96,8 @@ impl<'a> Attribute<'a> {
                 };
                 previous_offset = start;
 
-                let run_size = cluster_count as usize * bytes_per_cluster;
+                let run_size = cluster_count * bytes_per_cluster;
                 data_runs.push(start..start + run_size);
-                total_size += run_size;
             }
 
             Some((total_size, data_runs))
