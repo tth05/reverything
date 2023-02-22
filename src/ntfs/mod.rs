@@ -7,6 +7,7 @@ pub mod file_attribute;
 pub mod file_record;
 pub mod volume;
 pub mod mft;
+pub mod index;
 
 pub fn get_last_error_message() -> Result<String> {
     let mut buf = [0u16; 500];

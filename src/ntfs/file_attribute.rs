@@ -61,8 +61,6 @@ impl<'a> Attribute<'a> {
                 // Read header
                 let cluster_count_size = (data[offset] & 0xF) as usize;
                 let cluster_offset_size = (data[offset] >> 4) as usize;
-                debug_assert!(cluster_count_size > 0 && cluster_count_size <= 8);
-                debug_assert!(cluster_offset_size > 0 && cluster_offset_size <= 8);
 
                 offset += 1;
 
