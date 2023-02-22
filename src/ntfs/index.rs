@@ -82,6 +82,10 @@ impl NtfsVolumeIndex {
         }
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &FileInfo> {
+        self.infos.iter().filter_map(|info| info.as_ref())
+    }
+
     pub fn volume(&self) -> Volume {
         self.volume
     }
