@@ -1,10 +1,7 @@
-use std::ffi::OsString;
 use std::ops::Range;
-use std::os::windows::ffi::OsStringExt;
-use std::process::exit;
 
 use eyre::{ContextCompat, Result};
-use widestring::Utf16Str;
+use widestring::Utf16String;
 
 use crate::ntfs::file_attribute::{Attribute, AttributeType};
 
@@ -68,7 +65,8 @@ impl<'a> FileRecord<'a> {
             .with_context(|| "Cannot find data attribute")
     }
 
-    pub fn get_file_name_info(&self) -> Option<(u64, String)> {
+    pub fn get_file_name_info(&self) -> Option<(u64, Utf16String)> {
+        let mut found = false;
         self.attributes()
             .filter(|a| {
                 let attribute_type = a.header.attribute_type;
@@ -80,23 +78,31 @@ impl<'a> FileRecord<'a> {
                 // Skip reparse points
                 flags & 0x0400 == 0
             })
+            .take_while(|a| unsafe {
+                if found {
+                    return false;
+                }
+
+                let namespace = a.data[a.header.last.resident.value_offset as usize + 0x41];
+                // If the name is in this namespace, then it is the one we want
+                if namespace == /* Win */ 1 || namespace == /* WinAndDOS */ 3 {
+                    found = true;
+                }
+
+                true
+            })
             .last()
             .map(|a| unsafe {
                 let base = a.header.last.resident.value_offset as usize + 0x40;
                 let length = a.data[base] as usize * 2;
                 let name = &a.data[base + 2..base + 2 + length];
                 let base = base - 0x40;
-                let parent: u64 =
-                    u64::from_le_bytes(a.data[base..base + 8].try_into().unwrap()) & 0x0000_ffff_ffff_ffff;
-
-               /* if OsString::from_wide(name.align_to().1).to_string_lossy().to_string() {
-                    println!("Invalid file name: {:?} {:?}", name, name.align_to::<u16>());
-                    exit(0);
-                }*/
+                let parent: u64 = u64::from_le_bytes(a.data[base..base + 8].try_into().unwrap())
+                    & 0x0000_ffff_ffff_ffff;
 
                 (
                     parent,
-                    OsString::from_wide(name.align_to().1).to_string_lossy().into_owned(),
+                    Utf16String::from_slice_lossy(name.align_to().1).into_owned(),
                 )
             })
     }
