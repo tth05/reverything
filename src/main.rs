@@ -1,15 +1,18 @@
 #![feature(let_chains)]
-#![feature(iter_collect_into)]
 
 use std::time::Instant;
 
 use eyre::{ContextCompat, Result};
+use mimalloc::MiMalloc;
 use widestring::Utf16String;
 
 use crate::ntfs::index::NtfsVolumeIndex;
 use crate::ntfs::volume::get_volumes;
 
 mod ntfs;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 pub struct FileInfo {
     name: Utf16String,
@@ -31,6 +34,12 @@ fn main() -> Result<()> {
         index.compute_full_path(info),
     );
 
+    let mut s = 0usize;
+    index.iter().for_each(|info| {
+        s += index.compute_full_path(info).len();
+    });
+
+    println!("{}", s);
     println!("Elapsed: {:?}", t.elapsed());
 
     Ok(())
