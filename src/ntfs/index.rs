@@ -1,9 +1,9 @@
 use std::ffi::c_void;
 use std::ops::Range;
 
-use eyre::{eyre, Result};
+use eyre::{Context, Report, Result};
 use rayon::prelude::*;
-use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Storage::FileSystem::ReadFile;
 use windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER;
 use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
@@ -11,6 +11,7 @@ use windows::Win32::System::IO::OVERLAPPED;
 
 use crate::ntfs::file_record::FileRecord;
 use crate::ntfs::mft::MftFile;
+use crate::ntfs::try_close_handle;
 use crate::ntfs::volume::{create_overlapped, Volume};
 use crate::FileInfo;
 
@@ -200,17 +201,19 @@ fn read_runs_from_disk(volume: Volume, runs: RunGroup) -> Result<Vec<u8>> {
 
     unsafe {
         let res = WaitForMultipleObjects(&events, true, 50000);
-        events.iter().for_each(|&e| {
-            CloseHandle(e);
-        });
-        CloseHandle(handle);
+        events
+            .iter()
+            .chain(std::iter::once(&handle))
+            .try_for_each(|&e| try_close_handle(e))?;
 
         if res != WAIT_OBJECT_0 {
-            return Err(eyre!(
-                "WaitForMultipleObjects failed {:?} {:?}",
-                res.0 as i32,
-                std::thread::current().id()
-            ));
+            return Err(Report::new(std::io::Error::last_os_error())).with_context(|| {
+                format!(
+                    "WaitForMultipleObjects failed {:?} {:?}",
+                    res.0 as i32,
+                    std::thread::current().id()
+                )
+            });
         }
 
         buffer.set_len(buffer.capacity());

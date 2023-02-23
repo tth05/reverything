@@ -1,6 +1,6 @@
-use eyre::{eyre, Context, Result};
+use eyre::{eyre, Context, Report, Result};
 use windows::core::HSTRING;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetVolumeNameForVolumeMountPointW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
     FILE_READ_DATA, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -8,7 +8,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
 use windows::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
 
-use super::get_last_error_message;
+use crate::ntfs::try_close_handle;
 
 #[derive(Debug, Copy, Clone)]
 pub struct Volume {
@@ -45,15 +45,13 @@ impl Volume {
                 None,
                 None,
             );
-            assert!(CloseHandle(handle).as_bool());
+            try_close_handle(handle)?;
             res
         };
 
         if !res.as_bool() {
-            return Err(eyre!(
-                "DeviceIoControl failed with '{}'",
-                get_last_error_message().unwrap()
-            ));
+            return Err(Report::new(std::io::Error::last_os_error()))
+                .with_context(|| "DeviceIoControl failed");
         }
 
         Ok(data)

@@ -1,13 +1,12 @@
-use eyre::{Result, eyre};
-use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+use eyre::{Report, Result};
+use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Storage::FileSystem::ReadFile;
 use windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER;
 use windows::Win32::System::Threading::WaitForSingleObject;
 
 use crate::ntfs::file_record::FileRecord;
+use crate::ntfs::try_close_handle;
 use crate::ntfs::volume::{create_overlapped, Volume};
-
-use super::get_last_error_message;
 
 pub struct MftFile {
     data: Vec<u8>,
@@ -31,12 +30,10 @@ impl MftFile {
             );
 
             if WaitForSingleObject(handle, 1000) != WAIT_OBJECT_0 {
-                return Err(eyre!(
-                "ReadFile failed '{:?}'",
-                get_last_error_message().unwrap()
-            ));
+                return Err(Report::new(std::io::Error::last_os_error()));
             }
-            assert!(CloseHandle(handle).as_bool());
+
+            try_close_handle(handle)?;
 
             mft_file_buf.set_len(mft_file_buf.capacity());
         }
