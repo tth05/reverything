@@ -3,7 +3,6 @@ use std::ops::Range;
 
 use eyre::{eyre, Result};
 use rayon::prelude::*;
-use widestring::Utf16String;
 use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::ReadFile;
 use windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER;
@@ -51,7 +50,7 @@ impl NtfsVolumeIndex {
             .and_then(|info| info.as_ref())
     }
 
-    pub fn compute_full_path(&self, file_info: &FileInfo) -> Utf16String {
+    pub fn compute_full_path(&self, file_info: &FileInfo) -> String {
         let mut path_size = 0usize;
         let mut path = Vec::with_capacity(5);
         self.iter_with_parents(file_info).for_each(|f| {
@@ -59,12 +58,12 @@ impl NtfsVolumeIndex {
             path_size += f.name.len() + 1;
         });
 
-        let mut out = Utf16String::with_capacity(2 + path_size);
+        let mut out = String::with_capacity(2 + path_size);
         out.push(self.volume.id.to_ascii_uppercase());
         out.push(':');
         path.iter().rev().for_each(|&s| {
             out.push('\\');
-            out.push_utfstr(s);
+            out.push_str(s);
         });
 
         debug_assert!(out.capacity() == 2 + path_size);

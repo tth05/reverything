@@ -1,7 +1,6 @@
 use std::ops::Range;
 
 use eyre::{ContextCompat, Result};
-use widestring::Utf16String;
 
 use crate::ntfs::file_attribute::{Attribute, AttributeType};
 
@@ -65,7 +64,7 @@ impl<'a> FileRecord<'a> {
             .with_context(|| "Cannot find data attribute")
     }
 
-    pub fn get_file_name_info(&self) -> Option<(u64, Utf16String)> {
+    pub fn get_file_name_info(&self) -> Option<(u64, String)> {
         let mut found = false;
         self.attributes()
             .filter(|a| {
@@ -102,7 +101,7 @@ impl<'a> FileRecord<'a> {
 
                 (
                     parent,
-                    Utf16String::from_slice_lossy(name.align_to().1).into_owned(),
+                    String::from_utf16_lossy(name.align_to().1),
                 )
             })
     }

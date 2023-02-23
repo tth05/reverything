@@ -19,6 +19,5 @@ windows = { version = "0.44.0", default-features = false, features = [
 mimalloc = { version = "*", default-features = false }
 eyre = "0.6.8"
 rayon = "1.6.1"
-widestring = "1.0.2"
 rustc-hash = "1.1.0"
 num_cpus = "1.15.0"
