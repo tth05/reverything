@@ -29,7 +29,8 @@ enum Better {
 }
 
 fn main() -> Result<()> {
-    println!("{:?}", std::mem::size_of::<Option<FileInfo2>>());
+    color_eyre::install()?;
+
     let t = Instant::now();
     let vol = get_volumes()
         .into_iter()
