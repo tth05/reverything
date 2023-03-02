@@ -6,6 +6,7 @@ use eyre::{ContextCompat, Result};
 use mimalloc::MiMalloc;
 
 use crate::ntfs::index::NtfsVolumeIndex;
+use crate::ntfs::journal::Journal;
 use crate::ntfs::volume::get_volumes;
 
 mod ntfs;
@@ -18,16 +19,6 @@ pub struct FileInfo {
     parent: u64,
 }
 
-pub struct FileInfo2 {
-    name: Better,
-    parent: u64,
-}
-
-enum Better {
-    Valid { len: u8, str_pool_idx: u32 },
-    Invalid,
-}
-
 fn main() -> Result<()> {
     color_eyre::install()?;
 
@@ -36,6 +27,11 @@ fn main() -> Result<()> {
         .into_iter()
         .next()
         .with_context(|| "Cannot find first volume")?;
+
+    if true {
+        let j = Journal::new(vol)?;
+        return Ok(());
+    }
 
     let index = NtfsVolumeIndex::new(vol)?;
 

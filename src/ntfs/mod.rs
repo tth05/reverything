@@ -3,6 +3,7 @@ pub mod file_record;
 pub mod volume;
 pub mod mft;
 pub mod index;
+pub mod journal;
 
 pub fn try_close_handle(handle: windows::Win32::Foundation::HANDLE) -> eyre::Result<()> {
     use eyre::WrapErr;

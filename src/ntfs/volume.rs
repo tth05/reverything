@@ -20,7 +20,7 @@ impl Volume {
         unsafe {
             CreateFileW(
                 &HSTRING::from(&format!("\\\\.\\{}:", self.id)),
-                FILE_GENERIC_READ | FILE_READ_DATA,
+                FILE_GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
