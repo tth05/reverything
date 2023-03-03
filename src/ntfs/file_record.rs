@@ -44,6 +44,10 @@ impl<'a> FileRecord<'a> {
         self.header.flags & 0x1 != 0
     }
 
+    pub fn is_directory(&self) -> bool {
+        self.header.flags & 0x2 != 0
+    }
+
     pub fn attributes(&self) -> impl Iterator<Item = Attribute> {
         AttributeIterator {
             file: self,
