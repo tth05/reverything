@@ -8,6 +8,7 @@ use crate::ntfs::file_record::FileRecord;
 use crate::ntfs::try_close_handle;
 use crate::ntfs::volume::{create_overlapped, Volume};
 
+#[derive(Debug)]
 pub struct MftFile {
     data: Vec<u8>,
 }
