@@ -14,9 +14,11 @@ mod ntfs;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+#[derive(Debug)]
 pub struct FileInfo {
     name: String,
     parent: u64,
+    is_directory: bool,
 }
 
 fn main() -> Result<()> {
