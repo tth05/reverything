@@ -31,9 +31,19 @@ fn main() -> Result<()> {
         .with_context(|| "Cannot find first volume")?;
 
     if true {
-        let j = Journal::new(vol)?;
+        let mut j = Journal::new(vol)?;
+        let mut i = 0;
+        loop {
+            let vec = j.read_entries()?;
+            if vec.is_empty() {
+                break;
+            }
+            println!("{} {:?}", i, vec);
+            i += 1;
+        }
         return Ok(());
     }
+
 
     let index = NtfsVolumeIndex::new(vol)?;
 
