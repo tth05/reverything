@@ -19,7 +19,7 @@ const ROOT_INDEX: u64 = 5;
 
 pub struct NtfsVolumeIndex {
     volume: Volume,
-    infos: Vec<Option<FileInfo>>,
+    infos: Vec<FileInfo>,
 }
 
 impl NtfsVolumeIndex {
@@ -27,28 +27,49 @@ impl NtfsVolumeIndex {
         let volume_data = volume.query_volume_data()?;
         let mft_file = MftFile::new(volume, volume_data)?;
 
+        let mut files = process_mft_data(
+            volume,
+            mft_file
+                .as_record()
+                .read_data_runs(volume_data.BytesPerCluster as usize)?,
+        )?;
+
+        // Contains a mapping of file records ids as if the None entries were not present
+        let mut ids = Vec::with_capacity(files.len());
+        let mut id = 0u64;
+        for x in &files {
+            match x {
+                Some(_) => {
+                    ids.push(id);
+                    id += 1;
+                }
+                None => ids.push(0),
+            }
+        }
+
+        files.retain(|a| a.is_some());
+        // Map the parent ids to the new ids
+        let files = files
+            .into_iter()
+            .map(|f| f.unwrap())
+            .map(|mut f| {
+                f.parent = ids[f.parent as usize];
+                f
+            })
+            .collect();
+
         Ok(Self {
             volume,
-            infos: process_mft_data(
-                volume,
-                mft_file
-                    .as_record()
-                    .read_data_runs(volume_data.BytesPerCluster as usize)?,
-            )?,
+            infos: files,
         })
     }
 
     pub fn find_by_name(&self, name: &str) -> Option<&FileInfo> {
-        self.infos.par_iter().find_map_first(|info| {
-            info.as_ref()
-                .and_then(|info| if info.name == name { Some(info) } else { None })
-        })
+        self.infos.par_iter().find_first(|info| info.name == name)
     }
 
     pub fn find_by_index(&self, index: u64) -> Option<&FileInfo> {
-        self.infos
-            .get(index as usize)
-            .and_then(|info| info.as_ref())
+        self.infos.get(index as usize)
     }
 
     pub fn compute_full_path(&self, file_info: &FileInfo) -> String {
@@ -83,7 +104,7 @@ impl NtfsVolumeIndex {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &FileInfo> {
-        self.infos.iter().filter_map(|info| info.as_ref())
+        self.infos.iter()
     }
 
     pub fn volume(&self) -> Volume {
@@ -146,7 +167,11 @@ fn process_mft_data(
                                 return None;
                             };
 
-                            Some(FileInfo { name, parent })
+                            Some(FileInfo {
+                                name,
+                                parent,
+                                is_directory: record.is_directory(),
+                            })
                         })
                         .collect())
                 })
@@ -230,6 +255,7 @@ fn distribute_runs_to_cpus(
 ) -> Vec<RunGroup> {
     let cpus = num_cpus::get_physical();
     let run_size = total_size / cpus;
+    let run_size = run_size - (run_size % volume_data.BytesPerCluster as usize);
 
     // Distribute runs evenly
     let mut run_groups = Vec::with_capacity(cpus);
@@ -241,14 +267,11 @@ fn distribute_runs_to_cpus(
             let run = runs.remove(0);
 
             let run_len = run.len();
+            assert_eq!(run_len % volume_data.BytesPerCluster as usize, 0);
             // Get as close as possible to the run size, but don't split runs into non-cluster
             // aligned chunks
-            if run_group_size + run_len > run_size
-                && run_len % volume_data.BytesPerCluster as usize == 0
-            {
-                let split = run_group_size + run.len() - run_size;
-                // Round to cluster boundary
-                let split = split - (split % volume_data.BytesPerCluster as usize);
+            if run_group_size + run_len > run_size {
+                let split = run_group_size + run_len - run_size;
                 // Push back the remaining part of the run
                 runs.insert(0, run.start + split..run.end);
                 // Give the second part to the current group
