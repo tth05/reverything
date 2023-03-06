@@ -22,6 +22,10 @@ color-eyre = "0.6.2"
 rayon = "1.6.1"
 rustc-hash = "1.1.0"
 num_cpus = "1.15.0"
+glium = "0.32.1"
+imgui = "0.10.0"
+imgui-winit-support = "0.10.0"
+imgui-glium-renderer = "0.10.0"
 
 [profile.dev.package.backtrace]
 opt-level = 3

@@ -21,7 +21,7 @@ use windows::Win32::System::IO::DeviceIoControl;
 use crate::ntfs::try_close_handle;
 use crate::ntfs::volume::Volume;
 
-const MAX_HISTORY_SIZE: usize = 1000;
+const MAX_UNMATCHED_RENAMES: usize = 1000;
 
 pub struct Journal {
     handle: HANDLE,
@@ -118,7 +118,7 @@ impl Journal {
                 let file_path = self.compute_full_path(record)?;
 
                 if record.Reason & USN_REASON_RENAME_OLD_NAME != 0 {
-                    if self.unmatched_renames.len() >= MAX_HISTORY_SIZE {
+                    if self.unmatched_renames.len() >= MAX_UNMATCHED_RENAMES {
                         self.unmatched_renames.pop_front();
                     }
 
