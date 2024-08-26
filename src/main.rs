@@ -1,6 +1,5 @@
 #![feature(let_chains)]
 
-use std::io::Write;
 use std::time::Instant;
 
 use crate::ntfs::index::{FileInfo, NtfsVolumeIndex};
