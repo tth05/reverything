@@ -31,7 +31,7 @@ pub struct FileInfo {
 impl FileInfo {
     pub fn new(size: u64, is_directory: bool, parent: u64, name: SmartString<Compact>) -> Self {
         assert!(size <= 0x7FFF_FFFF_FFFF_FFFF);
-        
+
         Self {
             name,
             parent,
@@ -52,7 +52,6 @@ impl NtfsVolumeIndex {
     pub fn new(volume: Volume) -> Result<NtfsVolumeIndex> {
         let volume_data = volume.query_volume_data()?;
         let mft_file = MftFile::new(volume, volume_data)?;
-        println!("{:?}", mft_file.as_record().header);
 
         let mut files = process_mft_data(
             volume,
@@ -166,6 +165,7 @@ fn process_mft_data(
     let volume_data = volume.query_volume_data()?;
 
     let run_groups = distribute_runs_to_cpus(volume_data, (total_size, runs));
+    println!("{:?}", run_groups);
 
     let file_infos = std::thread::scope(|s| {
         // Spawn all threads
@@ -296,7 +296,7 @@ fn distribute_runs_to_cpus(
             // Get as close as possible to the run size, but don't split runs into non-cluster
             // aligned chunks
             if run_group_size + run_len > run_size {
-                let split = run_group_size + run_len - run_size;
+                let split = run_size - run_group_size;
                 // Push back the remaining part of the run
                 runs.insert(0, run.start + split..run.end);
                 // Give the second part to the current group
