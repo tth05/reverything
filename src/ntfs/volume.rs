@@ -1,9 +1,8 @@
-use eyre::{eyre, Context, Report, Result};
+use eyre::{Context, Report, Result};
 use windows::core::HSTRING;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetVolumeNameForVolumeMountPointW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
-    FILE_READ_DATA, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, GetVolumeNameForVolumeMountPointW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
 use windows::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
@@ -20,7 +19,7 @@ impl Volume {
         unsafe {
             CreateFileW(
                 &HSTRING::from(&format!("\\\\.\\{}:", self.id)),
-                FILE_GENERIC_READ,
+                FILE_GENERIC_READ.0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
@@ -49,7 +48,7 @@ impl Volume {
             res
         };
 
-        if !res.as_bool() {
+        if res.is_err() {
             return Err(Report::new(std::io::Error::last_os_error()))
                 .with_context(|| "DeviceIoControl failed");
         }
@@ -62,8 +61,10 @@ pub fn create_overlapped(offset: usize) -> OVERLAPPED {
     let low = offset & 0xffffffff;
     let high = offset >> 32;
     let mut ov = OVERLAPPED::default();
-    ov.Anonymous.Anonymous.Offset = low as u32;
-    ov.Anonymous.Anonymous.OffsetHigh = high as u32;
+    unsafe {
+        ov.Anonymous.Anonymous.Offset = low as u32;
+        ov.Anonymous.Anonymous.OffsetHigh = high as u32;
+    }
 
     ov
 }
@@ -76,7 +77,7 @@ pub fn get_volumes() -> Vec<Volume> {
             unsafe {
                 GetVolumeNameForVolumeMountPointW(&HSTRING::from(&format!("{}:\\", c)), &mut buf)
             }
-            .as_bool()
+            .is_ok()
         })
         .map(|c| Volume { id: c })
         .collect()

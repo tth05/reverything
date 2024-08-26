@@ -1,8 +1,8 @@
-use std::ffi::c_void;
 use std::ops::Range;
 
 use eyre::{Context, Report, Result};
 use rayon::prelude::*;
+use smartstring::{Compact, SmartString, SmartStringMode};
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Storage::FileSystem::ReadFile;
 use windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER;
@@ -13,7 +13,6 @@ use crate::ntfs::file_record::FileRecord;
 use crate::ntfs::mft::MftFile;
 use crate::ntfs::try_close_handle;
 use crate::ntfs::volume::{create_overlapped, Volume};
-use crate::FileInfo;
 
 const ROOT_INDEX: u64 = 5;
 
@@ -22,10 +21,38 @@ pub struct NtfsVolumeIndex {
     infos: Vec<FileInfo>,
 }
 
+#[derive(Debug)]
+pub struct FileInfo {
+    pub name: SmartString<Compact>,
+    parent: u64,
+    size_and_directory: u64,
+}
+
+impl FileInfo {
+    pub fn new(size: u64, is_directory: bool, parent: u64, name: SmartString<Compact>) -> Self {
+        assert!(size <= 0x7FFF_FFFF_FFFF_FFFF);
+        
+        Self {
+            name,
+            parent,
+            size_and_directory: size | (is_directory as u64) << 63,
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size_and_directory & !(1 << 63)
+    }
+
+    pub fn is_directory(&self) -> bool {
+        self.size_and_directory & (1 << 63) != 0
+    }
+}
+
 impl NtfsVolumeIndex {
     pub fn new(volume: Volume) -> Result<NtfsVolumeIndex> {
         let volume_data = volume.query_volume_data()?;
         let mft_file = MftFile::new(volume, volume_data)?;
+        println!("{:?}", mft_file.as_record().header);
 
         let mut files = process_mft_data(
             volume,
@@ -163,15 +190,9 @@ fn process_mft_data(
 
                             FileRecord::fixup(chunk, volume_data.BytesPerSector as usize);
                             let record = FileRecord::new(chunk);
-                            let Some((parent, name)) = record.get_file_name_info() else {
-                                return None;
-                            };
+                            let (size, parent, name) = record.get_file_name_info()?;
 
-                            Some(FileInfo {
-                                name,
-                                parent,
-                                is_directory: record.is_directory(),
-                            })
+                            Some(FileInfo::new(size, record.is_directory(), parent, name))
                         })
                         .collect())
                 })
@@ -200,7 +221,7 @@ fn process_mft_data(
 fn read_runs_from_disk(volume: Volume, runs: RunGroup) -> Result<Vec<u8>> {
     let handle = volume.create_read_handle()?;
     let mut events = Vec::with_capacity(runs.len());
-    let mut buffer = Vec::with_capacity(runs.iter().map(|r| r.len()).sum::<usize>());
+    let mut buffer: Vec<u8> = Vec::with_capacity(runs.iter().map(|r| r.len()).sum::<usize>());
     let mut write_offset = 0usize;
     for run in runs {
         unsafe {
@@ -209,15 +230,19 @@ fn read_runs_from_disk(volume: Volume, runs: RunGroup) -> Result<Vec<u8>> {
 
             let res = ReadFile(
                 handle,
-                Some((buffer.as_mut_ptr() as *mut c_void).add(write_offset)),
-                run.len() as u32,
+                Some(std::slice::from_raw_parts_mut(
+                    buffer.as_mut_ptr().add(write_offset),
+                    run.len(),
+                )),
                 None,
                 Some(&mut ov as *mut OVERLAPPED),
             );
 
             // Might return true if the read is completed immediately
-            if !res.as_bool() {
+            if res.is_err() {
                 events.push(ov.hEvent);
+            } else {
+                try_close_handle(ov.hEvent)?;
             }
 
             write_offset += run.len();

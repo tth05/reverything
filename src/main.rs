@@ -1,35 +1,42 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // Hide console window on Windows in release
 #![feature(let_chains)]
 
-use std::time::{Duration, Instant};
+use std::io::Write;
+use std::time::Instant;
 
-use eyre::{ContextCompat, Result};
-use mimalloc::MiMalloc;
-
-use crate::ntfs::index::NtfsVolumeIndex;
-use crate::ntfs::journal::Journal;
+use crate::ntfs::index::{FileInfo, NtfsVolumeIndex};
 use crate::ntfs::volume::get_volumes;
-use crate::ui::start_ui;
-
+use eyre::{ContextCompat, Result};
+use mimalloc_rust::GlobalMiMalloc;
 
 mod ntfs;
-mod ui;
 
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
-
-#[derive(Debug)]
-pub struct FileInfo {
-    name: String,
-    parent: u64,
-    is_directory: bool,
-}
+static GLOBAL: GlobalMiMalloc = GlobalMiMalloc;
 
 fn main() -> Result<()> {
-    color_eyre::install()?;
+    let index = build_index()?;
+    println!("{}", std::mem::size_of::<FileInfo>());
+    println!(
+        "File count: {}",
+        index
+            .iter()
+            .map(|f| 40 + if !f.name.is_inline() { f.name.len() } else { 0 })
+            .sum::<usize>()
+    );
+    println!(
+        "File count: {}, {}",
+        index.iter().count(),
+        index
+            .iter()
+            .map(|f| index.compute_full_path(f).replace("C:\\", "").len())
+            .sum::<usize>()
+    );
+    println!("bro");
+    let now = Instant::now();
+    println!("{}", index.find_by_name("bscstdlib").unwrap().size());
+    println!("Elapsed: {:?}", now.elapsed());
 
-    start_ui(build_index()?);
-
+    std::thread::sleep(std::time::Duration::from_secs(100));
     Ok(())
 }
 
@@ -39,6 +46,7 @@ fn build_index() -> Result<NtfsVolumeIndex> {
         .into_iter()
         .next()
         .with_context(|| "Cannot find first volume")?;
+    println!("Volume: {:?}", vol);
 
     /*if true {
         let mut j = Journal::new(vol)?;
