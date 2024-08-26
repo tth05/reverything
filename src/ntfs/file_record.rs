@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use eyre::{ContextCompat, Result};
-
+use smartstring::{Compact, SmartString};
 use crate::ntfs::file_attribute::{Attribute, AttributeType};
 
 pub struct FileRecord<'a> {
@@ -68,7 +68,7 @@ impl<'a> FileRecord<'a> {
             .with_context(|| "Cannot find data attribute")
     }
 
-    pub fn get_file_name_info(&self) -> Option<(u64, String)> {
+    pub fn get_file_name_info(&self) -> Option<(u64, u64, SmartString<Compact>)> {
         let mut found = false;
         self.attributes()
             .filter(|a| {
@@ -103,9 +103,13 @@ impl<'a> FileRecord<'a> {
                 let parent: u64 = u64::from_le_bytes(a.data[base..base + 8].try_into().unwrap())
                     & 0x0000_ffff_ffff_ffff;
 
+                let base = a.header.last.resident.value_offset as usize + 0x30;
+                let real_size = u64::from_le_bytes(a.data[base..base + 8].try_into().unwrap());
+                
                 (
+                    real_size,
                     parent,
-                    String::from_utf16_lossy(name.align_to().1),
+                    SmartString::from(String::from_utf16_lossy(name.align_to().1)),
                 )
             })
     }

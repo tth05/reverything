@@ -22,10 +22,9 @@ impl MftFile {
         let mut mft_file_buf = Vec::<u8>::with_capacity(data.BytesPerFileRecordSegment as usize);
 
         unsafe {
-            ReadFile(
+            let _ = ReadFile(
                 handle,
-                Some(mft_file_buf.as_mut_ptr() as *mut _),
-                mft_file_buf.capacity() as u32,
+                Some(std::slice::from_raw_parts_mut(mft_file_buf.as_mut_ptr() as *mut _,mft_file_buf.capacity())),
                 None,
                 Some(&mut ov as *mut _),
             );

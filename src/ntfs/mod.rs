@@ -9,7 +9,7 @@ pub fn try_close_handle(handle: windows::Win32::Foundation::HANDLE) -> eyre::Res
     use eyre::WrapErr;
 
     unsafe {
-        if windows::Win32::Foundation::CloseHandle(handle).as_bool() {
+        if windows::Win32::Foundation::CloseHandle(handle).is_ok() {
             return Ok(());
         }
 

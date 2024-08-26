@@ -5,17 +5,12 @@ use std::path::PathBuf;
 
 use eyre::{eyre, ContextCompat, Report, Result, WrapErr};
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Storage::FileSystem::{
-    ExtendedFileIdType, GetFinalPathNameByHandleW, OpenFileById, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_GENERIC_READ, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_NAME,
-    FILE_SHARE_READ, FILE_SHARE_WRITE,
-};
+use windows::Win32::Storage::FileSystem::{ExtendedFileIdType, GetFinalPathNameByHandleW, OpenFileById, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_SHARE_READ, FILE_SHARE_WRITE, VOLUME_NAME_NONE};
 use windows::Win32::System::Ioctl::{
     FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V1, USN_JOURNAL_DATA_V2,
     USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_RENAME_NEW_NAME,
     USN_REASON_RENAME_OLD_NAME, USN_RECORD_UNION, USN_RECORD_V3,
 };
-use windows::Win32::System::WindowsProgramming::VOLUME_NAME_NONE;
 use windows::Win32::System::IO::DeviceIoControl;
 
 use crate::ntfs::try_close_handle;
@@ -47,7 +42,7 @@ impl Journal {
                 None,
             );
 
-            if !query.as_bool() {
+            if query.is_err() {
                 return Err(Report::new(std::io::Error::last_os_error()))
                     .with_context(|| "DeviceIoControl failed trying to query journal data");
             }
@@ -90,7 +85,7 @@ impl Journal {
                 None,
             );
 
-            if !query.as_bool() {
+            if query.is_err() {
                 return Err(Report::new(std::io::Error::last_os_error()))
                     .with_context(|| "DeviceIoControl failed trying to read journal entries");
             }
@@ -178,7 +173,7 @@ impl Journal {
             let file_handle = OpenFileById(
                 self.handle,
                 &desc as *const _,
-                FILE_GENERIC_READ,
+                FILE_GENERIC_READ.0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 FILE_FLAGS_AND_ATTRIBUTES(0),
@@ -193,7 +188,7 @@ impl Journal {
 
             let mut path_buf = [0u16; 2048];
             let path_length =
-                GetFinalPathNameByHandleW(file_handle, &mut path_buf, FILE_NAME(VOLUME_NAME_NONE));
+                GetFinalPathNameByHandleW(file_handle, &mut path_buf, VOLUME_NAME_NONE);
             try_close_handle(file_handle)?;
 
             if path_length == 0 {
