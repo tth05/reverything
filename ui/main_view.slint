@@ -1,0 +1,27 @@
+import { Button, VerticalBox, StandardTableView, LineEdit } from "std-widgets.slint";
+
+export component App inherits Window {
+    title: "Reverything";
+
+    callback search_input_change(string);
+    in property <[[StandardListViewItem]]> data;
+
+    preferred-width: 1280px;
+    preferred-height: 720px;
+    default-font-size: 15px;
+    VerticalBox {
+        LineEdit {
+            font-size: 1.2rem;
+            placeholder-text: "Search...";
+            edited(text) => { search_input_change(text); }
+        }
+
+        StandardTableView {
+            columns: [
+                { title: "Name" },
+                { title: "Size" },
+            ];
+            rows: root.data;
+        }
+    }
+}

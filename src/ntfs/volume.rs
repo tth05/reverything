@@ -2,7 +2,8 @@ use eyre::{Context, Report, Result};
 use windows::core::HSTRING;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetVolumeNameForVolumeMountPointW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, GetVolumeNameForVolumeMountPointW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
 use windows::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
@@ -61,10 +62,8 @@ pub fn create_overlapped(offset: usize) -> OVERLAPPED {
     let low = offset & 0xffffffff;
     let high = offset >> 32;
     let mut ov = OVERLAPPED::default();
-    unsafe {
-        ov.Anonymous.Anonymous.Offset = low as u32;
-        ov.Anonymous.Anonymous.OffsetHigh = high as u32;
-    }
+    ov.Anonymous.Anonymous.Offset = low as u32;
+    ov.Anonymous.Anonymous.OffsetHigh = high as u32;
 
     ov
 }

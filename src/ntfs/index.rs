@@ -114,8 +114,6 @@ impl NtfsVolumeIndex {
             out.push_str(s);
         });
 
-        debug_assert!(out.capacity() == 2 + path_size);
-
         out
     }
 
@@ -125,7 +123,7 @@ impl NtfsVolumeIndex {
     ) -> impl Iterator<Item = &'a FileInfo> {
         HierarchyIter::<'a> {
             index: self,
-            current: file_info,
+            current: Some(file_info),
         }
     }
 
@@ -136,25 +134,35 @@ impl NtfsVolumeIndex {
     pub fn volume(&self) -> Volume {
         self.volume
     }
+    
+    pub fn file_count(&self) -> usize {
+        self.infos.len()
+    }
 }
 
 struct HierarchyIter<'a> {
     index: &'a NtfsVolumeIndex,
-    current: &'a FileInfo,
+    current: Option<&'a FileInfo>,
 }
 
 impl<'a> Iterator for HierarchyIter<'a> {
     type Item = &'a FileInfo;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current.parent == ROOT_INDEX {
-            return None;
+        match self.current {
+            None => None,
+            Some(current) => {
+                let parent = self.index.find_by_index(current.parent)?;
+                let next = current;
+                self.current = if current.parent == ROOT_INDEX {
+                    None
+                } else {
+                    Some(parent)
+                };
+                
+                Some(next)
+            }
         }
-
-        let parent = self.index.find_by_index(self.current.parent)?;
-        let next = self.current;
-        self.current = parent;
-        Some(next)
     }
 }
 
@@ -165,7 +173,6 @@ fn process_mft_data(
     let volume_data = volume.query_volume_data()?;
 
     let run_groups = distribute_runs_to_cpus(volume_data, (total_size, runs));
-    println!("{:?}", run_groups);
 
     let file_infos = std::thread::scope(|s| {
         // Spawn all threads
@@ -278,7 +285,7 @@ fn distribute_runs_to_cpus(
     volume_data: NTFS_VOLUME_DATA_BUFFER,
     (total_size, mut runs): (usize, RunGroup),
 ) -> Vec<RunGroup> {
-    let cpus = num_cpus::get_physical();
+    let cpus = num_cpus::get_physical() - 1 /* Save one thread for UI */;
     let run_size = total_size / cpus;
     let run_size = run_size - (run_size % volume_data.BytesPerCluster as usize);
 
