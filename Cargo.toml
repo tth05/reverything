@@ -2,6 +2,7 @@
 name = "reverything"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -23,6 +24,10 @@ rayon = "1.6.1"
 rustc-hash = "2.0.0"
 num_cpus = "1.15.0"
 smartstring = "1.0.1"
+slint = "1.7.2"
+
+[build-dependencies]
+slint-build = "1.7.2"
 
 [profile.dev]
 debug = 2

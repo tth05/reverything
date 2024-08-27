@@ -1,41 +1,19 @@
-#![feature(let_chains)]
-
 use std::time::Instant;
 
-use crate::ntfs::index::{FileInfo, NtfsVolumeIndex};
+use crate::ntfs::index::NtfsVolumeIndex;
 use crate::ntfs::volume::get_volumes;
 use eyre::{ContextCompat, Result};
 use mimalloc_rust::GlobalMiMalloc;
 
 mod ntfs;
+mod ui;
 
 #[global_allocator]
 static GLOBAL: GlobalMiMalloc = GlobalMiMalloc;
 
 fn main() -> Result<()> {
     let index = build_index()?;
-    println!("{}", std::mem::size_of::<FileInfo>());
-    println!(
-        "File count: {}",
-        index
-            .iter()
-            .map(|f| 40 + if !f.name.is_inline() { f.name.len() } else { 0 })
-            .sum::<usize>()
-    );
-    println!(
-        "File count: {}, {}",
-        index.iter().count(),
-        index
-            .iter()
-            .map(|f| index.compute_full_path(f).replace("C:\\", "").len())
-            .sum::<usize>()
-    );
-    println!("bro");
-    let now = Instant::now();
-    println!("{}", index.find_by_name("bscstdlib").unwrap().size());
-    println!("Elapsed: {:?}", now.elapsed());
-
-    std::thread::sleep(std::time::Duration::from_secs(100));
+    ui::run_ui(index)?;
     Ok(())
 }
 
