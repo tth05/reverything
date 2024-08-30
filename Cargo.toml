@@ -19,15 +19,13 @@ windows = { version = "0.58.0", default-features = false, features = [
     "Win32_UI_HiDpi"
 ] }
 mimalloc-rust = "0.2.1"
-eyre = "0.6.8"
-rayon = "1.6.1"
+eyre = "0.6.12"
+rayon = "1.10.0"
 rustc-hash = "2.0.0"
-num_cpus = "1.15.0"
+num_cpus = "1.16.0"
 smartstring = "1.0.1"
 slint = "1.7.2"
+log = "0.4.22"
 
 [build-dependencies]
 slint-build = "1.7.2"
-
-[profile.dev]
-debug = 2

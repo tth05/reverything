@@ -1,11 +1,13 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::mem::size_of;
-use std::path::PathBuf;
 
 use eyre::{eyre, ContextCompat, Report, Result, WrapErr};
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Storage::FileSystem::{ExtendedFileIdType, GetFinalPathNameByHandleW, OpenFileById, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_SHARE_READ, FILE_SHARE_WRITE, VOLUME_NAME_NONE};
+use windows::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_DIRECTORY
+    , FILE_ID_128
+    ,
+};
 use windows::Win32::System::Ioctl::{
     FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V1, USN_JOURNAL_DATA_V2,
     USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_RENAME_NEW_NAME,
@@ -16,14 +18,17 @@ use windows::Win32::System::IO::DeviceIoControl;
 use crate::ntfs::try_close_handle;
 use crate::ntfs::volume::Volume;
 
-const MAX_UNMATCHED_RENAMES: usize = 1000;
+const MAX_UNMATCHED_RENAMES: usize = 2000;
 
 pub struct Journal {
     handle: HANDLE,
     next_usn: i64,
     journal_id: u64,
-    unmatched_renames: VecDeque<UnmatchedRename>,
+    unmatched_renames: VecDeque<u64>,
 }
+
+unsafe impl Send for Journal {}
+unsafe impl Sync for Journal {}
 
 impl Journal {
     pub fn new(vol: Volume) -> Result<Self> {
@@ -37,7 +42,7 @@ impl Journal {
                 None,
                 0,
                 Some(&mut data as *mut _ as *mut c_void),
-                std::mem::size_of_val(&data) as u32,
+                size_of_val(&data) as u32,
                 None,
                 None,
             );
@@ -78,9 +83,9 @@ impl Journal {
                 self.handle,
                 FSCTL_READ_USN_JOURNAL,
                 Some(&mut read_input as *mut _ as *mut c_void),
-                std::mem::size_of_val(&read_input) as u32,
+                size_of_val(&read_input) as u32,
                 Some(&mut buffer as *mut _ as *mut c_void),
-                std::mem::size_of_val(&buffer) as u32,
+                size_of_val(&buffer) as u32,
                 Some(&mut bytes_read as *mut u32),
                 None,
             );
@@ -90,7 +95,7 @@ impl Journal {
                     .with_context(|| "DeviceIoControl failed trying to read journal entries");
             }
 
-            let next_usn = i64::from_le_bytes(buffer[0..size_of::<i64>()].try_into().unwrap());
+            let next_usn = i64::from_le_bytes(buffer[0..size_of::<i64>()].try_into()?);
             if next_usn == 0 || next_usn < self.next_usn {
                 return Ok(Vec::new());
             }
@@ -110,114 +115,94 @@ impl Journal {
                 }
 
                 let record = &(*union).V3;
-                let file_path = self.compute_full_path(record)?;
 
                 if record.Reason & USN_REASON_RENAME_OLD_NAME != 0 {
                     if self.unmatched_renames.len() >= MAX_UNMATCHED_RENAMES {
                         self.unmatched_renames.pop_front();
                     }
 
-                    self.unmatched_renames.push_back(UnmatchedRename {
-                        file_id: record.FileReferenceNumber,
-                        old_path: file_path,
-                    });
+                    self.unmatched_renames
+                        .push_back(get_mft_index_from_file_id(record.FileReferenceNumber));
                 } else {
+                    let is_directory = record.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
                     let reason = match record.Reason {
-                        x if x & USN_REASON_FILE_CREATE != 0 => JournalEntry::FileCreate(file_path),
-                        x if x & USN_REASON_FILE_DELETE != 0 => JournalEntry::FileDelete(file_path),
-                        x if x & USN_REASON_RENAME_NEW_NAME != 0 => {
-                            self.match_rename(file_path, record.FileReferenceNumber)?
-                        }
-                        _ => unreachable!("Invalid reason"),
+                        x if x & USN_REASON_FILE_CREATE == x => Ok(JournalEntry::FileCreate {
+                            mft_index: get_mft_index_from_file_id(record.FileReferenceNumber),
+                            parent_mft_index: get_mft_index_from_file_id(
+                                record.ParentFileReferenceNumber,
+                            ),
+                            name: get_record_file_name(record),
+                            is_directory,
+                        }),
+                        x if x & USN_REASON_FILE_DELETE != 0 => Ok(JournalEntry::FileDelete(
+                            get_mft_index_from_file_id(record.FileReferenceNumber),
+                        )),
+                        x if x & USN_REASON_RENAME_NEW_NAME != 0 => self.match_rename(
+                            get_mft_index_from_file_id(record.FileReferenceNumber),
+                            get_record_file_name(record),
+                            get_mft_index_from_file_id(record.ParentFileReferenceNumber),
+                        ),
+                        _ => Err(eyre!("")),
                     };
 
-                    entries.push(reason);
+                    if let Ok(reason) = reason {
+                        entries.push(reason);
+                    }
                 }
 
                 offset += record_length;
+            }
+
+            // Match file creates to deletes
+            let mut i = 0usize;
+            while let Some((pos1, JournalEntry::FileCreate { mft_index, .. })) = entries
+                .iter()
+                .enumerate()
+                .find(|(j, e)| *j >= i && matches!(e, JournalEntry::FileCreate { .. }))
+            {
+                if let Some(pos2) = entries.iter().skip(pos1).rposition(
+                    |e| matches!(e, JournalEntry::FileDelete(mft_index2) if mft_index == mft_index2),
+                ) {
+                    entries.remove(pos2);
+                    entries.remove(pos1);
+                }
+
+                i += pos1 + 1;
             }
 
             Ok(entries)
         }
     }
 
-    fn match_rename(&mut self, new_path: PathBuf, file_id: FILE_ID_128) -> Result<JournalEntry> {
-        let rename = self
-            .unmatched_renames
+    fn match_rename(
+        &mut self,
+        mft_index: u64,
+        new_name: String,
+        new_parent_mft_index: u64,
+    ) -> Result<JournalEntry> {
+        let idx = self.unmatched_renames
             .iter()
-            .find(|x| x.file_id.Identifier == file_id.Identifier)
+            .position(|x| *x == mft_index)
             .with_context(|| {
                 format!(
-                    "Failed to find old name for rename {:?} {:?}",
-                    new_path, file_id
+                    "Failed to find old name for rename {:?} {:?} {:?}",
+                    mft_index, new_name, new_parent_mft_index
                 )
             })?;
+        
+        self.unmatched_renames.remove(idx);
 
         // We can't immediately remove the rename from the queue because it can be used multiple times
         Ok(JournalEntry::Rename {
-            old_path: rename.old_path.clone(),
-            new_path,
+            mft_index,
+            new_name,
+            new_parent_mft_index,
         })
     }
+}
 
-    fn compute_full_path(&self, record: &USN_RECORD_V3) -> Result<PathBuf> {
-        unsafe {
-            let desc = FILE_ID_DESCRIPTOR {
-                dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
-                Type: ExtendedFileIdType,
-                Anonymous: FILE_ID_DESCRIPTOR_0 {
-                    ExtendedFileId: record.ParentFileReferenceNumber,
-                },
-            };
-
-            let file_handle = OpenFileById(
-                self.handle,
-                &desc as *const _,
-                FILE_GENERIC_READ.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                FILE_FLAGS_AND_ATTRIBUTES(0),
-            )
-            .with_context(|| {
-                eyre!(
-                    "OpenFileById failed for parent of {:?} ({:?})",
-                    record,
-                    get_record_file_name(record)
-                )
-            })?;
-
-            let mut path_buf = [0u16; 2048];
-            let path_length =
-                GetFinalPathNameByHandleW(file_handle, &mut path_buf, VOLUME_NAME_NONE);
-            try_close_handle(file_handle)?;
-
-            if path_length == 0 {
-                return Err(eyre!(
-                    "Failed to get path for parent of {:?} ({:?})",
-                    record,
-                    get_record_file_name(record)
-                ));
-            } else if path_length >= 2048 {
-                return Err(eyre!(
-                    "Path too long {:?} ({:?}, {:?})",
-                    record,
-                    get_record_file_name(record),
-                    path_buf
-                ));
-            }
-
-            debug_assert!(
-                path_buf[0] == '\\' as u16,
-                "{:?}",
-                String::from_utf16_lossy(&path_buf[0..path_length as usize])
-            );
-
-            let path_buf =
-                PathBuf::from(String::from_utf16_lossy(&path_buf[1..path_length as usize]));
-            let path_buf = path_buf.join(get_record_file_name(record));
-            Ok(path_buf)
-        }
-    }
+fn get_mft_index_from_file_id(id: FILE_ID_128) -> u64 {
+    u64::from_le_bytes(id.Identifier[..8].try_into().unwrap()) & 0xffff_ffff_ffffu64
 }
 
 impl Drop for Journal {
@@ -239,17 +224,18 @@ fn get_record_file_name(record: &USN_RECORD_V3) -> String {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
 pub enum JournalEntry {
-    FileCreate(PathBuf),
-    FileDelete(PathBuf),
-    Rename {
-        old_path: PathBuf,
-        new_path: PathBuf,
+    FileCreate {
+        mft_index: u64,
+        parent_mft_index: u64,
+        name: String,
+        is_directory: bool,
     },
-}
-
-struct UnmatchedRename {
-    file_id: FILE_ID_128,
-    old_path: PathBuf,
+    FileDelete(u64),
+    Rename {
+        mft_index: u64,
+        new_name: String,
+        new_parent_mft_index: u64,
+    },
 }

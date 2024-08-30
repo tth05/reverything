@@ -3214,6 +3214,7 @@ name = "reverything"
 version = "0.1.0"
 dependencies = [
  "eyre",
+ "log",
  "mimalloc-rust",
  "num_cpus",
  "rayon",
