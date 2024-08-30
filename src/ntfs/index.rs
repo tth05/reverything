@@ -10,15 +10,17 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
 use windows::Win32::System::IO::OVERLAPPED;
 
 use crate::ntfs::file_record::FileRecord;
+use crate::ntfs::journal::JournalEntry;
 use crate::ntfs::mft::MftFile;
 use crate::ntfs::try_close_handle;
 use crate::ntfs::volume::{create_overlapped, Volume};
 
 const ROOT_INDEX: u64 = 5;
+const PAR_ITER_CHUNK_COUNT: usize = 64;
 
 pub struct NtfsVolumeIndex {
     volume: Volume,
-    infos: Vec<FileInfo>,
+    infos: Vec<Option<FileInfo>>,
 }
 
 #[derive(Debug)]
@@ -60,42 +62,84 @@ impl NtfsVolumeIndex {
                 .read_data_runs(volume_data.BytesPerCluster as usize)?,
         )?;
 
-        // Contains a mapping of file records ids as if the None entries were not present
-        let mut ids = Vec::with_capacity(files.len());
-        let mut id = 0u64;
-        for x in &files {
-            match x {
-                Some(_) => {
-                    ids.push(id);
-                    id += 1;
-                }
-                None => ids.push(0),
-            }
-        }
-
-        files.retain(|a| a.is_some());
-        // Map the parent ids to the new ids
-        let files = files
-            .into_iter()
-            .map(|f| f.unwrap())
-            .map(|mut f| {
-                f.parent = ids[f.parent as usize];
-                f
-            })
-            .collect();
-
         Ok(Self {
             volume,
             infos: files,
         })
     }
 
+    pub fn process_journal_entries(&mut self, entries: &[JournalEntry]) {
+        for e in entries {
+            match e {
+                JournalEntry::FileCreate {
+                    mft_index,
+                    is_directory,
+                    parent_mft_index,
+                    name,
+                } => {
+                    if self.find_by_index(*mft_index).is_some() {
+                        eprintln!("File already exists: {}, {}", mft_index, name);
+                        continue;
+                    }
+
+                    if self.find_by_index(*parent_mft_index).is_none() {
+                        eprintln!("Parent not found: {}", parent_mft_index);
+                        continue;
+                    }
+
+                    // Prevent out of bounds access
+                    if *mft_index as usize >= self.infos.len() {
+                        self.infos.resize_with(*mft_index as usize + 1, Default::default);
+                    }
+                    
+                    self.infos[*mft_index as usize] = Some(FileInfo::new(
+                        // TODO: Get size from somewhere
+                        0,
+                        *is_directory,
+                        *parent_mft_index,
+                        SmartString::from(name),
+                    ));
+                    println!("Creating file: {}", self.compute_full_path(self.infos[*mft_index as usize].as_ref().unwrap()));
+                }
+                JournalEntry::Rename {
+                    mft_index,
+                    new_name,
+                    new_parent_mft_index,
+                } => {
+                    if self.find_by_index(*new_parent_mft_index).is_none() {
+                        eprintln!("Parent not found: {}", new_parent_mft_index);
+                        continue;
+                    }
+
+                    let old_path = self.compute_full_path(self.find_by_index(*mft_index).unwrap());
+                    
+                    if let Some(Some(info)) = self.infos.get_mut(*mft_index as usize) {
+                        info.name = SmartString::from(new_name);
+                        info.parent = *new_parent_mft_index;
+                    }
+                    
+                    println!("Renaming file: {} -> {}", old_path, self.compute_full_path(self.find_by_index(*mft_index).unwrap()));
+                }
+                JournalEntry::FileDelete(index) => {
+                    if let Some(info) = self.find_by_index(*index) {
+                        eprintln!("Deleting file: {}", self.compute_full_path(info));
+                    }
+                    self.infos[*index as usize] = None;
+                }
+            }
+        }
+    }
+
     pub fn find_by_name(&self, name: &str) -> Option<&FileInfo> {
-        self.infos.par_iter().find_first(|info| info.name == name)
+        self.par_iter()
+            .find_first(|info| matches!(info, Some(info) if info.name == name))
+            .and_then(|info| info.as_ref().copied())
     }
 
     pub fn find_by_index(&self, index: u64) -> Option<&FileInfo> {
-        self.infos.get(index as usize)
+        self.infos
+            .get(index as usize)
+            .and_then(|info| info.as_ref())
     }
 
     pub fn compute_full_path(&self, file_info: &FileInfo) -> String {
@@ -127,16 +171,28 @@ impl NtfsVolumeIndex {
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &FileInfo> {
-        self.infos.iter()
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Option<&FileInfo>> {
+        self.infos.iter().map(|info| info.as_ref())
+    }
+
+    pub fn par_iter(&self) -> impl IndexedParallelIterator<Item = Option<&FileInfo>> {
+        self.infos
+            .par_iter()
+            .map(|info| info.as_ref())
+            .with_min_len(self.infos.len() / PAR_ITER_CHUNK_COUNT)
     }
 
     pub fn volume(&self) -> Volume {
         self.volume
     }
-    
-    pub fn file_count(&self) -> usize {
+
+    pub fn file_info_count(&self) -> usize {
         self.infos.len()
+    }
+
+    // TODO: Cache this
+    pub fn real_file_count(&self) -> usize {
+        self.infos.iter().filter(|i| i.is_some()).count()
     }
 }
 
@@ -152,14 +208,13 @@ impl<'a> Iterator for HierarchyIter<'a> {
         match self.current {
             None => None,
             Some(current) => {
-                let parent = self.index.find_by_index(current.parent)?;
                 let next = current;
                 self.current = if current.parent == ROOT_INDEX {
                     None
                 } else {
-                    Some(parent)
+                    Some(self.index.find_by_index(current.parent)?)
                 };
-                
+
                 Some(next)
             }
         }
