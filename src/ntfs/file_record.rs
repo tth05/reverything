@@ -68,7 +68,7 @@ impl<'a> FileRecord<'a> {
             .with_context(|| "Cannot find data attribute")
     }
 
-    pub fn get_file_name_info(&self) -> Option<(u64, u64, SmartString<Compact>)> {
+    pub fn destructure_file_name_attribute(&self) -> Option<(u64, u64, SmartString<Compact>)> {
         let mut found = false;
         self.attributes()
             .filter(|a| {
@@ -112,6 +112,21 @@ impl<'a> FileRecord<'a> {
                     SmartString::from(String::from_utf16_lossy(name.align_to().1)),
                 )
             })
+    }
+    
+    pub fn get_data_attribute_size(&self) -> u64 {
+        let Some(attr) = self.get_attribute(AttributeType::Data) else {
+            return 0;
+        };
+        
+        unsafe {
+            
+            if attr.header.non_resident {
+                return attr.header.last.non_resident.allocated_size;
+            }
+
+            attr.header.last.resident.value_length as u64
+        }
     }
 
     pub fn fixup(data: &mut [u8], sector_size: usize) {

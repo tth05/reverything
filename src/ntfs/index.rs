@@ -1,19 +1,19 @@
 use std::ops::Range;
 
-use eyre::{Context, Report, Result};
-use rayon::prelude::*;
-use smartstring::{Compact, SmartString, SmartStringMode};
-use windows::Win32::Foundation::WAIT_OBJECT_0;
-use windows::Win32::Storage::FileSystem::ReadFile;
-use windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER;
-use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
-use windows::Win32::System::IO::OVERLAPPED;
-
+use crate::ntfs::file_attribute::AttributeType;
 use crate::ntfs::file_record::FileRecord;
 use crate::ntfs::journal::JournalEntry;
 use crate::ntfs::mft::MftFile;
 use crate::ntfs::try_close_handle;
 use crate::ntfs::volume::{create_overlapped, Volume};
+use eyre::{Context, Report, Result};
+use rayon::prelude::*;
+use smartstring::{Compact, SmartString};
+use windows::Win32::Foundation::WAIT_OBJECT_0;
+use windows::Win32::Storage::FileSystem::ReadFile;
+use windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER;
+use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
+use windows::Win32::System::IO::OVERLAPPED;
 
 const ROOT_INDEX: u64 = 5;
 const PAR_ITER_CHUNK_COUNT: usize = 64;
@@ -45,17 +45,19 @@ impl FileInfo {
         self.size_and_directory & !(1 << 63)
     }
 
+    #[allow(unused)]
     pub fn is_directory(&self) -> bool {
         self.size_and_directory & (1 << 63) != 0
     }
 }
 
+#[allow(unused)]
 impl NtfsVolumeIndex {
     pub fn new(volume: Volume) -> Result<NtfsVolumeIndex> {
         let volume_data = volume.query_volume_data()?;
         let mft_file = MftFile::new(volume, volume_data)?;
 
-        let mut files = process_mft_data(
+        let files = process_mft_data(
             volume,
             mft_file
                 .as_record()
@@ -89,9 +91,10 @@ impl NtfsVolumeIndex {
 
                     // Prevent out of bounds access
                     if *mft_index as usize >= self.infos.len() {
-                        self.infos.resize_with(*mft_index as usize + 1, Default::default);
+                        self.infos
+                            .resize_with(*mft_index as usize + 1, Default::default);
                     }
-                    
+
                     self.infos[*mft_index as usize] = Some(FileInfo::new(
                         // TODO: Get size from somewhere
                         0,
@@ -99,7 +102,12 @@ impl NtfsVolumeIndex {
                         *parent_mft_index,
                         SmartString::from(name),
                     ));
-                    println!("Creating file: {}", self.compute_full_path(self.infos[*mft_index as usize].as_ref().unwrap()));
+
+                    #[cfg(feature = "journal_dbg")]
+                    println!(
+                        "Creating file: {}",
+                        self.compute_full_path(self.infos[*mft_index as usize].as_ref().unwrap())
+                    );
                 }
                 JournalEntry::Rename {
                     mft_index,
@@ -111,19 +119,27 @@ impl NtfsVolumeIndex {
                         continue;
                     }
 
+                    #[cfg(feature = "journal_dbg")]
                     let old_path = self.compute_full_path(self.find_by_index(*mft_index).unwrap());
-                    
+
                     if let Some(Some(info)) = self.infos.get_mut(*mft_index as usize) {
                         info.name = SmartString::from(new_name);
                         info.parent = *new_parent_mft_index;
                     }
-                    
-                    println!("Renaming file: {} -> {}", old_path, self.compute_full_path(self.find_by_index(*mft_index).unwrap()));
+
+                    #[cfg(feature = "journal_dbg")]
+                    println!(
+                        "Renaming file: {} -> {}",
+                        old_path,
+                        self.compute_full_path(self.find_by_index(*mft_index).unwrap())
+                    );
                 }
                 JournalEntry::FileDelete(index) => {
+                    #[cfg(feature = "journal_dbg")]
                     if let Some(info) = self.find_by_index(*index) {
-                        eprintln!("Deleting file: {}", self.compute_full_path(info));
+                        println!("Deleting file: {}", self.compute_full_path(info));
                     }
+
                     self.infos[*index as usize] = None;
                 }
             }
@@ -252,9 +268,18 @@ fn process_mft_data(
 
                             FileRecord::fixup(chunk, volume_data.BytesPerSector as usize);
                             let record = FileRecord::new(chunk);
-                            let (size, parent, name) = record.get_file_name_info()?;
+                            let (real_size, parent, name) =
+                                record.destructure_file_name_attribute()?;
 
-                            Some(FileInfo::new(size, record.is_directory(), parent, name))
+                            // We get the size from the data attribute or the file name attribute.
+                            // Some files don't have a data attribute, others don't have the size
+                            // stored in the file name attribute.
+                            Some(FileInfo::new(
+                                record.get_data_attribute_size().max(real_size),
+                                record.is_directory(),
+                                parent,
+                                name,
+                            ))
                         })
                         .collect())
                 })
