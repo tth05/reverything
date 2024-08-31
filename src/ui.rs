@@ -1,4 +1,5 @@
 use crate::ntfs::index::{FileInfo, NtfsVolumeIndex};
+use rayon::prelude::*;
 use slint::{
     Model, ModelNotify, ModelRc, ModelTracker, SharedString, StandardListViewItem, VecModel,
 };
@@ -6,48 +7,77 @@ use std::cell::RefCell;
 use std::default::Default;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use rayon::prelude::*;
 
 slint::include_modules!();
 
 pub fn run_ui(index: Arc<Mutex<NtfsVolumeIndex>>) -> Result<(), slint::PlatformError> {
-    let ui = App::new()?;
+    let app = App::new()?;
 
     let model = Rc::new(InfiniteModel {
         ntfs_index: index,
+        filter: RefCell::new("".to_string()),
         filtered_files: RefCell::new(Vec::new()),
         notify: Default::default(),
     });
     model.set_filter("".to_string());
 
-    ui.set_data(model.clone().into());
+    let app_weak = app.as_weak();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
 
-    ui.on_search_input_change(move |search: SharedString| {
+        let app_weak = app_weak.clone();
+        slint::invoke_from_event_loop(move || {
+            app_weak
+                .unwrap()
+                .get_data()
+                .as_any()
+                .downcast_ref::<InfiniteModel>()
+                .unwrap()
+                .refresh()
+        })
+        .expect("Failed to refresh model");
+    });
+
+    app.set_data(model.clone().into());
+
+    app.on_search_input_change(move |search: SharedString| {
         model.set_filter(search.to_string());
     });
 
-    ui.run()
+    app.run()
 }
 
 pub struct InfiniteModel {
     ntfs_index: Arc<Mutex<NtfsVolumeIndex>>,
+    filter: RefCell<String>,
     filtered_files: RefCell<Vec<u64>>,
     // the ModelNotify will allow to notify the UI that the model changes
     notify: ModelNotify,
 }
 
+unsafe impl Send for InfiniteModel {}
+unsafe impl Sync for InfiniteModel {}
+
 impl InfiniteModel {
+    fn refresh(&self) {
+        self.set_filter(self.filter.take());
+    }
+
     fn set_filter(&self, search: String) {
+        self.filter.replace(search.to_string());
+
         let mut vec = self.filtered_files.take();
         vec.clear();
 
-        let match_fn: Box<dyn Fn(&(usize, Option<&FileInfo>)) -> bool  + Send+ Sync> = if search.is_empty() {
-            Box::new(|(_, info)| info.is_some())
-        } else {
-            Box::new(|(_, info)| matches!(info, Some(info) if info.name.contains(&search)))
-        };
+        let match_fn: Box<dyn Fn(&(usize, Option<&FileInfo>)) -> bool + Send + Sync> =
+            if search.is_empty() {
+                Box::new(|(_, info)| info.is_some())
+            } else {
+                Box::new(|(_, info)| matches!(info, Some(info) if info.name.contains(&search)))
+            };
 
-        let vec = self.ntfs_index
+        let vec = self
+            .ntfs_index
             .lock()
             .unwrap()
             .par_iter()

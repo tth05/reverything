@@ -2,6 +2,7 @@ use std::ops::Range;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
+#[allow(unused)]
 pub enum AttributeType {
     StandardInformation = 0x10,
     AttributeList = 0x20,
