@@ -13,7 +13,7 @@ slint::include_modules!();
 pub fn run_ui(index: Arc<Mutex<NtfsVolumeIndex>>) -> Result<(), slint::PlatformError> {
     let app = App::new()?;
 
-    let model = Rc::new(InfiniteModel {
+    let model = Rc::new(NtfsIndexTableModel {
         ntfs_index: index,
         filter: RefCell::new("".to_string()),
         filtered_files: RefCell::new(Vec::new()),
@@ -23,6 +23,8 @@ pub fn run_ui(index: Arc<Mutex<NtfsVolumeIndex>>) -> Result<(), slint::PlatformE
 
     let app_weak = app.as_weak();
     std::thread::spawn(move || loop {
+        // While this is a bit lazy (we simply match the journal update loop found in the main file),
+        // it gets the job done and is easier than using a channel which notifies the UI.
         std::thread::sleep(std::time::Duration::from_secs(1));
 
         let app_weak = app_weak.clone();
@@ -31,7 +33,7 @@ pub fn run_ui(index: Arc<Mutex<NtfsVolumeIndex>>) -> Result<(), slint::PlatformE
                 .unwrap()
                 .get_data()
                 .as_any()
-                .downcast_ref::<InfiniteModel>()
+                .downcast_ref::<NtfsIndexTableModel>()
                 .unwrap()
                 .refresh()
         })
@@ -47,18 +49,17 @@ pub fn run_ui(index: Arc<Mutex<NtfsVolumeIndex>>) -> Result<(), slint::PlatformE
     app.run()
 }
 
-pub struct InfiniteModel {
+pub struct NtfsIndexTableModel {
     ntfs_index: Arc<Mutex<NtfsVolumeIndex>>,
     filter: RefCell<String>,
     filtered_files: RefCell<Vec<u64>>,
-    // the ModelNotify will allow to notify the UI that the model changes
     notify: ModelNotify,
 }
 
-unsafe impl Send for InfiniteModel {}
-unsafe impl Sync for InfiniteModel {}
+unsafe impl Send for NtfsIndexTableModel {}
+unsafe impl Sync for NtfsIndexTableModel {}
 
-impl InfiniteModel {
+impl NtfsIndexTableModel {
     fn refresh(&self) {
         self.set_filter(self.filter.take());
     }
@@ -69,17 +70,30 @@ impl InfiniteModel {
         let mut vec = self.filtered_files.take();
         vec.clear();
 
+        let search = search
+            .split(|c| c == '\\' || c == '/')
+            .filter(|s| !s.is_empty())
+            .rev()
+            .collect::<Vec<_>>();
+        let ntfs_index = self.ntfs_index.lock().unwrap();
+
         let match_fn: Box<dyn Fn(&(usize, Option<&FileInfo>)) -> bool + Send + Sync> =
             if search.is_empty() {
                 Box::new(|(_, info)| info.is_some())
             } else {
-                Box::new(|(_, info)| matches!(info, Some(info) if info.name.contains(&search)))
+                Box::new(|(_, info)| {
+                    let Some(info) = info else {
+                        return false;
+                    };
+
+                    ntfs_index
+                        .iter_with_parents(info)
+                        .zip(search.iter())
+                        .all(|(info, search)| info.name.contains(search))
+                })
             };
 
-        let vec = self
-            .ntfs_index
-            .lock()
-            .unwrap()
+        let vec = ntfs_index
             .par_iter()
             .enumerate()
             .filter(match_fn)
@@ -91,7 +105,7 @@ impl InfiniteModel {
     }
 }
 
-impl Model for InfiniteModel {
+impl Model for NtfsIndexTableModel {
     type Data = ModelRc<StandardListViewItem>;
 
     fn row_count(&self) -> usize {
@@ -123,7 +137,6 @@ impl Model for InfiniteModel {
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
-        // a typical implementation just return `self`
         self
     }
 }
