@@ -201,6 +201,9 @@ impl Journal {
     }
 }
 
+/// Converts a FILE_ID_128 to an MFT index. The first 6 bytes contain the MFT index followed by a 2 
+/// byte sequence number. The upper 8 bytes are only used on ReFS.
+/// Only source I could find on this https://github.com/mgeeky/ntfs-journal-viewer/blob/master/journal.c#L559
 fn get_mft_index_from_file_id(id: FILE_ID_128) -> u64 {
     u64::from_le_bytes(id.Identifier[..8].try_into().unwrap()) & 0xffff_ffff_ffffu64
 }
