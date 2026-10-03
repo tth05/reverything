@@ -11,6 +11,7 @@ use gpui_kit::*;
 
 mod client;
 mod desktop;
+mod drives;
 mod format;
 mod icons;
 mod log;
@@ -18,6 +19,28 @@ mod results;
 mod settings;
 mod shell;
 mod view;
+
+// Icons beyond the ones the components bundle
+gpui_kit::assets::icon_assets!(ExtraIcons, [CircleQuestionMark]);
+
+struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if let Some(bytes) = ExtraIcons.load(path)? {
+            return Ok(Some(bytes));
+        }
+        assets::Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut paths = assets::Assets.list(path)?;
+        paths.extend(ExtraIcons.list(path)?);
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+}
 
 fn main() {
     let started = Instant::now();
@@ -34,7 +57,7 @@ fn main() {
         }
     };
     stage("main");
-    application().with_assets(assets::Assets).run(move |cx| {
+    application().with_assets(AppAssets).run(move |cx| {
         stage("run");
         init(cx);
         stage("init");

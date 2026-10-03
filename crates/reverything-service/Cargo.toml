@@ -10,6 +10,8 @@ reverything-protocol.workspace = true
 eyre.workspace = true
 log.workspace = true
 mimalloc-rust.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 windows-service = "0.8.1"
 windows = { workspace = true, features = [
     "Win32_Foundation",

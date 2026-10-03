@@ -27,24 +27,27 @@ use reverything_core::index::{ATTRIBUTE_MASK, FLAG_DIRECTORY};
 use reverything_core::search::{exclusions, hit_parts, search_all, Hit};
 use reverything_core::service::{self as core_service, BatchStats, IndexSet, SaveStats};
 use reverything_protocol::{
-    read_message, write_message, BatchTimings, Request, Response, Row, SaveTimings, ScanTimings,
-    Sort, SortColumn, Status, VolumeState, VolumeStatus, MAX_REQUEST_BYTES, MAX_ROWS_PER_REQUEST,
-    PIPE_NAME, PROTOCOL_VERSION,
+    read_message, write_message, BatchTimings, Request, Response, Row, SaveTimings, SavedIndex,
+    ScanTimings, Sort, SortColumn, Status, VolumeState, VolumeStatus, MAX_REQUEST_BYTES,
+    MAX_ROWS_PER_REQUEST, PROTOCOL_VERSION,
 };
 
+use crate::config::Config;
 use crate::security::{SecurityAttributes, PIPE_SDDL};
 
 pub struct Server {
     set: Arc<IndexSet>,
+    pipe: String,
     searches: AtomicU64,
     /// Duration of the last search in microseconds, `u64::MAX` if there was none
     last_search_us: AtomicU64,
 }
 
 impl Server {
-    pub fn new(set: Arc<IndexSet>) -> Arc<Self> {
+    pub fn new(set: Arc<IndexSet>, pipe: String) -> Arc<Self> {
         Arc::new(Self {
             set,
+            pipe,
             searches: AtomicU64::new(0),
             last_search_us: AtomicU64::new(u64::MAX),
         })
@@ -55,7 +58,7 @@ impl Server {
         let security = SecurityAttributes::from_sddl(PIPE_SDDL)?;
         let mut first = true;
         loop {
-            let pipe = create_instance(&security, first)?;
+            let pipe = create_instance(&self.pipe, &security, first)?;
             first = false;
 
             match unsafe { ConnectNamedPipe(pipe, None) } {
@@ -106,10 +109,17 @@ impl Server {
             Request::Hello { .. } => Response::Hello {
                 version: PROTOCOL_VERSION,
             },
-            Request::Search { query, sort } => {
+            Request::Search {
+                query,
+                sort,
+                files,
+                folders,
+            } => {
                 let t = Instant::now();
                 let mut query = Query::parse(&query);
                 query.folders.truncate(MAX_EXCLUDED_FOLDERS);
+                query.skip_files = !files;
+                query.skip_folders = !folders;
                 let hits = {
                     let excluded =
                         session.exclusions(&self.set, std::mem::take(&mut query.folders));
@@ -145,6 +155,20 @@ impl Server {
                 }
             }
             Request::Status => Response::Status(self.status()),
+            Request::SetVolumes { volumes } => {
+                let volumes = volumes
+                    .into_iter()
+                    .filter(|&c| self.set.volumes.iter().any(|v| v.volume.id == c))
+                    .collect::<Vec<_>>();
+                self.set.set_enabled(&volumes);
+                let config = Config {
+                    volumes: self.set.enabled(),
+                };
+                match config.save(self.set.db_dir()) {
+                    Ok(()) => Response::Done,
+                    Err(e) => Response::Error(format!("Failed to save the settings: {}", e)),
+                }
+            }
         }
     }
 
@@ -249,7 +273,7 @@ impl Session {
     }
 }
 
-fn create_instance(security: &SecurityAttributes, first: bool) -> Result<HANDLE> {
+fn create_instance(name: &str, security: &SecurityAttributes, first: bool) -> Result<HANDLE> {
     let mut open_mode = PIPE_ACCESS_DUPLEX;
     if first {
         // Fails if someone else already owns the name, so clients can not be tricked into
@@ -258,7 +282,7 @@ fn create_instance(security: &SecurityAttributes, first: bool) -> Result<HANDLE>
     }
     let pipe = unsafe {
         CreateNamedPipeW(
-            &HSTRING::from(PIPE_NAME),
+            &HSTRING::from(name),
             open_mode,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
@@ -273,7 +297,7 @@ fn create_instance(security: &SecurityAttributes, first: bool) -> Result<HANDLE>
         if first {
             bail!(
                 "Failed to create {} (is another instance running?): {}",
-                PIPE_NAME,
+                name,
                 e
             );
         }
@@ -333,6 +357,7 @@ fn volume_status(letter: char, s: core_service::VolumeStats) -> VolumeStatus {
     VolumeStatus {
         letter,
         state: match s.state {
+            core_service::VolumeState::Disabled => VolumeState::Disabled,
             core_service::VolumeState::Waiting => VolumeState::Waiting,
             core_service::VolumeState::Loading => VolumeState::Loading,
             core_service::VolumeState::Indexing => VolumeState::Indexing,
@@ -342,9 +367,13 @@ fn volume_status(letter: char, s: core_service::VolumeStats) -> VolumeStatus {
         },
         entries: s.entries as u64,
         index_bytes: s.index_bytes as u64,
-        ready_after_us: s.ready_after.map(us),
         load_us: s.load.map(us),
-        load_error: s.load_error,
+        saved_index: match s.saved_index {
+            core_service::SavedIndex::NotChecked => SavedIndex::NotChecked,
+            core_service::SavedIndex::Missing => SavedIndex::Missing,
+            core_service::SavedIndex::Loaded => SavedIndex::Loaded,
+            core_service::SavedIndex::Discarded(e) => SavedIndex::Discarded(e),
+        },
         scan: s.scan.map(scan),
         catch_up: s.catch_up.map(batch),
         last_batch: s.last_batch.map(batch),

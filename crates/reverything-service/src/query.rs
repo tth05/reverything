@@ -11,6 +11,15 @@ pub fn run(query: &str) -> Result<()> {
     let mut client = Client::connect()?;
     println!("connected in {:?}", t.elapsed());
 
+    if let Ok(volumes) = std::env::var("RV_QUERY_VOLUMES") {
+        // Changes which volumes are indexed, e.g. RV_QUERY_VOLUMES=CD
+        let volumes = volumes.chars().map(|c| c.to_ascii_uppercase()).collect();
+        match client.request(&Request::SetVolumes { volumes })? {
+            Response::Done => println!("volumes changed"),
+            other => bail!("Unexpected response {:?}", other),
+        }
+    }
+
     let t = Instant::now();
     match client.request(&Request::Status)? {
         Response::Status(status) => {
@@ -27,6 +36,8 @@ pub fn run(query: &str) -> Result<()> {
     let (search, total, took_us) = match client.request(&Request::Search {
         query: query.to_string(),
         sort: Sort::default(),
+        files: std::env::var_os("RV_QUERY_NO_FILES").is_none(),
+        folders: std::env::var_os("RV_QUERY_NO_FOLDERS").is_none(),
     })? {
         Response::Search {
             search,

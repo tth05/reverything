@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
@@ -15,10 +16,13 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use reverything_protocol::{Request, Response, Status, VolumeState, VolumeStatus};
+use reverything_protocol::{
+    Request, Response, SavedIndex, ScanTimings, Status, VolumeState, VolumeStatus,
+};
 
 use crate::client::ServiceClient;
 use crate::desktop::{self, Desktop};
+use crate::drives::{Drive, DriveChoice};
 use crate::format;
 use crate::results::Results;
 use crate::settings::{HotkeyChoice, Settings, ThemeChoice};
@@ -35,6 +39,8 @@ gpui_kit::actions!(
         FocusSearch,
         HideWindow,
         OpenSettings,
+        ToggleFiles,
+        ToggleFolders,
     ]
 );
 
@@ -48,6 +54,8 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-f", FocusSearch, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-l", FocusSearch, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-,", OpenSettings, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-f", ToggleFiles, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-d", ToggleFolders, Some(KEY_CONTEXT)),
         KeyBinding::new("escape", HideWindow, Some(KEY_CONTEXT)),
     ]
 }
@@ -60,6 +68,8 @@ pub fn apply_theme(window: Option<&mut Window>, cx: &mut App) {
         ThemeChoice::Light => Theme::change(ThemeMode::Light, window, cx),
         ThemeChoice::Dark => Theme::change(ThemeMode::Dark, window, cx),
     }
+    // Focused inputs only get a colored border instead of an extra ring around them
+    Theme::global_mut(cx).focus_ring = false;
 }
 
 /// The app icon, shown in the title bar
@@ -70,6 +80,8 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 /// Minimum time between the last search and a refresh caused by index changes. Typing or
 /// sorting always searches right away.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// Lower than the default title bar (34px)
+const TITLE_BAR_HEIGHT: Pixels = px(30.);
 
 pub struct MainView {
     input: Entity<InputState>,
@@ -80,7 +92,13 @@ pub struct MainView {
     status_round_trip: Option<Duration>,
     /// Index generation the current results were searched at
     searched_generation: Option<u64>,
+    /// Number of searchable volumes when the current results were searched
+    searched_volumes: usize,
     last_search: Instant,
+    /// The settings dialog is open, the drive selection is applied when it closes
+    settings_open: bool,
+    /// Changing the indexed drives failed
+    drive_error: Option<String>,
     started: Instant,
     first_frame: Option<Duration>,
     _subscriptions: Vec<Subscription>,
@@ -90,14 +108,15 @@ impl MainView {
     pub fn new(started: Instant, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let client = Arc::new(ServiceClient::default());
         let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(
-                "Search, e.g. notepad, windows\\system32\\, report !draft, .rs !target\\",
-            )
+            InputState::new(window, cx)
+                .placeholder("Search, e.g. report, .pdf, photos\\2024, !draft, !node_modules\\")
         });
+        let columns = cx.global::<Settings>().columns.clone();
         let table = cx.new(|cx| {
-            TableState::new(Results::new(client.clone()), window, cx)
+            TableState::new(Results::new(client.clone(), &columns), window, cx)
                 .row_selectable(true)
                 .col_resizable(true)
+                .col_movable(true)
                 .sortable(true)
         });
 
@@ -115,10 +134,13 @@ impl MainView {
                 }
                 _ => {}
             }),
-            cx.subscribe_in(&table, window, |view, _, event, _, cx| {
-                if let TableEvent::DoubleClickedRow(row) = event {
-                    view.open_row(*row, cx);
-                }
+            cx.subscribe_in(&table, window, |view, table, event, _, cx| match event {
+                TableEvent::DoubleClickedRow(row) => view.open_row(*row, cx),
+                TableEvent::ColumnWidthsChanged(widths) => table.update(cx, |table, cx| {
+                    table.delegate_mut().set_widths(widths);
+                    table.delegate().save_columns(cx);
+                }),
+                _ => {}
             }),
         ];
 
@@ -132,7 +154,10 @@ impl MainView {
             status_error: None,
             status_round_trip: None,
             searched_generation: None,
+            searched_volumes: 0,
             last_search: Instant::now(),
+            settings_open: false,
+            drive_error: None,
             started,
             first_frame: None,
             _subscriptions: subscriptions,
@@ -146,6 +171,7 @@ impl MainView {
         let query = self.input.read(cx).value().to_string();
         self.last_search = Instant::now();
         self.searched_generation = self.status.as_ref().map(|s| s.generation);
+        self.searched_volumes = self.status.as_ref().map_or(0, searchable_volumes);
         self.table.update(cx, |table, cx| {
             table.delegate_mut().search(query, scroll_to_top, cx)
         });
@@ -224,10 +250,42 @@ impl MainView {
         }
     }
 
+    fn on_toggle_files(&mut self, _: &ToggleFiles, _: &mut Window, cx: &mut Context<Self>) {
+        self.table.update(cx, |table, _| {
+            let results = table.delegate_mut();
+            results.files = !results.files;
+        });
+        self.search(true, cx);
+    }
+
+    fn on_toggle_folders(&mut self, _: &ToggleFolders, _: &mut Window, cx: &mut Context<Self>) {
+        self.table.update(cx, |table, _| {
+            let results = table.delegate_mut();
+            results.folders = !results.folders;
+        });
+        self.search(true, cx);
+    }
+
     fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             return;
         }
+        let volumes = self
+            .status
+            .as_ref()
+            .map(|s| s.volumes.as_slice())
+            .unwrap_or_default();
+        let indexed = volumes
+            .iter()
+            .filter(|v| v.state != VolumeState::Disabled)
+            .map(|v| v.letter)
+            .collect::<Vec<_>>();
+        cx.set_global(DriveChoice {
+            drives: volumes.iter().map(|v| Drive::new(v.letter)).collect(),
+            selected: indexed.clone(),
+            indexed,
+        });
+        self.settings_open = true;
         window.open_dialog(cx, |dialog, _, cx| {
             dialog
                 .title("Settings")
@@ -236,8 +294,40 @@ impl MainView {
         });
     }
 
+    /// Sends the drive selection of the settings dialog to the service, if it changed.
+    fn apply_drive_choice(&mut self, cx: &mut Context<Self>) {
+        let Some(choice) = cx.try_global::<DriveChoice>() else {
+            return;
+        };
+        if choice.selected == choice.indexed {
+            return;
+        }
+        let request = Request::SetVolumes {
+            volumes: choice.selected.clone(),
+        };
+        let client = self.client.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { client.request(&request) });
+        cx.spawn(async move |view, cx| {
+            let response = task.await;
+            let _ = view.update(cx, |view, cx| {
+                view.drive_error = match response {
+                    Ok(Response::Done) => None,
+                    Ok(Response::Error(e)) => Some(e),
+                    Ok(other) => Some(format!("Unexpected response {:?}", other)),
+                    Err(e) => Some(e),
+                };
+                // Disabled drives disappear from the results right away
+                view.search(false, cx);
+            });
+        })
+        .detach();
+    }
+
     /// Fetches the service status every second, and refreshes the results when the index
-    /// changed, at most every [`REFRESH_INTERVAL`] and only while the window is active.
+    /// changed, at most every [`REFRESH_INTERVAL`] and only while the window is active. A drive
+    /// that became searchable refreshes them right away.
     fn poll_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let client = self.client.clone();
         cx.spawn_in(window, async move |view, cx| loop {
@@ -257,6 +347,7 @@ impl MainView {
                         let changed = view
                             .searched_generation
                             .is_some_and(|g| g != status.generation);
+                        let new_volumes = searchable_volumes(&status) != view.searched_volumes;
                         view.searched_generation.get_or_insert(status.generation);
                         view.status = Some(status);
                         view.status_error = None;
@@ -264,8 +355,9 @@ impl MainView {
 
                         // After reconnecting the results may be empty or stale
                         let refresh = changed
-                            && view.last_search.elapsed() >= REFRESH_INTERVAL
-                            && window.is_window_active();
+                            && (new_volumes
+                                || view.last_search.elapsed() >= REFRESH_INTERVAL
+                                    && window.is_window_active());
                         if reconnected || refresh {
                             view.search(false, cx);
                         }
@@ -291,7 +383,7 @@ impl MainView {
     /// Icon, name and settings on the left, the window controls on the right.
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let icon = std::sync::Arc::new(Image::from_bytes(ImageFormat::Png, APP_ICON.to_vec()));
-        TitleBar::new().child(
+        TitleBar::new().h(TITLE_BAR_HEIGHT).child(
             h_flex()
                 .gap_2()
                 .child(img(icon).size_4())
@@ -316,21 +408,114 @@ impl MainView {
                             .xsmall()
                             .icon(IconName::Settings)
                             .tooltip("Settings (Ctrl+,)")
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(OpenSettings), cx)
-                            }),
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.on_open_settings(&OpenSettings, window, cx)
+                            })),
                     ),
                 ),
         )
     }
 
-    fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Search box, the file and folder filters and the syntax help.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let results = self.table.read(cx).delegate();
-        let left = match &results.error {
+        let (files, folders) = (results.files, results.folders);
+        let toggle = |id: &'static str, icon: IconName, on: bool, tooltip: &'static str| {
+            Button::new(id)
+                .ghost()
+                .small()
+                .icon(icon)
+                .selected(on)
+                .tooltip(tooltip)
+        };
+
+        h_flex()
+            .px_2()
+            .py_1p5()
+            .gap_1()
+            .child(
+                div().flex_1().child(
+                    Input::new(&self.input)
+                        .small()
+                        .text_xs()
+                        .prefix(Icon::new(IconName::Search).small())
+                        .cleanable(true),
+                ),
+            )
+            .child(
+                toggle("files", IconName::File, files, "Show files (Alt+F)").on_click(cx.listener(
+                    |view, _, window, cx| view.on_toggle_files(&ToggleFiles, window, cx),
+                )),
+            )
+            .child(
+                toggle("folders", IconName::Folder, folders, "Show folders (Alt+D)").on_click(
+                    cx.listener(|view, _, window, cx| {
+                        view.on_toggle_folders(&ToggleFolders, window, cx)
+                    }),
+                ),
+            )
+            .child(
+                HoverCard::new("search-help")
+                    .anchor(Anchor::TopRight)
+                    .open_delay(Duration::from_millis(150))
+                    .trigger(
+                        div()
+                            .id("search-help-trigger")
+                            .px_1()
+                            .cursor_pointer()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                Icon::new(gpui_kit::assets::IconName::CircleQuestionMark).small(),
+                            ),
+                    )
+                    .child(search_help(cx)),
+            )
+    }
+
+    /// Shown instead of the results while no drive is indexed.
+    fn render_no_drives(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(
+                Icon::new(IconName::HardDrive)
+                    .size_10()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                div()
+                    .text_base()
+                    .font_semibold()
+                    .child("No drives are indexed yet"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Choose the drives Reverything should search in the settings."),
+            )
+            .child(
+                Button::new("open-settings")
+                    .primary()
+                    .small()
+                    .label("Open settings")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.on_open_settings(&OpenSettings, window, cx)
+                    })),
+            )
+    }
+
+    fn render_status_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let results = self.table.read(cx).delegate();
+        let left = match (&self.drive_error, &results.error) {
+            (Some(e), _) => format!("Changing the drives failed: {}", e),
             // The health indicator already says that the service is not reachable
-            Some(_) if self.status.is_none() => String::new(),
-            Some(e) => e.clone(),
-            None => format!("{} objects", format::group_digits(results.total() as u64)),
+            (None, Some(_)) if self.status.is_none() => String::new(),
+            (None, Some(e)) => e.clone(),
+            (None, None) => format!("{} objects", format::group_digits(results.total() as u64)),
         };
 
         h_flex()
@@ -342,33 +527,38 @@ impl MainView {
             .text_sm()
             .text_color(cx.theme().muted_foreground)
             .child(div().flex_1().truncate().child(left))
-            .child(self.render_health(cx))
+            .child(self.render_health(window, cx))
     }
 
-    /// Icon with a short label, showing every timing we collect on hover.
-    fn render_health(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Icon with a short label, showing a summary and, in detailed mode, every timing we
+    /// collect on hover.
+    fn render_health(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let icon = |name: IconName, color: Hsla| {
+            Icon::new(name).small().text_color(color).into_any_element()
+        };
         let (label, indicator): (String, AnyElement) = match (&self.status, &self.status_error) {
-            (None, Some(e)) => (
-                e.clone(),
-                Icon::new(IconName::CircleX)
-                    .small()
-                    .text_color(theme.danger)
-                    .into_any_element(),
-            ),
+            (None, Some(e)) => (e.clone(), icon(IconName::CircleX, theme.danger)),
             (None, None) => (
                 "Connecting".into(),
                 Spinner::new().small().into_any_element(),
             ),
             (Some(status), _) => {
-                let states = status.volumes.iter().map(|v| &v.state).collect::<Vec<_>>();
-                if states.iter().any(|s| matches!(s, VolumeState::Failed(_))) {
+                let states = status
+                    .volumes
+                    .iter()
+                    .map(|v| &v.state)
+                    .filter(|s| **s != VolumeState::Disabled)
+                    .collect::<Vec<_>>();
+                if states.is_empty() {
+                    (
+                        "No drives".into(),
+                        icon(IconName::Info, theme.muted_foreground),
+                    )
+                } else if states.iter().any(|s| matches!(s, VolumeState::Failed(_))) {
                     (
                         "Problem".into(),
-                        Icon::new(IconName::TriangleAlert)
-                            .small()
-                            .text_color(theme.warning)
-                            .into_any_element(),
+                        icon(IconName::TriangleAlert, theme.warning),
                     )
                 } else if states.iter().any(|s| {
                     matches!(
@@ -378,24 +568,20 @@ impl MainView {
                 }) {
                     ("Indexing".into(), Spinner::new().small().into_any_element())
                 } else if states.iter().any(|s| matches!(s, VolumeState::Offline)) {
-                    (
-                        "Offline".into(),
-                        Icon::new(IconName::Info)
-                            .small()
-                            .text_color(theme.info)
-                            .into_any_element(),
-                    )
+                    ("Offline".into(), icon(IconName::Info, theme.info))
                 } else {
                     (
                         "Up to date".into(),
-                        Icon::new(IconName::CircleCheck)
-                            .small()
-                            .text_color(theme.success)
-                            .into_any_element(),
+                        icon(IconName::CircleCheck, theme.success),
                     )
                 }
             }
         };
+
+        // The popup can not leave the window, so it scrolls when the window is small
+        let viewport = window.viewport_size();
+        let max_height = (viewport.height - px(56.)).max(px(120.));
+        let max_width = (viewport.width - px(32.)).max(px(200.));
 
         HoverCard::new("health")
             .anchor(Anchor::BottomRight)
@@ -408,10 +594,128 @@ impl MainView {
                     .child(indicator)
                     .child(label),
             )
-            .child(self.render_timings(cx))
+            .child(self.render_status_popup(max_width, max_height, cx))
     }
 
-    fn render_timings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_status_popup(
+        &self,
+        max_width: Pixels,
+        max_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let detailed = cx.global::<Settings>().detailed_status;
+        let panel = if detailed {
+            self.detailed_status(cx)
+        } else {
+            self.summary_status(cx)
+        };
+        let width = px(if detailed { 480. } else { 360. }).min(max_width);
+        // Grows with the content up to the maximum height, then the content scrolls
+        let scrolling = |content: AnyElement| {
+            v_flex().w(width).max_h(max_height).child(
+                v_flex().flex_1().overflow_hidden().child(
+                    div().flex_1().overflow_hidden().child(
+                        v_flex()
+                            .id("status-details")
+                            .size_full()
+                            // Room for the scrollbar
+                            .pr_3()
+                            .overflow_y_scrollbar()
+                            .child(content),
+                    ),
+                ),
+            )
+        };
+        scrolling(
+            v_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .gap_4()
+                        .child(div().text_sm().font_semibold().child("Status"))
+                        .child(
+                            Switch::new("detailed-status")
+                                .small()
+                                .checked(detailed)
+                                .label("Details")
+                                .on_click(|checked, _, cx| {
+                                    let checked = *checked;
+                                    Settings::update(cx, |s| s.detailed_status = checked)
+                                }),
+                        ),
+                )
+                .child(panel.render(cx))
+                .into_any_element(),
+        )
+    }
+
+    /// What a user wants to know: is everything indexed and how fast is it.
+    fn summary_status(&self, cx: &mut Context<Self>) -> Panel {
+        let results = self.table.read(cx).delegate();
+        let mut panel = Panel::default();
+
+        panel.section("Search");
+        panel.row("Results", format::group_digits(results.total() as u64));
+        if let Some(t) = results.last_search {
+            panel.row("Search took", format::duration(t.service));
+        }
+
+        let Some(status) = &self.status else {
+            panel.section("Service");
+            panel.row(
+                "State",
+                self.status_error
+                    .clone()
+                    .unwrap_or_else(|| "Connecting".into()),
+            );
+            return panel;
+        };
+
+        panel.section("Drives");
+        let enabled = status
+            .volumes
+            .iter()
+            .filter(|v| v.state != VolumeState::Disabled)
+            .collect::<Vec<_>>();
+        if enabled.is_empty() {
+            panel.row("Indexed drives", "None, choose them in the settings".into());
+        }
+        for v in &enabled {
+            let state = match &v.state {
+                VolumeState::Ready | VolumeState::Offline => format!(
+                    "{} entries, {}",
+                    format::group_digits(v.entries),
+                    state_text(&v.state).to_lowercase()
+                ),
+                state => state_text(state),
+            };
+            panel.row(&format!("{}:", v.letter), state);
+            // How long the index took to build this time
+            match (&v.scan, v.load_us) {
+                (Some(scan), _) => panel.row(
+                    &format!("{}: indexed in", v.letter),
+                    format!("{} (full scan)", format::micros(scan_total(scan))),
+                ),
+                (None, Some(us)) => panel.row(
+                    &format!("{}: indexed in", v.letter),
+                    format!("{} (saved index)", format::micros(us)),
+                ),
+                (None, None) => {}
+            }
+        }
+        if let Some(at) = enabled
+            .iter()
+            .filter_map(|v| v.last_batch.as_ref().map(|b| b.at))
+            .max()
+        {
+            panel.row("Last change", format::ago(at));
+        }
+        panel.row("Memory used", format::size(status.private_bytes));
+        panel
+    }
+
+    fn detailed_status(&self, cx: &mut Context<Self>) -> Panel {
         let results = self.table.read(cx).delegate();
         let mut panel = Panel::default();
 
@@ -467,35 +771,62 @@ impl MainView {
                 );
             }
         }
-
-        panel.render(cx)
+        panel
     }
 }
 
-fn volume_timings(panel: &mut Panel, v: &VolumeStatus) {
-    panel.section(&format!("Volume {}:", v.letter));
-    let state = match &v.state {
+/// Volumes that can be searched
+fn searchable_volumes(status: &Status) -> usize {
+    status
+        .volumes
+        .iter()
+        .filter(|v| matches!(v.state, VolumeState::Ready | VolumeState::Offline))
+        .count()
+}
+
+fn state_text(state: &VolumeState) -> String {
+    match state {
+        VolumeState::Disabled => "Not indexed".to_string(),
         VolumeState::Waiting => "Waiting".to_string(),
         VolumeState::Loading => "Loading the saved index".to_string(),
         VolumeState::Indexing => "Reading the MFT".to_string(),
         VolumeState::Ready => "Up to date".to_string(),
         VolumeState::Offline => "Offline, not updated".to_string(),
         VolumeState::Failed(e) => format!("Failed: {}", e),
-    };
-    panel.row("State", state);
+    }
+}
+
+fn scan_total(s: &ScanTimings) -> u64 {
+    s.open_us + s.read_parse_us + s.merge_us + s.sort_us + s.folder_sizes_us
+}
+
+fn volume_timings(panel: &mut Panel, v: &VolumeStatus) {
+    panel.section(&format!("Volume {}:", v.letter));
+    panel.row("State", state_text(&v.state));
+    if v.state == VolumeState::Disabled {
+        return;
+    }
     panel.row("Entries", format::group_digits(v.entries));
     panel.row("Index memory", format::size(v.index_bytes));
-    if let Some(us) = v.ready_after_us {
-        panel.row("Searchable after", format::micros(us));
-    }
-    if let Some(us) = v.load_us {
-        panel.row("Loading the saved index", format::micros(us));
-    }
-    if let Some(e) = &v.load_error {
-        panel.row("Saved index not used", e.clone());
+    match &v.saved_index {
+        SavedIndex::NotChecked => {}
+        SavedIndex::Loaded => {
+            if let Some(us) = v.load_us {
+                panel.row("Loading the saved index", format::micros(us));
+            }
+        }
+        SavedIndex::Missing => panel.row(
+            "Saved index",
+            if v.last_save.is_some() {
+                "None at start, saved now".into()
+            } else {
+                "None at start".into()
+            },
+        ),
+        SavedIndex::Discarded(e) => panel.row("Saved index not used", e.clone()),
     }
     if let Some(s) = &v.scan {
-        let total = s.open_us + s.read_parse_us + s.merge_us + s.sort_us + s.folder_sizes_us;
+        let total = scan_total(s);
         let mb_per_s = s.bytes_read as f64 / 1048576.0 / (s.read_parse_us.max(1) as f64 / 1e6);
         panel.row("Full scan", format::micros(total));
         panel.row("  Opening the volume", format::micros(s.open_us));
@@ -584,8 +915,6 @@ impl Panel {
     fn render(self, cx: &App) -> impl IntoElement {
         let theme = cx.theme();
         v_flex()
-            .min_w(px(380.))
-            .max_w(px(560.))
             .gap_0p5()
             .text_xs()
             .children(
@@ -623,6 +952,52 @@ impl Panel {
     }
 }
 
+/// Short explanation of the query syntax, shown when hovering the help icon.
+fn search_help(cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let examples = [
+        ("report", "Names containing \"report\""),
+        (".pdf", "Files by extension"),
+        ("!draft", "Leave out names containing \"draft\""),
+        (
+            "!node_modules\\",
+            "Leave out matching folders with everything inside",
+        ),
+        (
+            "!C:\\Windows",
+            "Leave out this folder with everything inside",
+        ),
+        (
+            "photos\\2024",
+            "\"2024\" inside a folder matching \"photos\"",
+        ),
+    ];
+    v_flex()
+        .gap_1()
+        .text_xs()
+        .w(px(380.))
+        .child(div().text_sm().font_semibold().child("Search syntax"))
+        .children(examples.into_iter().map(|(example, meaning)| {
+            h_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .w(px(110.))
+                        .flex_shrink_0()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.foreground)
+                        .child(example),
+                )
+                .child(div().text_color(theme.muted_foreground).child(meaning))
+        }))
+        .child(
+            div()
+                .mt_1()
+                .text_color(theme.muted_foreground)
+                .child("Separate terms with spaces, every term has to match. Case does not matter, quotes keep spaces in a term."),
+        )
+}
+
 fn hint_owned(theme: &gpui_kit::component::Theme, text: String) -> Div {
     div()
         .text_xs()
@@ -630,7 +1005,8 @@ fn hint_owned(theme: &gpui_kit::component::Theme, text: String) -> Div {
         .child(text)
 }
 
-/// Settings dialog content. Rebuilt on every render from the [`Settings`] global.
+/// Settings dialog content. Rebuilt on every render from the [`Settings`] and
+/// [`DriveChoice`] globals.
 fn settings_panel(cx: &App) -> impl IntoElement {
     let settings = cx.global::<Settings>().clone();
     let theme = cx.theme();
@@ -648,8 +1024,41 @@ fn settings_panel(cx: &App) -> impl IntoElement {
             .child(text)
     };
 
+    let drives = cx.try_global::<DriveChoice>();
     v_flex()
         .gap_5()
+        .child(
+            v_flex()
+                .gap_3()
+                .child(heading("Drives"))
+                .map(|this| match drives {
+                    Some(choice) if !choice.drives.is_empty() => {
+                        this.children(choice.drives.iter().map(|drive| {
+                            let letter = drive.letter;
+                            let mut label = format!("{}:", letter);
+                            if !drive.label.is_empty() {
+                                label.push_str(&format!("  {}", drive.label));
+                            }
+                            if drive.total_bytes > 0 {
+                                label.push_str(&format!("  ({})", format::size(drive.total_bytes)));
+                            }
+                            Switch::new(SharedString::from(format!("drive-{}", letter)))
+                                .checked(choice.selected.contains(&letter))
+                                .label(label)
+                                .on_click(move |checked, _, cx| {
+                                    DriveChoice::toggle(cx, letter, *checked)
+                                })
+                        }))
+                        .child(hint(
+                            "Changes apply when the settings close. Turning a drive off deletes \
+                             its index.",
+                        ))
+                    }
+                    _ => this.child(hint(
+                        "The drives can be chosen while the Reverything service is running.",
+                    )),
+                }),
+        )
         .child(
             v_flex()
                 .gap_2()
@@ -730,7 +1139,7 @@ fn settings_panel(cx: &App) -> impl IntoElement {
 }
 
 impl Render for MainView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.first_frame.is_none() {
             let elapsed = self.started.elapsed();
             self.first_frame = Some(elapsed);
@@ -738,6 +1147,16 @@ impl Render for MainView {
                 crate::log::write(&format!("first frame after {:?}", elapsed));
             }
         }
+        // However the dialog was closed (button, Escape, clicking outside)
+        if self.settings_open && !window.has_active_dialog(cx) {
+            self.settings_open = false;
+            self.apply_drive_choice(cx);
+        }
+
+        let no_drives = self
+            .status
+            .as_ref()
+            .is_some_and(|s| s.volumes.iter().all(|v| v.state == VolumeState::Disabled));
 
         v_flex()
             .key_context(KEY_CONTEXT)
@@ -749,25 +1168,26 @@ impl Render for MainView {
             .on_action(cx.listener(Self::on_focus_search))
             .on_action(cx.listener(Self::on_hide))
             .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_toggle_files))
+            .on_action(cx.listener(Self::on_toggle_folders))
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(self.render_title_bar(cx))
-            .child(
-                div().px_2().py_1p5().child(
-                    Input::new(&self.input)
-                        .small()
-                        .prefix(Icon::new(IconName::Search).small())
-                        .cleanable(true),
-                ),
-            )
-            .child(
-                div().flex_1().overflow_hidden().child(
-                    DataTable::new(&self.table)
-                        .stripe(true)
-                        .with_size(crate::results::ROW_SIZE),
-                ),
-            )
-            .child(self.render_status_bar(cx))
+            .child(self.render_toolbar(cx))
+            .map(|this| {
+                if no_drives {
+                    this.child(self.render_no_drives(cx))
+                } else {
+                    this.child(
+                        div().flex_1().overflow_hidden().child(
+                            DataTable::new(&self.table)
+                                .stripe(true)
+                                .with_size(crate::results::ROW_SIZE),
+                        ),
+                    )
+                }
+            })
+            .child(self.render_status_bar(window, cx))
     }
 }

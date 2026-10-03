@@ -26,6 +26,10 @@ pub struct Query {
     pub exclude: Vec<Term>,
     /// Folders whose whole subtree is left out
     pub folders: Vec<FolderExclusion>,
+    /// Leave out files
+    pub skip_files: bool,
+    /// Leave out directories
+    pub skip_folders: bool,
 }
 
 /// A single term, see the module documentation.
@@ -79,6 +83,8 @@ impl Query {
         self.include.iter().all(Term::is_match_all)
             && self.exclude.is_empty()
             && self.folders.is_empty()
+            && !self.skip_files
+            && !self.skip_folders
     }
 }
 
@@ -243,7 +249,9 @@ impl VolumeIndex {
     /// Matching entries in name order. `excluded` is a bitset of directories (see
     /// [`VolumeIndex::exclusions`]) whose entries are left out.
     pub fn search(&self, query: &Query, excluded: Option<&[u64]>) -> Vec<u32> {
-        if !query.include.iter().all(|t| self.on_this_volume(t)) {
+        if !query.include.iter().all(|t| self.on_this_volume(t))
+            || (query.skip_files && query.skip_folders)
+        {
             return Vec::new();
         }
         let include = query
@@ -259,12 +267,20 @@ impl VolumeIndex {
             .map(|t| self.prepare(t))
             .collect::<Vec<_>>();
 
+        // Only one of them can be set here, both leave nothing
+        let skip_kind = (query.skip_files || query.skip_folders).then_some(if query.skip_folders {
+            FLAG_DIRECTORY
+        } else {
+            0
+        });
+
         self.sorted
             .par_iter()
             .with_min_len(4096)
             .copied()
             .filter(|&id| {
-                excluded.is_none_or(|set| !bit(set, self.parent(id)) && !bit(set, id))
+                skip_kind.is_none_or(|skip| self.flags(id) & FLAG_DIRECTORY != skip)
+                    && excluded.is_none_or(|set| !bit(set, self.parent(id)) && !bit(set, id))
                     && include.iter().all(|t| t.matches(self, id))
                     && !exclude.iter().any(|t| t.matches(self, id))
             })

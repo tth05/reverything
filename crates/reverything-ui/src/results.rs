@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::menu::PopupMenu;
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::component::{h_flex, ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::*;
@@ -15,6 +15,7 @@ use reverything_protocol::{Request, Response, Row, Sort, SortColumn};
 use crate::client::ServiceClient;
 use crate::format;
 use crate::icons::FileIcons;
+use crate::settings::{ColumnSetting, Settings};
 use crate::view::{CopyName, CopyPath, OpenSelected, RevealSelected, ShowProperties};
 
 /// Rows fetched per request
@@ -27,6 +28,115 @@ const CELL_LINE_HEIGHT: Pixels = px(16.);
 /// How far the mouse has to move with the button down before a row is dragged out
 const DRAG_THRESHOLD: Pixels = px(6.);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnKind {
+    Name,
+    Folder,
+    Size,
+    Modified,
+    Created,
+    Attributes,
+}
+
+impl ColumnKind {
+    pub const ALL: [ColumnKind; 6] = [
+        ColumnKind::Name,
+        ColumnKind::Folder,
+        ColumnKind::Size,
+        ColumnKind::Modified,
+        ColumnKind::Created,
+        ColumnKind::Attributes,
+    ];
+
+    /// Stored in the settings
+    fn key(self) -> &'static str {
+        match self {
+            ColumnKind::Name => "name",
+            ColumnKind::Folder => "folder",
+            ColumnKind::Size => "size",
+            ColumnKind::Modified => "modified",
+            ColumnKind::Created => "created",
+            ColumnKind::Attributes => "attributes",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            ColumnKind::Name => "Name",
+            ColumnKind::Folder => "Folder",
+            ColumnKind::Size => "Size",
+            ColumnKind::Modified => "Date Modified",
+            ColumnKind::Created => "Date Created",
+            ColumnKind::Attributes => "Attributes",
+        }
+    }
+
+    fn default_width(self) -> f32 {
+        match self {
+            ColumnKind::Name => 300.,
+            ColumnKind::Folder => 520.,
+            ColumnKind::Size => 90.,
+            ColumnKind::Modified | ColumnKind::Created => 140.,
+            ColumnKind::Attributes => 96.,
+        }
+    }
+
+    fn sort_column(self) -> SortColumn {
+        match self {
+            ColumnKind::Name => SortColumn::Name,
+            ColumnKind::Folder => SortColumn::Path,
+            ColumnKind::Size => SortColumn::Size,
+            ColumnKind::Modified => SortColumn::Modified,
+            ColumnKind::Created => SortColumn::Created,
+            ColumnKind::Attributes => SortColumn::Attributes,
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.key() == key)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VisibleColumn {
+    kind: ColumnKind,
+    width: Pixels,
+}
+
+/// The visible columns from the settings. The name column is always shown.
+fn columns_from_settings(settings: &[ColumnSetting]) -> Vec<VisibleColumn> {
+    let mut columns: Vec<VisibleColumn> = Vec::new();
+    for setting in settings {
+        if let Some(kind) = ColumnKind::from_key(&setting.key) {
+            if columns.iter().all(|c| c.kind != kind) {
+                columns.push(VisibleColumn {
+                    kind,
+                    width: px(setting.width.clamp(20., 4000.)),
+                });
+            }
+        }
+    }
+    if columns.is_empty() {
+        columns = ColumnKind::ALL
+            .into_iter()
+            .map(|kind| VisibleColumn {
+                kind,
+                width: px(kind.default_width()),
+            })
+            .collect();
+    }
+    if columns.iter().all(|c| c.kind != ColumnKind::Name) {
+        columns.insert(
+            0,
+            VisibleColumn {
+                kind: ColumnKind::Name,
+                width: px(ColumnKind::Name.default_width()),
+            },
+        );
+    }
+    columns
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SearchTiming {
     /// Time the service spent searching
@@ -37,9 +147,13 @@ pub struct SearchTiming {
 
 pub struct Results {
     client: Arc<ServiceClient>,
-    columns: Vec<Column>,
+    columns: Vec<VisibleColumn>,
     query: String,
-    sort: Sort,
+    /// Column the user sorted by, `None` for the default order by name
+    sorted_by: Option<(ColumnKind, bool)>,
+    /// Include files and folders in the results
+    pub files: bool,
+    pub folders: bool,
     /// Incremented for every search we start, to drop responses of outdated ones
     seq: u64,
     /// Id of the result set on the service side
@@ -59,22 +173,14 @@ pub struct Results {
 }
 
 impl Results {
-    pub fn new(client: Arc<ServiceClient>) -> Self {
-        let column = |key: &'static str, name: &'static str, width: f32| {
-            Column::new(key, name).width(px(width)).sortable()
-        };
+    pub fn new(client: Arc<ServiceClient>, columns: &[ColumnSetting]) -> Self {
         Self {
             client,
-            columns: vec![
-                column("name", "Name", 300.),
-                column("folder", "Folder", 520.),
-                column("size", "Size", 90.).text_right(),
-                column("modified", "Date Modified", 140.),
-                column("created", "Date Created", 140.),
-                column("attributes", "Attributes", 96.),
-            ],
+            columns: columns_from_settings(columns),
             query: String::new(),
-            sort: Sort::default(),
+            sorted_by: None,
+            files: true,
+            folders: true,
             seq: 0,
             search: 0,
             total: 0,
@@ -100,6 +206,16 @@ impl Results {
             .and_then(|page| page.get(ix % PAGE))
     }
 
+    fn sort(&self) -> Sort {
+        match self.sorted_by {
+            Some((kind, ascending)) => Sort {
+                column: kind.sort_column(),
+                ascending,
+            },
+            None => Sort::default(),
+        }
+    }
+
     /// Runs `query` on the service. Refreshes keep the scroll position, new searches start at the
     /// top.
     pub fn search(
@@ -113,7 +229,9 @@ impl Results {
         let seq = self.seq;
         let request = Request::Search {
             query,
-            sort: self.sort,
+            sort: self.sort(),
+            files: self.files,
+            folders: self.folders,
         };
 
         let client = self.client.clone();
@@ -218,15 +336,59 @@ impl Results {
         .detach();
     }
 
-    fn cell_text(row: &Row, col_ix: usize) -> String {
-        match col_ix {
-            1 => row.folder.clone(),
-            2 => format::size(row.size),
-            3 => format::time(row.modified),
-            4 => format::time(row.created),
-            5 => format::attributes(row.attributes),
-            _ => row.name.clone(),
+    fn cell_text(row: &Row, kind: ColumnKind) -> String {
+        match kind {
+            ColumnKind::Name => row.name.clone(),
+            ColumnKind::Folder => row.folder.clone(),
+            ColumnKind::Size => format::size(row.size),
+            ColumnKind::Modified => format::time(row.modified),
+            ColumnKind::Created => format::time(row.created),
+            ColumnKind::Attributes => format::attributes(row.attributes),
         }
+    }
+
+    /// Shows or hides a column. The name column is always shown.
+    fn toggle_column(&mut self, kind: ColumnKind) {
+        if kind == ColumnKind::Name {
+            return;
+        }
+        if let Some(ix) = self.columns.iter().position(|c| c.kind == kind) {
+            self.columns.remove(ix);
+            return;
+        }
+        // Put it back in front of the first visible column that comes after it by default
+        let order = |k: ColumnKind| ColumnKind::ALL.iter().position(|&a| a == k);
+        let ix = self
+            .columns
+            .iter()
+            .position(|c| order(c.kind) > order(kind))
+            .unwrap_or(self.columns.len());
+        self.columns.insert(
+            ix,
+            VisibleColumn {
+                kind,
+                width: px(kind.default_width()),
+            },
+        );
+    }
+
+    /// Takes over the column widths after the user resized one.
+    pub fn set_widths(&mut self, widths: &[Pixels]) {
+        for (column, &width) in self.columns.iter_mut().zip(widths) {
+            column.width = width;
+        }
+    }
+
+    pub fn save_columns(&self, cx: &mut App) {
+        let columns = self
+            .columns
+            .iter()
+            .map(|c| ColumnSetting {
+                key: c.kind.key().to_string(),
+                width: f32::from(c.width).round(),
+            })
+            .collect();
+        Settings::update(cx, |s| s.columns = columns);
     }
 }
 
@@ -240,7 +402,18 @@ impl TableDelegate for Results {
     }
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
-        self.columns[col_ix].clone()
+        let VisibleColumn { kind, width } = self.columns[col_ix];
+        let column = Column::new(kind.key(), kind.title()).width(width);
+        let column = match self.sorted_by {
+            Some((sorted, true)) if sorted == kind => column.ascending(),
+            Some((sorted, false)) if sorted == kind => column.descending(),
+            _ => column.sortable(),
+        };
+        if kind == ColumnKind::Size {
+            column.text_right()
+        } else {
+            column
+        }
     }
 
     fn perform_sort(
@@ -250,26 +423,25 @@ impl TableDelegate for Results {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) {
-        let column = match col_ix {
-            1 => SortColumn::Path,
-            2 => SortColumn::Size,
-            3 => SortColumn::Modified,
-            4 => SortColumn::Created,
-            5 => SortColumn::Attributes,
-            _ => SortColumn::Name,
-        };
-        self.sort = match sort {
-            ColumnSort::Ascending => Sort {
-                column,
-                ascending: true,
-            },
-            ColumnSort::Descending => Sort {
-                column,
-                ascending: false,
-            },
-            ColumnSort::Default => Sort::default(),
+        let kind = self.columns[col_ix].kind;
+        self.sorted_by = match sort {
+            ColumnSort::Ascending => Some((kind, true)),
+            ColumnSort::Descending => Some((kind, false)),
+            ColumnSort::Default => None,
         };
         self.search(self.query.clone(), true, cx);
+    }
+
+    fn move_column(
+        &mut self,
+        col_ix: usize,
+        to_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let column = self.columns.remove(col_ix);
+        self.columns.insert(to_ix, column);
+        self.save_columns(cx);
     }
 
     fn render_td(
@@ -282,8 +454,9 @@ impl TableDelegate for Results {
         let Some(row) = self.row(row_ix) else {
             return div().into_any_element();
         };
-        let text = Self::cell_text(row, col_ix);
-        if col_ix != 0 {
+        let kind = self.columns[col_ix].kind;
+        let text = Self::cell_text(row, kind);
+        if kind != ColumnKind::Name {
             return div()
                 .text_xs()
                 .line_height(CELL_LINE_HEIGHT)
@@ -318,18 +491,41 @@ impl TableDelegate for Results {
             .into_any_element()
     }
 
+    /// Header cells, with a context menu to show and hide columns.
     fn render_th(
         &mut self,
         col_ix: usize,
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        let table = cx.entity().downgrade();
+        let visible = self.columns.iter().map(|c| c.kind).collect::<Vec<_>>();
         div()
+            .id(("th", col_ix))
             .size_full()
             .text_xs()
             .line_height(CELL_LINE_HEIGHT)
             .truncate()
-            .child(self.column(col_ix, cx).name.clone())
+            .child(self.columns[col_ix].kind.title())
+            .context_menu(move |menu, _, _| {
+                ColumnKind::ALL.into_iter().fold(menu, |menu, kind| {
+                    let table = table.clone();
+                    menu.item(
+                        PopupMenuItem::new(kind.title())
+                            .checked(visible.contains(&kind))
+                            .disabled(kind == ColumnKind::Name)
+                            .on_click(move |_, _, cx| {
+                                let _ = table.update(cx, |table, cx| {
+                                    let results = table.delegate_mut();
+                                    results.toggle_column(kind);
+                                    results.save_columns(cx);
+                                    table.refresh(cx);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                })
+            })
     }
 
     fn render_tr(

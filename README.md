@@ -1,6 +1,6 @@
 # Reverything
-Simple Everything clone written in Rust. It indexes every fixed NTFS volume by reading the Master File Table directly,
-keeps the index up to date from the USN change journal and searches it as you type.
+Simple Everything clone written in Rust. It indexes the fixed NTFS volumes you pick by reading the Master File Table
+directly, keeps the index up to date from the USN change journal and searches it as you type.
 
 ## Architecture
 ```
@@ -13,9 +13,10 @@ installer/               Inno Setup script
 scripts/                 icon generator, installer build, benchmark task
 ```
 
-- **Service** (`reverything-service.exe`): runs as LocalSystem, because reading raw volumes needs it. It loads the
-  saved index from `%ProgramData%\Reverything` (or scans the MFT if there is none), follows the journal and answers
-  requests on `\\.\pipe\reverything`. The pipe and the data directory are restricted to SYSTEM, administrators and
+- **Service** (`reverything-service.exe`): runs as LocalSystem, because reading raw volumes needs it. For every
+  volume turned on in the settings (none by default, the choice is saved in `%ProgramData%\Reverything\config.json`)
+  it loads the saved index from `%ProgramData%\Reverything` (or scans the MFT if there is none), follows the journal
+  and answers requests on `\\.\pipe\reverything`. Turning a volume off drops its index and deletes the saved one. The pipe and the data directory are restricted to SYSTEM, administrators and
   interactively logged on users, because they expose every file name. Clients are treated as untrusted: message
   sizes are capped and the service never opens or changes files for them.
 - **Window** (`reverything.exe`): asks the service for the number of results and only fetches the rows around the
@@ -42,10 +43,15 @@ scripts/                 icon generator, installer build, benchmark task
 | Alt+Enter | Properties |
 | Ctrl+F, Ctrl+L | Focus the search box |
 | Ctrl+, | Settings |
+| Alt+F | Show or hide files in the results |
+| Alt+D | Show or hide folders in the results |
 | Escape | Hide to the tray |
 | Drag a row | Drop the file into Explorer or any other program |
+| Drag a column header | Reorder the columns |
+| Right click a column header | Show or hide columns |
 
-Hovering the status icon in the bottom right shows the service state and all timings.
+Hovering the status icon in the bottom right shows a summary, its "Details" switch shows every timing. The `?` next
+to the search box explains the search syntax. Column order, widths and visibility are saved.
 
 ### Search syntax
 Terms are separated by spaces (use quotes for spaces inside a term) and all have to match. Matching is
@@ -82,14 +88,18 @@ GPUI_FXC_PATH = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.20348.0\x64\fxc
 - Or run it in the foreground (admin): `reverything-service --console`.
 - UI development without admin rights: `reverything-service --console --offline` serves the indices saved in
   `%LOCALAPPDATA%\reverything-dev` (written by the benchmarks and `RV_SERVE_SECS`) without updating them.
+- `REVERYTHING_PIPE=\\.\pipe\reverything-dev` makes the window, `query` and the console/bench service use another
+  pipe, so a development service can run next to the installed one. The installed service ignores it.
 - `reverything-service query <text>` searches through a running service from the command line.
+  `RV_QUERY_VOLUMES=CD` first changes the indexed volumes, `RV_QUERY_NO_FILES` / `RV_QUERY_NO_FOLDERS` filter the
+  results and `RV_QUERY_STATUS` prints the full status.
 
 ## Installer
 `scripts\build-installer.ps1 [-Profile dist]` builds the binaries and
 `target\installer\reverything-setup-<version>.exe` with [Inno Setup 6](https://jrsoftware.org/isinfo.php)
 (`winget install JRSoftware.InnoSetup`). The installer registers and starts the service, optionally adds the window
 to the logon startup, and on upgrades stops the service first (which saves the index). Uninstalling removes the
-service, the program, the saved index and service log (`%ProgramData%\Reverything`), the settings
+service, the program, the saved index, the drive choice and the service log (`%ProgramData%\Reverything`), the settings
 (`%APPDATA%\Reverything`), the UI log (`%LOCALAPPDATA%\Reverything`) and the autostart entry.
 `scripts\generate-icon.py` regenerates `assets\reverything.ico`.
 
@@ -103,10 +113,13 @@ service, the program, the saved index and service log (`%ProgramData%\Reverythin
 1. Build the installer: `scripts\build-installer.ps1`.
 2. Run `target\installer\reverything-setup-<version>.exe`, confirm the UAC prompt, keep "Start Reverything when I log
    on" checked and let it start Reverything at the end.
-3. The first start scans the MFT (a few seconds). The status icon in the bottom right shows a spinner, then "Up to
-   date". Hover it: the per volume sections should show a full scan with its timings.
+3. No drive is indexed yet: the window says so. "Open settings", turn on the drives and close the settings. The
+   status icon in the bottom right shows a spinner while the MFT is scanned (a few seconds), then "Up to date". Hover
+   it for the summary, turn on "Details": the per volume sections show the full scan with its timings and "Saved
+   index: None at start, saved now". Make the window small: the popup scrolls instead of being cut off.
 4. Search: `notepad`, `windows\system32\`, `notepad !winsxs\`, sort by clicking column headers, scroll through an empty
-   search (all files).
+   search (all files). Hover the `?` next to the search box. Toggle the file and folder buttons (or Alt+F / Alt+D).
+   Drag a column header to another place, right click a header to hide a column, restart the window: both are kept.
 5. Live updates: create, rename and delete a file in Explorer, then search for it. The results refresh within 10
    seconds (immediately when you change the search).
 6. Rows: double click opens, right click shows the menu (open, open folder, copy path/name, properties), dragging a
@@ -114,6 +127,8 @@ service, the program, the saved index and service log (`%ProgramData%\Reverythin
 7. Tray: close the window (it keeps running in the tray), bring it back with the tray icon, the global shortcut
    (Settings shows which one is active) or by starting Reverything again. "Quit" in the tray menu exits.
 8. Settings (gear in the title bar or Ctrl+,): switch light/dark, change the shortcut, toggle "Start with Windows".
+   Turn a drive off: after closing the settings its results are gone and
+   `%ProgramData%\Reverything\<letter>.db` is deleted. Turning it on again scans it again.
 9. Restart the service (`services.msc`, "Reverything Index", or reboot): it now loads the saved index, the status
    popup shows "Loading the saved index" and the journal catch-up instead of a full scan. The window reconnects by
    itself.
@@ -137,7 +152,8 @@ Variations are read from `target/bench.env` (`KEY=VALUE` lines):
 | `RV_SWEEP=threads:chunk_kb,...` | Times scans of the first volume with each combination |
 | `RV_STARTUP=1` | Measures startup from the saved index including the journal replay |
 | `RV_JOURNAL=1` | Creates, renames, links and deletes files in `%TEMP%` and checks the index follows |
-| `RV_SERVE_SECS=90` | Runs the live service for that long, to test clients against it |
+| `RV_SERVE_SECS=90` | Runs the live service for that long, to test clients against it (volumes are turned on through a client, e.g. `RV_QUERY_VOLUMES`) |
+| `REVERYTHING_PIPE=\\.\pipe\reverything-bench` | Serves on another pipe, next to the installed service |
 
 ## Resources
 - https://flatcap.github.io/linux-ntfs

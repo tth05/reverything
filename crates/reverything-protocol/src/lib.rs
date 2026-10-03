@@ -11,8 +11,20 @@ use serde::{Deserialize, Serialize};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\reverything";
 
+/// Environment variable with another pipe name, for running a development service next to the
+/// installed one. The installed service ignores it.
+pub const PIPE_ENV: &str = "REVERYTHING_PIPE";
+
+/// [`PIPE_NAME`], or the pipe named in [`PIPE_ENV`].
+pub fn pipe_name() -> String {
+    std::env::var(PIPE_ENV)
+        .ok()
+        .filter(|name| name.starts_with(r"\\.\pipe\") && name.len() > 9)
+        .unwrap_or_else(|| PIPE_NAME.to_string())
+}
+
 /// Bumped on incompatible changes. Clients and the service have to agree on it.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Upper bound for requests, which come from less privileged processes
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -31,6 +43,10 @@ pub enum Request {
     Search {
         query: String,
         sort: Sort,
+        /// Include files
+        files: bool,
+        /// Include folders
+        folders: bool,
     },
     /// Rows `start..start + count` of the result set with id `search`
     Rows {
@@ -39,6 +55,10 @@ pub enum Request {
         count: u32,
     },
     Status,
+    /// Indexes exactly these volumes (drive letters). The choice is saved by the service.
+    SetVolumes {
+        volumes: Vec<char>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +77,7 @@ pub enum Response {
         rows: Vec<Row>,
     },
     Status(Status),
+    Done,
     Error(String),
 }
 
@@ -104,6 +125,8 @@ pub struct Row {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VolumeState {
+    /// Not indexed
+    Disabled,
     Waiting,
     Loading,
     Indexing,
@@ -123,7 +146,19 @@ pub struct Status {
     pub private_bytes: u64,
     pub searches: u64,
     pub last_search_us: Option<u64>,
+    /// Every NTFS volume, including the ones that are not indexed
     pub volumes: Vec<VolumeStatus>,
+}
+
+/// What happened to the saved index when the volume was enabled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SavedIndex {
+    NotChecked,
+    /// There was none, so the volume was scanned
+    Missing,
+    Loaded,
+    /// It could not be used, so the volume was scanned
+    Discarded(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,9 +167,8 @@ pub struct VolumeStatus {
     pub state: VolumeState,
     pub entries: u64,
     pub index_bytes: u64,
-    pub ready_after_us: Option<u64>,
     pub load_us: Option<u64>,
-    pub load_error: Option<String>,
+    pub saved_index: SavedIndex,
     pub scan: Option<ScanTimings>,
     pub catch_up: Option<BatchTimings>,
     pub last_batch: Option<BatchTimings>,
@@ -213,7 +247,7 @@ impl Client {
             match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(PIPE_NAME)
+                .open(pipe_name())
             {
                 Ok(file) => break file,
                 // ERROR_PIPE_BUSY
@@ -257,6 +291,8 @@ mod tests {
         let request = Request::Search {
             query: "notepad".into(),
             sort: Sort::default(),
+            files: true,
+            folders: false,
         };
         write_message(&mut buf, &request).unwrap();
         let decoded: Request = read_message(&mut buf.as_slice(), MAX_REQUEST_BYTES).unwrap();

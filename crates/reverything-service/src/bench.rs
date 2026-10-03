@@ -50,7 +50,7 @@ pub fn run() -> Result<()> {
     if let Ok(secs) = std::env::var("RV_SERVE_SECS") {
         // Runs the live service for a while, so clients can be tested against it
         crate::logger::init_stderr();
-        let app = crate::App::start(dev_db_dir(), false)?;
+        let app = crate::App::start(dev_db_dir(), reverything_protocol::pipe_name(), false)?;
         std::thread::sleep(std::time::Duration::from_secs(secs.parse()?));
         app.set.save_changed();
         return Ok(());

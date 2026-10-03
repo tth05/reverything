@@ -6141,6 +6141,8 @@ dependencies = [
  "mimalloc-rust",
  "reverything-core",
  "reverything-protocol",
+ "serde",
+ "serde_json",
  "windows 0.62.2",
  "windows-service",
 ]

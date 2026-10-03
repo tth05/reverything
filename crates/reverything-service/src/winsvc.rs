@@ -67,7 +67,7 @@ fn run_service() -> Result<()> {
         ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN,
         Duration::ZERO,
     )?;
-    let app = App::start(data_dir, false)?;
+    let app = App::start(data_dir, reverything_protocol::PIPE_NAME.to_string(), false)?;
 
     let _ = stop_rx.recv();
     log::info!("Stopping service");

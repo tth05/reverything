@@ -93,6 +93,14 @@ impl HotkeyChoice {
     }
 }
 
+/// A visible column of the result table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColumnSetting {
+    /// See `results::ColumnKind::key`
+    pub key: String,
+    pub width: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -103,6 +111,10 @@ pub struct Settings {
     pub close_to_tray: bool,
     #[serde(skip)]
     pub start_with_windows: bool,
+    /// Visible result columns in display order, empty for the default columns
+    pub columns: Vec<ColumnSetting>,
+    /// The status popup shows every timing instead of a short summary
+    pub detailed_status: bool,
 }
 
 impl Default for Settings {
@@ -112,6 +124,8 @@ impl Default for Settings {
             hotkey: None,
             close_to_tray: true,
             start_with_windows: false,
+            columns: Vec::new(),
+            detailed_status: false,
         }
     }
 }

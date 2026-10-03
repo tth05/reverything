@@ -1,5 +1,5 @@
-//! The Reverything service: keeps the index of every NTFS volume and answers searches over a
-//! named pipe.
+//! The Reverything service: keeps the index of the NTFS volumes the user picked and answers
+//! searches over a named pipe.
 //!
 //! ```text
 //! reverything-service install            register and start the Windows service (admin)
@@ -27,8 +27,10 @@ use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use reverything_core::index::persist::dev_db_dir;
 use reverything_core::ntfs::volume::ntfs_volumes;
 use reverything_core::service::IndexSet;
+use reverything_protocol::pipe_name;
 
 mod bench;
+mod config;
 mod logger;
 mod query;
 mod security;
@@ -47,18 +49,23 @@ pub struct App {
 }
 
 impl App {
-    /// Loads (or builds) the indices in the background and starts serving clients. `offline`
-    /// loads the saved indices without volume access and does not update them.
-    pub fn start(db_dir: PathBuf, offline: bool) -> Result<Self> {
+    /// Loads (or builds) the indices of the enabled volumes in the background and starts
+    /// serving clients on `pipe`. `offline` loads the saved indices without volume access and
+    /// does not update them.
+    pub fn start(db_dir: PathBuf, pipe: String, offline: bool) -> Result<Self> {
         let volumes = ntfs_volumes();
         if volumes.is_empty() {
             bail!("No fixed NTFS volumes found");
         }
-        let set = IndexSet::new(volumes, db_dir);
-        if offline {
-            set.load_offline();
+        let config = config::Config::load(&db_dir);
+        let set = if offline {
+            IndexSet::new_offline(volumes, db_dir)
         } else {
-            set.start();
+            IndexSet::new(volumes, db_dir)
+        };
+        set.set_enabled(&config.volumes);
+        if !offline {
+            set.delete_unused();
             let saver = set.clone();
             std::thread::Builder::new()
                 .name("saver".into())
@@ -68,7 +75,7 @@ impl App {
                 })?;
         }
 
-        let server = server::Server::new(set.clone());
+        let server = server::Server::new(set.clone(), pipe);
         std::thread::Builder::new()
             .name("pipe server".into())
             .spawn(move || {
@@ -144,7 +151,7 @@ fn run_console(offline: bool) -> Result<()> {
     let _ = CONSOLE_STOP.set(stop_tx);
     unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), true)? };
 
-    let app = App::start(db_dir, offline)?;
+    let app = App::start(db_dir, pipe_name(), offline)?;
     let _ = stop_rx.recv();
     log::info!("Stopping");
     if !offline {
