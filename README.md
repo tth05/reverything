@@ -31,8 +31,21 @@ scripts/                 icon generator, installer build, benchmark task
   Hard link names live in a separate link table. About 60 bytes per file including the name.
 - Changed records are re-read with `FSCTL_GET_NTFS_FILE_RECORD` and parsed with the same code as the scan, so names,
   sizes, dates and hard links stay exact. Folder sizes are updated incrementally.
-- The index is saved after a full scan, every 30 minutes if it changed and when the service stops. On the next start
-  only the journal entries since then are replayed (~0.1 s instead of a full scan).
+- The index is saved only after a full scan and when the service stops (including shutdown), never while running.
+  On the next start only the changes since then are applied (~0.1 s instead of a full scan).
+
+### Resource use while not in use
+Both processes do almost nothing while the window is not focused:
+
+- **Service:** the index is only kept live while the app's window has the focus. Without it, nothing is fetched or
+  applied: every 5 minutes one query checks how full the change journal is, and the journal is read (in Windows
+  background mode, low CPU/disk priority) only once a quarter of it is new, to remember which files changed. Focusing
+  the window applies just those. After an hour without focus the index is dropped from memory (~10 MB left);
+  focusing the window loads the saved index again and applies everything that changed since it was saved (~0.1 s).
+  If the journal was reset or overflowed in the meantime, the drive is scanned again (a few seconds).
+- **App:** tray, menu, shortcut and second start are handled through callbacks, nothing polls. The service status is
+  only polled while the window has the focus. A window hidden in the tray is closed after 10 minutes to free its
+  memory and opened again on demand; started with Windows, it is only opened when first needed (~35 MB in the tray).
 
 ## Using it
 | Shortcut | |
@@ -102,7 +115,8 @@ GPUI_FXC_PATH = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.20348.0\x64\fxc
   pipe, so a development service can run next to the installed one. The installed service ignores it.
 - `reverything-service query <text>` searches through a running service from the command line.
   `RV_QUERY_VOLUMES=CD` first changes the indexed volumes, `RV_QUERY_NO_FILES` / `RV_QUERY_NO_FOLDERS` filter the
-  results and `RV_QUERY_STATUS` prints the full status.
+  results and `RV_QUERY_STATUS` prints the full status (`RV_QUERY_STATUS_ONLY` without searching, which would count
+  as using the index).
 
 ## Installer
 `scripts\build-installer.ps1 [-Profile dist]` builds the binaries and
@@ -135,15 +149,18 @@ service, the program, the saved index, the drive choice and the service log (`%P
 6. Rows: double click opens, right click shows the menu (open, open folder, copy path/name, properties), dragging a
    row into an Explorer window copies the file.
 7. Tray: close the window (it keeps running in the tray), bring it back with the tray icon, the global shortcut
-   (Settings shows which one is active) or by starting Reverything again. "Quit" in the tray menu exits.
+   (Settings shows which one is active) or by starting Reverything again. "Quit" in the tray menu exits. After 10
+   minutes in the tray the window is closed (the process drops to ~115 MB or less); the shortcut opens it again.
 8. Settings (gear in the title bar or Ctrl+,): switch light/dark, change the shortcut, toggle "Start with Windows".
    Turn a drive off: after closing the settings its results are gone and
    `%ProgramData%\Reverything\<letter>.db` is deleted. Turning it on again scans it again.
-9. Restart the service (`services.msc`, "Reverything Index", or reboot): it now loads the saved index, the status
-   popup shows "Loading the saved index" and the journal catch-up instead of a full scan. The window reconnects by
-   itself.
-10. Log off and on: Reverything starts hidden in the tray.
-11. Uninstall from "Apps & features": afterwards `%ProgramData%\Reverything`, `%APPDATA%\Reverything`,
+9. Restart the service (`services.msc`, "Reverything Index", or reboot): it saves the index while stopping and
+   starts without loading it. Focusing the window loads it, the status popup shows "Loading the saved index" and the
+   catch-up instead of a full scan. The window reconnects by itself.
+10. Leave the window unfocused for an hour: the service drops the index ("Unloaded while not in use" in the
+    details) and uses ~10 MB; focusing the window brings it back in about a tenth of a second.
+11. Log off and on: Reverything starts hidden in the tray.
+12. Uninstall from "Apps & features": afterwards `%ProgramData%\Reverything`, `%APPDATA%\Reverything`,
     `%LOCALAPPDATA%\Reverything`, the "Reverything" value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
     and the service (`sc query Reverything`) are gone.
 
@@ -164,6 +181,7 @@ Variations are read from `target/bench.env` (`KEY=VALUE` lines):
 | `RV_JOURNAL=1` | Creates, renames, links and deletes files in `%TEMP%` and checks the index follows |
 | `RV_SERVE_SECS=90` | Runs the live service for that long, to test clients against it (volumes are turned on through a client, e.g. `RV_QUERY_VOLUMES`) |
 | `REVERYTHING_PIPE=\\.\pipe\reverything-bench` | Serves on another pipe, next to the installed service |
+| `RV_IDLE_CHECK_SECS=5`, `RV_UNLOAD_SECS=25` | Shorter idle timings for `RV_SERVE_SECS` (default 5 and 60 minutes) |
 
 ## Resources
 - https://flatcap.github.io/linux-ntfs

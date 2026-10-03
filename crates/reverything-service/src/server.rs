@@ -87,10 +87,17 @@ impl Server {
     }
 
     fn handle_client(&self, file: File) -> Result<()> {
-        let mut reader = BufReader::new(&file);
-        let mut writer = BufWriter::new(&file);
         let mut session = Session::default();
+        let result = self.serve_session(&mut session, &file);
+        if session.active == Some(true) {
+            self.set.client_active(false);
+        }
+        result
+    }
 
+    fn serve_session(&self, session: &mut Session, file: &File) -> Result<()> {
+        let mut reader = BufReader::new(file);
+        let mut writer = BufWriter::new(file);
         loop {
             let request: Request = match read_message(&mut reader, MAX_REQUEST_BYTES) {
                 Ok(request) => request,
@@ -99,7 +106,7 @@ impl Server {
                 Err(e) if e.raw_os_error() == Some(109) => return Ok(()),
                 Err(e) => return Err(e.into()),
             };
-            let response = self.handle(&mut session, request);
+            let response = self.handle(session, request);
             write_message(&mut writer, &response)?;
         }
     }
@@ -115,6 +122,16 @@ impl Server {
                 files,
                 folders,
             } => {
+                // Clients that never say whether they are active (the command line) are active
+                // while connected
+                if session.active.is_none() {
+                    session.active = Some(true);
+                    self.set.client_active(true);
+                }
+                // Right after becoming active, the indices may still be loading
+                if session.active == Some(true) {
+                    self.set.wait_until_awake(WAKE_WAIT);
+                }
                 let t = Instant::now();
                 let mut query = Query::parse(&query);
                 query.folders.truncate(MAX_EXCLUDED_FOLDERS);
@@ -155,6 +172,13 @@ impl Server {
                 }
             }
             Request::Status => Response::Status(self.status()),
+            Request::SetActive { active } => {
+                if session.active.unwrap_or(false) != active {
+                    self.set.client_active(active);
+                }
+                session.active = Some(active);
+                Response::Done
+            }
             Request::SetVolumes { volumes } => {
                 let volumes = volumes
                     .into_iter()
@@ -239,6 +263,8 @@ impl Server {
 
 /// More are ignored
 const MAX_EXCLUDED_FOLDERS: usize = 256;
+/// How long a search waits for indices that are still loading after the app became active
+const WAKE_WAIT: Duration = Duration::from_secs(3);
 /// How long resolved folder exclusions are reused before they are looked up again, so new
 /// directories below excluded folders get excluded too
 const EXCLUSION_CACHE_TIME: Duration = Duration::from_secs(10);
@@ -248,6 +274,8 @@ type CachedExclusions = (Vec<FolderExclusion>, Instant, Vec<Option<Vec<u64>>>);
 
 #[derive(Default)]
 struct Session {
+    /// Whether the client's window is active, `None` until it says
+    active: Option<bool>,
     search: u64,
     hits: Vec<Hit>,
     /// Folder exclusions of the last query, when they were resolved, and the resulting bitsets
@@ -363,6 +391,7 @@ fn volume_status(letter: char, s: core_service::VolumeStats) -> VolumeStatus {
             core_service::VolumeState::Loading => VolumeState::Loading,
             core_service::VolumeState::Indexing => VolumeState::Indexing,
             core_service::VolumeState::Ready => VolumeState::Ready,
+            core_service::VolumeState::Asleep => VolumeState::Asleep,
             core_service::VolumeState::Offline => VolumeState::Offline,
             core_service::VolumeState::Failed(e) => VolumeState::Failed(e),
         },

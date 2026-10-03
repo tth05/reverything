@@ -16,6 +16,7 @@ image = { version = "0.25", default-features = false }
 raw-window-handle = "0.6.2"
 tray-icon = "0.26.0"
 global-hotkey = "0.8.0"
+async-channel = "2.5.0"
 serde.workspace = true
 serde_json.workspace = true
 windows = { workspace = true, features = [
@@ -26,6 +27,7 @@ windows = { workspace = true, features = [
     "Win32_System_Ole",
     "Win32_Storage_FileSystem",
     "Win32_System_Registry",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_System_Time",
     "Win32_UI_Shell",

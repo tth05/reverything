@@ -76,7 +76,8 @@ fn run_service() -> Result<()> {
         ServiceControlAccept::empty(),
         Duration::from_secs(20),
     )?;
-    app.set.save_changed();
+    // Brings the indices up to date and saves them, the only save while the service runs
+    app.set.shutdown();
     report(
         ServiceState::Stopped,
         ServiceControlAccept::empty(),
@@ -124,6 +125,8 @@ pub fn install() -> Result<()> {
             .with_context(|| "Failed to create the service")?,
     };
     service.set_description(DESCRIPTION)?;
+    // Saving at shutdown can take a few seconds, the default allows only 10
+    service.set_preshutdown_timeout(Duration::from_secs(30))?;
     // Restart after crashes
     service.update_failure_actions(ServiceFailureActions {
         reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 60 * 60)),

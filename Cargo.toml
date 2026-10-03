@@ -13,7 +13,8 @@ windows = { version = "0.62.2", default-features = false, features = ["std"] }
 eyre = "0.6.14"
 rayon = "1.12.0"
 memchr = "2.8.3"
-mimalloc-rust = "0.2.1"
+mimalloc = "0.1.52"
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 log = { version = "0.4.34", features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

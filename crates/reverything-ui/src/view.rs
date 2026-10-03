@@ -75,8 +75,12 @@ pub fn apply_theme(window: Option<&mut Window>, cx: &mut App) {
 /// The app icon, shown in the title bar
 static APP_ICON: &[u8] = include_bytes!("../../../assets/reverything.png");
 
-/// How often the service status is polled
+/// How often the service status is polled while the window is active. Nothing is polled while
+/// it is not.
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+/// After the window became active, index changes refresh the results right away for this long,
+/// while the service catches up with what happened in the meantime
+const ACTIVATION_REFRESH: Duration = Duration::from_secs(5);
 /// Minimum time between the last search and a refresh caused by index changes. Typing or
 /// sorting always searches right away.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
@@ -97,6 +101,11 @@ pub struct MainView {
     last_search: Instant,
     /// The settings dialog is open, the drive selection is applied when it closes
     settings_open: bool,
+    /// The window has the focus, as last told to the service
+    active: bool,
+    activated_at: Instant,
+    /// The status polling loop runs
+    polling: bool,
     /// Changing the indexed drives failed
     drive_error: Option<String>,
     started: Instant,
@@ -106,7 +115,8 @@ pub struct MainView {
 
 impl MainView {
     pub fn new(started: Instant, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let client = Arc::new(ServiceClient::default());
+        // The window opens focused. Being active makes the service load the index right away.
+        let client = Arc::new(ServiceClient::new(true));
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Search, e.g. report, .pdf, photos\\2024, !draft, !node_modules\\")
@@ -157,11 +167,16 @@ impl MainView {
             searched_volumes: 0,
             last_search: Instant::now(),
             settings_open: false,
+            active: true,
+            activated_at: Instant::now(),
+            polling: false,
             drive_error: None,
             started,
             first_frame: None,
             _subscriptions: subscriptions,
         };
+        cx.observe_window_activation(window, Self::on_activation)
+            .detach();
         view.search(true, cx);
         view.poll_status(window, cx);
         view
@@ -246,7 +261,7 @@ impl MainView {
         if window.has_active_dialog(cx) {
             window.close_dialog(cx);
         } else if cx.global::<Settings>().close_to_tray {
-            desktop::hide(window);
+            desktop::hide(window, cx);
         }
     }
 
@@ -325,10 +340,34 @@ impl MainView {
         .detach();
     }
 
-    /// Fetches the service status every second, and refreshes the results when the index
-    /// changed, at most every [`REFRESH_INTERVAL`] and only while the window is active. A drive
-    /// that became searchable refreshes them right away.
+    /// Tells the service when the window gets or loses the focus, and polls the status only
+    /// while it has it.
+    fn on_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active = window.is_window_active();
+        if active == self.active {
+            return;
+        }
+        self.active = active;
+        let client = self.client.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let _ = client.set_active(active);
+            })
+            .detach();
+        if active {
+            self.activated_at = Instant::now();
+            self.poll_status(window, cx);
+        }
+    }
+
+    /// Fetches the service status every second while the window is active, and refreshes the
+    /// results when the index changed: right after the window became active and when a drive
+    /// became searchable, otherwise at most every [`REFRESH_INTERVAL`].
     fn poll_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.polling {
+            return;
+        }
+        self.polling = true;
         let client = self.client.clone();
         cx.spawn_in(window, async move |view, cx| loop {
             let task = cx.background_executor().spawn({
@@ -356,8 +395,8 @@ impl MainView {
                         // After reconnecting the results may be empty or stale
                         let refresh = changed
                             && (new_volumes
-                                || view.last_search.elapsed() >= REFRESH_INTERVAL
-                                    && window.is_window_active());
+                                || view.activated_at.elapsed() < ACTIVATION_REFRESH
+                                || view.last_search.elapsed() >= REFRESH_INTERVAL);
                         if reconnected || refresh {
                             view.search(false, cx);
                         }
@@ -371,8 +410,13 @@ impl MainView {
                     }
                 }
                 cx.notify();
+                if !window.is_window_active() {
+                    view.polling = false;
+                    return false;
+                }
+                true
             });
-            if alive.is_err() {
+            if !matches!(alive, Ok(true)) {
                 return;
             }
             cx.background_executor().timer(STATUS_INTERVAL).await;
@@ -563,7 +607,10 @@ impl MainView {
                 } else if states.iter().any(|s| {
                     matches!(
                         s,
-                        VolumeState::Waiting | VolumeState::Loading | VolumeState::Indexing
+                        VolumeState::Waiting
+                            | VolumeState::Loading
+                            | VolumeState::Indexing
+                            | VolumeState::Asleep
                     )
                 }) {
                     ("Indexing".into(), Spinner::new().small().into_any_element())
@@ -791,6 +838,7 @@ fn state_text(state: &VolumeState) -> String {
         VolumeState::Loading => "Loading the saved index".to_string(),
         VolumeState::Indexing => "Reading the MFT".to_string(),
         VolumeState::Ready => "Up to date".to_string(),
+        VolumeState::Asleep => "Unloaded while not in use".to_string(),
         VolumeState::Offline => "Offline, not updated".to_string(),
         VolumeState::Failed(e) => format!("Failed: {}", e),
     }

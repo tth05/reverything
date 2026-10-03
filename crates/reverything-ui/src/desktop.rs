@@ -1,19 +1,25 @@
 //! Tray icon, global hotkey, single instance and hiding/showing the window.
+//!
+//! Nothing here polls: tray, menu and hotkey events arrive through callbacks, a second start
+//! through a Windows event, and all of them are handled when they happen. A window that stays
+//! hidden for a while is closed to free its memory and opened again when it is needed.
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use gpui_kit::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows::core::w;
+use windows::core::HSTRING;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND};
+use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
-    INFINITE,
+    CreateEventW, CreateMutexW, GetCurrentProcess, OpenEventW, SetEvent, WaitForSingleObject,
+    EVENT_MODIFY_STATE, INFINITE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_HIDE, SW_RESTORE, SW_SHOW,
@@ -22,21 +28,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::settings::{HotkeyChoice, Settings};
 use crate::view::{FocusSearch, OpenSettings};
 
-/// How often tray, hotkey and second-instance events are checked
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// A window hidden in the tray for this long is closed, and opened again when needed
+const CLOSE_HIDDEN_AFTER: Duration = Duration::from_secs(10 * 60);
 
-const INSTANCE_MUTEX: windows::core::PCWSTR = w!(r"Local\Reverything.UI");
-const SHOW_EVENT: windows::core::PCWSTR = w!(r"Local\Reverything.Show");
+/// Signalled when Reverything is started a second time
+pub struct SecondInstance(usize);
 
-/// Makes sure only one window exists. Returns `None` in a second instance after asking the
+/// Makes sure only one instance runs. Returns `None` in a second instance after asking the
 /// first one to show its window.
-pub fn single_instance() -> Option<mpsc::Receiver<()>> {
+pub fn single_instance() -> Option<SecondInstance> {
+    // A development build talking to another pipe runs next to the installed app
+    let suffix = std::env::var(reverything_protocol::PIPE_ENV)
+        .map(|pipe| format!(".{}", pipe.rsplit('\\').next().unwrap_or_default()))
+        .unwrap_or_default();
+    let mutex_name = HSTRING::from(format!(r"Local\Reverything.UI{}", suffix));
+    let event_name = HSTRING::from(format!(r"Local\Reverything.Show{}", suffix));
     unsafe {
         // Held for the lifetime of the process
-        let _mutex = CreateMutexW(None, true, INSTANCE_MUTEX).ok()?;
+        let _mutex = CreateMutexW(None, true, &mutex_name).ok()?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             for _ in 0..50 {
-                if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, SHOW_EVENT) {
+                if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, &event_name) {
                     let _ = SetEvent(event);
                     let _ = CloseHandle(event);
                     break;
@@ -46,45 +58,109 @@ pub fn single_instance() -> Option<mpsc::Receiver<()>> {
             }
             return None;
         }
-
-        let (tx, rx) = mpsc::channel();
-        let event = CreateEventW(None, false, false, SHOW_EVENT).ok()?;
-        let event = event.0 as usize;
-        std::thread::spawn(move || loop {
-            WaitForSingleObject(HANDLE(event as *mut _), INFINITE);
-            if tx.send(()).is_err() {
-                return;
-            }
-        });
-        Some(rx)
+        let event = CreateEventW(None, false, false, &event_name).ok()?;
+        Some(SecondInstance(event.0 as usize))
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Event {
+    Show,
+    Toggle,
+    OpenSettings,
+    Quit,
+}
+
+/// Opens the main window, shown and focused.
+pub type OpenWindow = fn(cx: &mut App) -> AnyWindowHandle;
+
 /// Lives as long as the app; dropping it removes the tray icon.
 pub struct Desktop {
-    window: AnyWindowHandle,
+    /// `None` while the window is closed
+    window: Option<AnyWindowHandle>,
+    open_window: OpenWindow,
+    /// Closes the window after it was hidden for a while, dropped when it is shown again
+    close_hidden: Option<Task<()>>,
     _tray: Option<TrayIcon>,
     hotkeys: Option<GlobalHotKeyManager>,
     hotkey: Option<HotKey>,
+    /// Id of the registered hotkey, read by the hotkey callback
+    hotkey_id: Arc<AtomicU32>,
     /// The shortcut that is registered right now
     pub active_hotkey: Option<HotkeyChoice>,
     /// Why the chosen shortcut could not be registered
     pub hotkey_error: Option<String>,
-    show_id: MenuId,
-    settings_id: MenuId,
-    quit_id: MenuId,
-    second_instance: mpsc::Receiver<()>,
 }
 
 impl Global for Desktop {}
 
 impl Desktop {
-    pub fn install(window: AnyWindowHandle, second_instance: mpsc::Receiver<()>, cx: &mut App) {
+    /// `window` is `None` when the app started hidden without opening it.
+    pub fn install(
+        window: Option<AnyWindowHandle>,
+        open_window: OpenWindow,
+        second_instance: SecondInstance,
+        cx: &mut App,
+    ) {
+        let (events, received) = async_channel::unbounded::<Event>();
+
         let show = MenuItem::new("Open Reverything", true, None);
         let settings = MenuItem::new("Settings", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::new();
         let _ = menu.append_items(&[&show, &settings, &PredefinedMenuItem::separator(), &quit]);
+        let (show_id, settings_id, quit_id) =
+            (show.id().clone(), settings.id().clone(), quit.id().clone());
+        MenuEvent::set_event_handler(Some({
+            let events = events.clone();
+            move |event: MenuEvent| {
+                let event = if event.id == show_id {
+                    Event::Show
+                } else if event.id == settings_id {
+                    Event::OpenSettings
+                } else if event.id == quit_id {
+                    Event::Quit
+                } else {
+                    return;
+                };
+                let _ = events.try_send(event);
+            }
+        }));
+        TrayIconEvent::set_event_handler(Some({
+            let events = events.clone();
+            move |event: TrayIconEvent| match event {
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } => {
+                    let _ = events.try_send(Event::Toggle);
+                }
+                TrayIconEvent::DoubleClick { .. } => {
+                    let _ = events.try_send(Event::Show);
+                }
+                _ => {}
+            }
+        }));
+        let hotkey_id = Arc::new(AtomicU32::new(0));
+        GlobalHotKeyEvent::set_event_handler(Some({
+            let events = events.clone();
+            let hotkey_id = hotkey_id.clone();
+            move |event: GlobalHotKeyEvent| {
+                if event.id == hotkey_id.load(Ordering::Relaxed)
+                    && event.state == HotKeyState::Pressed
+                {
+                    let _ = events.try_send(Event::Toggle);
+                }
+            }
+        }));
+        let SecondInstance(event) = second_instance;
+        std::thread::spawn(move || loop {
+            unsafe { WaitForSingleObject(HANDLE(event as *mut _), INFINITE) };
+            if events.send_blocking(Event::Show).is_err() {
+                return;
+            }
+        });
 
         let tray = match tray_icon::Icon::from_resource(1, None) {
             Ok(icon) => TrayIconBuilder::new()
@@ -109,22 +185,22 @@ impl Desktop {
 
         let mut desktop = Desktop {
             window,
+            open_window,
+            close_hidden: None,
             _tray: tray,
             hotkeys,
             hotkey: None,
+            hotkey_id,
             active_hotkey: None,
             hotkey_error: None,
-            show_id: show.id().clone(),
-            settings_id: settings.id().clone(),
-            quit_id: quit.id().clone(),
-            second_instance,
         };
         desktop.apply_hotkey(cx.global::<Settings>().hotkey);
         cx.set_global(desktop);
 
-        cx.spawn(async move |cx| loop {
-            cx.background_executor().timer(POLL_INTERVAL).await;
-            cx.update(Desktop::poll);
+        cx.spawn(async move |cx| {
+            while let Ok(event) = received.recv().await {
+                cx.update(|cx| Desktop::handle(event, cx));
+            }
         })
         .detach();
     }
@@ -136,6 +212,7 @@ impl Desktop {
         if let Some(old) = self.hotkey.take() {
             let _ = manager.unregister(old);
         }
+        self.hotkey_id.store(0, Ordering::Relaxed);
         self.active_hotkey = None;
         self.hotkey_error = None;
 
@@ -153,6 +230,7 @@ impl Desktop {
             match manager.register(hotkey) {
                 Ok(()) => {
                     self.hotkey = Some(hotkey);
+                    self.hotkey_id.store(hotkey.id(), Ordering::Relaxed);
                     self.active_hotkey = Some(candidate);
                     return;
                 }
@@ -165,65 +243,64 @@ impl Desktop {
         });
     }
 
-    fn poll(cx: &mut App) {
-        let desktop = cx.global::<Desktop>();
-        let window = desktop.window;
-        let hotkey_id = desktop.hotkey.map(|h| h.id());
-        let (show_id, settings_id, quit_id) = (
-            desktop.show_id.clone(),
-            desktop.settings_id.clone(),
-            desktop.quit_id.clone(),
-        );
-
-        let mut show = desktop.second_instance.try_recv().is_ok();
-        let mut toggle = false;
-        let mut open_settings = false;
-        let mut quit = false;
-
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            match event {
-                TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                } => toggle = true,
-                TrayIconEvent::DoubleClick { .. } => show = true,
-                _ => {}
-            }
-        }
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == show_id {
-                show = true;
-            } else if event.id == settings_id {
-                show = true;
-                open_settings = true;
-            } else if event.id == quit_id {
-                quit = true;
-            }
-        }
-        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if Some(event.id) == hotkey_id && event.state == HotKeyState::Pressed {
-                toggle = true;
-            }
-        }
-
-        if quit {
+    fn handle(event: Event, cx: &mut App) {
+        if let Event::Quit = event {
             cx.quit();
             return;
         }
-        if !(show || toggle) {
+        let window = cx.global::<Desktop>().window;
+        let Some(window) = window else {
+            // Closed while hidden, open it again
+            let open = cx.global::<Desktop>().open_window;
+            let window = open(cx);
+            let desktop = cx.global_mut::<Desktop>();
+            desktop.window = Some(window);
+            desktop.close_hidden = None;
+            if let Event::OpenSettings = event {
+                let _ = window.update(cx, |_, window, cx| {
+                    window.dispatch_action(Box::new(OpenSettings), cx)
+                });
+            }
             return;
-        }
+        };
         let _ = window.update(cx, |_, window, cx| {
-            if toggle && !show && is_visible(window) && window.is_window_active() {
-                hide(window);
+            let toggle = matches!(event, Event::Toggle);
+            if toggle && is_visible(window) && window.is_window_active() {
+                hide(window, cx);
             } else {
                 show_window(window, cx);
-                if open_settings {
+                if let Event::OpenSettings = event {
                     window.dispatch_action(Box::new(OpenSettings), cx);
                 }
             }
         });
+    }
+
+    /// Closes the window if it is still hidden, freeing its memory. The tray icon and hotkey
+    /// open it again.
+    fn close_hidden_window(cx: &mut App) {
+        let Some(window) = cx.global::<Desktop>().window else {
+            return;
+        };
+        let closed = window
+            .update(cx, |_, window, _| {
+                if is_visible(window) {
+                    return false;
+                }
+                window.remove_window();
+                true
+            })
+            .unwrap_or(true);
+        if closed {
+            crate::log::write("Closed the hidden window");
+            let desktop = cx.global_mut::<Desktop>();
+            desktop.window = None;
+            desktop.close_hidden = None;
+            // The renderer keeps its caches, at least they do not need to stay in memory
+            unsafe {
+                let _ = K32EmptyWorkingSet(GetCurrentProcess());
+            }
+        }
     }
 }
 
@@ -238,16 +315,27 @@ fn is_visible(window: &Window) -> bool {
     hwnd(window).is_some_and(|h| unsafe { IsWindowVisible(h).as_bool() })
 }
 
-pub fn hide(window: &Window) {
+/// Hides the window to the tray. If it stays hidden for [`CLOSE_HIDDEN_AFTER`] it is closed.
+pub fn hide(window: &Window, cx: &mut App) {
     if let Some(h) = hwnd(window) {
         unsafe {
             let _ = ShowWindow(h, SW_HIDE);
         }
     }
+    if cx.has_global::<Desktop>() {
+        let task = cx.spawn(async move |cx| {
+            cx.background_executor().timer(CLOSE_HIDDEN_AFTER).await;
+            cx.update(Desktop::close_hidden_window);
+        });
+        cx.global_mut::<Desktop>().close_hidden = Some(task);
+    }
 }
 
 /// Shows, restores and focuses the window, with the search box focused.
 pub fn show_window(window: &mut Window, cx: &mut App) {
+    if cx.has_global::<Desktop>() {
+        cx.global_mut::<Desktop>().close_hidden = None;
+    }
     if let Some(h) = hwnd(window) {
         unsafe {
             let _ = ShowWindow(

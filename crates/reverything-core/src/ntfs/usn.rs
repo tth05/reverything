@@ -25,6 +25,8 @@ pub struct JournalInfo {
     pub id: u64,
     pub first_usn: i64,
     pub next_usn: i64,
+    /// Size the journal is kept at, older records are deleted beyond it
+    pub max_size: u64,
 }
 
 pub fn query_journal(handle: &Handle) -> Result<JournalInfo> {
@@ -34,6 +36,7 @@ pub fn query_journal(handle: &Handle) -> Result<JournalInfo> {
         id: data.UsnJournalID,
         first_usn: data.FirstUsn,
         next_usn: data.NextUsn,
+        max_size: data.MaximumSize,
     })
 }
 
@@ -85,6 +88,15 @@ impl JournalReader {
 
     pub fn next_usn(&self) -> i64 {
         self.next_usn
+    }
+
+    pub fn journal_id(&self) -> u64 {
+        self.journal_id
+    }
+
+    /// The current state of the journal.
+    pub fn query(&self) -> Result<JournalInfo> {
+        query_journal(&self.handle)
     }
 
     /// Collects the record numbers of changed files into `changed`. With `wait`, blocks until at

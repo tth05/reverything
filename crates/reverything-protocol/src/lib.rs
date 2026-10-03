@@ -24,7 +24,7 @@ pub fn pipe_name() -> String {
 }
 
 /// Bumped on incompatible changes. Clients and the service have to agree on it.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Upper bound for requests, which come from less privileged processes
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -58,6 +58,12 @@ pub enum Request {
     /// Indexes exactly these volumes (drive letters). The choice is saved by the service.
     SetVolumes {
         volumes: Vec<char>,
+    },
+    /// The client's window got (`true`) or lost the focus. The indices are only loaded and
+    /// updated live while a client is active. Clients that never send this count as active
+    /// from their first search on.
+    SetActive {
+        active: bool,
     },
 }
 
@@ -133,6 +139,8 @@ pub enum VolumeState {
     Loading,
     Indexing,
     Ready,
+    /// Unloaded while the app is not used, loaded again when it is
+    Asleep,
     Offline,
     Failed(String),
 }

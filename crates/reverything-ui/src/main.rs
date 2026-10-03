@@ -61,56 +61,68 @@ fn main() {
         stage("run");
         init(cx);
         stage("init");
+        // The app keeps running in the tray without a window
+        cx.set_quit_mode(QuitMode::Explicit);
         cx.set_global(settings::Settings::load());
         view::apply_theme(None, cx);
         cx.bind_keys(view::key_bindings());
 
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(1280.), px(780.)),
-                cx,
-            ))),
-            // The window draws its own title bar, see `view::MainView::render_title_bar`
-            titlebar: Some(TitlebarOptions {
-                title: Some("Reverything".into()),
-                ..gpui_kit::component::TitleBar::title_bar_options()
-            }),
-            app_owns_titlebar_drag: true,
-            window_min_size: Some(size(px(640.), px(360.))),
-            show: !background,
-            focus: !background,
-            ..Default::default()
-        };
-
-        let (window, _) = open_window(options, cx, |window, cx| {
-            let view = cx.new(|cx| view::MainView::new(started, window, cx));
-
-            // Follow the Windows light/dark setting
-            window
-                .observe_window_appearance(|window, cx| {
-                    if cx.global::<settings::Settings>().theme == settings::ThemeChoice::System {
-                        view::apply_theme(Some(window), cx);
-                    }
-                })
-                .detach();
-
-            // Closing hides the window to the tray unless that is turned off
-            window.on_window_should_close(cx, |window, cx| {
-                if cx.global::<settings::Settings>().close_to_tray {
-                    desktop::hide(window);
-                    false
-                } else {
-                    cx.quit();
-                    true
-                }
-            });
-            view
-        })
-        .expect("Failed to open the window");
+        // Started with Windows, the window is only opened when it is first needed
+        let window = (!background).then(|| open_main_window(started, cx));
         stage("window opened");
 
-        desktop::Desktop::install(window, second_instance, cx);
+        desktop::Desktop::install(window, reopen_main_window, second_instance, cx);
         stage("tray and hotkey");
     });
+}
+
+/// Opens the search window, shown and focused.
+fn open_main_window(started: Instant, cx: &mut App) -> AnyWindowHandle {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(1280.), px(780.)),
+            cx,
+        ))),
+        // The window draws its own title bar, see `view::MainView::render_title_bar`
+        titlebar: Some(TitlebarOptions {
+            title: Some("Reverything".into()),
+            ..gpui_kit::component::TitleBar::title_bar_options()
+        }),
+        app_owns_titlebar_drag: true,
+        window_min_size: Some(size(px(640.), px(360.))),
+        ..Default::default()
+    };
+
+    let (window, _) = open_window(options, cx, |window, cx| {
+        let view = cx.new(|cx| view::MainView::new(started, window, cx));
+
+        // Follow the Windows light/dark setting
+        window
+            .observe_window_appearance(|window, cx| {
+                if cx.global::<settings::Settings>().theme == settings::ThemeChoice::System {
+                    view::apply_theme(Some(window), cx);
+                }
+            })
+            .detach();
+
+        // Closing hides the window to the tray unless that is turned off
+        window.on_window_should_close(cx, |window, cx| {
+            if cx.global::<settings::Settings>().close_to_tray {
+                desktop::hide(window, cx);
+                false
+            } else {
+                cx.quit();
+                true
+            }
+        });
+        view
+    })
+    .expect("Failed to open the window");
+    window
+}
+
+/// Opens the window again after it was closed while hidden.
+fn reopen_main_window(cx: &mut App) -> AnyWindowHandle {
+    open_main_window(Instant::now(), cx)
 }

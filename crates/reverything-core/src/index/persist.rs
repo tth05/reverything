@@ -51,6 +51,58 @@ pub fn load_current(volume: Volume, dir: &Path) -> Result<VolumeIndex> {
     Ok(index)
 }
 
+/// The header of a saved index, readable without loading the whole file.
+#[derive(Debug, Clone, Copy)]
+pub struct SavedHeader {
+    pub record_size: u32,
+    pub volume_serial: u64,
+    pub journal_id: u64,
+    /// Journal position the saved index is up to date with
+    pub next_usn: i64,
+}
+
+/// Reads the header of the saved index of `volume`, `None` if there is none.
+pub fn read_header(volume: Volume, dir: &Path) -> Result<Option<SavedHeader>> {
+    let path = db_path(dir, volume);
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("Failed to open {}", path.display())),
+    };
+    read_header_from(&mut file, volume).map(Some)
+}
+
+fn read_header_from(file: &mut File, volume: Volume) -> Result<SavedHeader> {
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic)?;
+    ensure!(magic == MAGIC, "Not an index file");
+    let version = read_u32(file)?;
+    ensure!(
+        version == VERSION,
+        "Index file has version {}, expected {}",
+        version,
+        VERSION
+    );
+    ensure!(
+        read_u32(file)? == volume.id as u32,
+        "Index file is for another volume"
+    );
+    Ok(SavedHeader {
+        record_size: read_u32(file)?,
+        volume_serial: read_u64(file)?,
+        journal_id: read_u64(file)?,
+        next_usn: read_u64(file)? as i64,
+    })
+}
+
+/// Loads the saved index of a volume with the given serial number, without checking the
+/// journal. The caller brings it up to date.
+pub fn load_saved(volume: Volume, dir: &Path, volume_serial: u64) -> Result<VolumeIndex> {
+    let mut index = VolumeIndex::load(volume, dir, Some(volume_serial))?;
+    index.compute_folder_sizes();
+    Ok(index)
+}
+
 /// Loads a saved index without checking it against the volume, which needs no admin rights.
 /// The index can not be kept up to date then.
 pub fn load_offline(volume: Volume, dir: &Path) -> Result<VolumeIndex> {
@@ -107,29 +159,17 @@ impl VolumeIndex {
         let mut file =
             File::open(&path).with_context(|| format!("Failed to open {}", path.display()))?;
 
-        let mut magic = [0u8; 8];
-        file.read_exact(&mut magic)?;
-        ensure!(magic == MAGIC, "Not an index file");
-        let version = read_u32(&mut file)?;
-        ensure!(
-            version == VERSION,
-            "Index file has version {}, expected {}",
-            version,
-            VERSION
-        );
-        ensure!(
-            read_u32(&mut file)? == volume.id as u32,
-            "Index file is for another volume"
-        );
-        let record_size = read_u32(&mut file)?;
-        let serial = read_u64(&mut file)?;
+        let SavedHeader {
+            record_size,
+            volume_serial: serial,
+            journal_id,
+            next_usn,
+        } = read_header_from(&mut file, volume)?;
         ensure!(
             volume_serial.is_none_or(|s| s == serial),
             "Index file is for another volume"
         );
         let volume_serial = serial;
-        let journal_id = read_u64(&mut file)?;
-        let next_usn = read_u64(&mut file)? as i64;
 
         let records = Records {
             name_off: read_vec(&mut file)?,

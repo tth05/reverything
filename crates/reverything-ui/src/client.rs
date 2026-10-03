@@ -1,26 +1,51 @@
 //! Shared connection to the service. Requests block, so they run on GPUI's background
 //! executor; the mutex keeps them in order on the single pipe.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use reverything_protocol::{Client, Request, Response};
 
-#[derive(Default)]
 pub struct ServiceClient {
     client: Mutex<Option<Client>>,
     connect_time: Mutex<Option<Duration>>,
+    /// Whether the window is active. The service only keeps the index loaded and live while a
+    /// client is active, so this is sent on every new connection.
+    active: AtomicBool,
 }
 
 impl ServiceClient {
+    pub fn new(active: bool) -> Self {
+        Self {
+            client: Mutex::new(None),
+            connect_time: Mutex::new(None),
+            active: AtomicBool::new(active),
+        }
+    }
+
+    /// Tells the service whether the window is active.
+    pub fn set_active(&self, active: bool) -> Result<(), String> {
+        self.active.store(active, Ordering::SeqCst);
+        self.request(&Request::SetActive { active }).map(|_| ())
+    }
+
     /// Sends a request, connecting first if needed. A failed request drops the connection so the
     /// next one reconnects, e.g. after the service restarted.
     pub fn request(&self, request: &Request) -> Result<Response, String> {
         let mut client = self.client.lock().unwrap();
         if client.is_none() {
             let t = Instant::now();
-            *client = Some(Client::connect().map_err(describe)?);
+            let mut connected = Client::connect().map_err(describe)?;
             *self.connect_time.lock().unwrap() = Some(t.elapsed());
+            // Sent before anything else, a search would otherwise count as active
+            if !matches!(request, Request::SetActive { .. }) {
+                let active = self.active.load(Ordering::SeqCst);
+                connected
+                    .request(&Request::SetActive { active })
+                    .map_err(describe)?;
+            }
+            *client = Some(connected);
         }
 
         match client.as_mut().unwrap().request(request) {

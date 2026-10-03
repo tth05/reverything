@@ -31,6 +31,10 @@ pub fn run(query: &str) -> Result<()> {
         }
         other => bail!("Unexpected response {:?}", other),
     }
+    // Only the status, without searching (which counts as using the index)
+    if std::env::var_os("RV_QUERY_STATUS_ONLY").is_some() {
+        return Ok(());
+    }
 
     let t = Instant::now();
     let (search, total, took_us) = match client.request(&Request::Search {

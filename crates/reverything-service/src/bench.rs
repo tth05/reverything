@@ -51,8 +51,22 @@ pub fn run() -> Result<()> {
         // Runs the live service for a while, so clients can be tested against it
         crate::logger::init_stderr();
         let app = crate::App::start(dev_db_dir(), reverything_protocol::pipe_name(), false)?;
+        // RV_IDLE_CHECK_SECS and RV_UNLOAD_SECS shorten the idle behaviour for testing
+        let env_secs = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map_or(
+                    std::time::Duration::from_secs(default),
+                    std::time::Duration::from_secs,
+                )
+        };
+        app.set.set_idle_timing(
+            env_secs("RV_IDLE_CHECK_SECS", 5 * 60),
+            env_secs("RV_UNLOAD_SECS", 60 * 60),
+        );
         std::thread::sleep(std::time::Duration::from_secs(secs.parse()?));
-        app.set.save_changed();
+        app.set.shutdown();
         return Ok(());
     }
 

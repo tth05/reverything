@@ -17,10 +17,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use eyre::{bail, Result};
-use mimalloc_rust::GlobalMiMalloc;
+use mimalloc::MiMalloc;
 use windows::core::BOOL;
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 
@@ -38,10 +37,7 @@ mod server;
 mod winsvc;
 
 #[global_allocator]
-static GLOBAL: GlobalMiMalloc = GlobalMiMalloc;
-
-/// How often changed indices are saved, so a crash or power loss does not cost a full rescan
-const SAVE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+static GLOBAL: MiMalloc = MiMalloc;
 
 /// A running index set with its pipe server.
 pub struct App {
@@ -63,16 +59,16 @@ impl App {
         } else {
             IndexSet::new(volumes, db_dir)
         };
+        // Freed memory goes back to the system instead of staying with the allocator. Every
+        // thread caches what it allocated, and indices are built on the rayon threads.
+        set.on_trim(|| {
+            let collect = || unsafe { libmimalloc_sys::mi_collect(true) };
+            rayon::broadcast(|_| collect());
+            collect();
+        });
         set.set_enabled(&config.volumes);
         if !offline {
             set.delete_unused();
-            let saver = set.clone();
-            std::thread::Builder::new()
-                .name("saver".into())
-                .spawn(move || loop {
-                    std::thread::sleep(SAVE_INTERVAL);
-                    saver.save_changed();
-                })?;
         }
 
         let server = server::Server::new(set.clone(), pipe);
@@ -154,8 +150,6 @@ fn run_console(offline: bool) -> Result<()> {
     let app = App::start(db_dir, pipe_name(), offline)?;
     let _ = stop_rx.recv();
     log::info!("Stopping");
-    if !offline {
-        app.set.save_changed();
-    }
+    app.set.shutdown();
     Ok(())
 }
