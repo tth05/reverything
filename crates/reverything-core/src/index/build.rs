@@ -24,6 +24,8 @@ pub struct ScanOptions {
     pub threads: usize,
     pub chunk_bytes: usize,
     pub no_buffering: bool,
+    /// Off only for benchmarks that measure reading alone; the index stays empty then
+    pub parse: bool,
 }
 
 impl Default for ScanOptions {
@@ -34,6 +36,7 @@ impl Default for ScanOptions {
             threads: 3,
             chunk_bytes: 32 * 1024 * 1024,
             no_buffering: true,
+            parse: true,
         }
     }
 }
@@ -55,6 +58,9 @@ impl ScanOptions {
         }
         if let Some(b) = var("RV_NOBUF") {
             opts.no_buffering = b != 0;
+        }
+        if let Some(p) = var("RV_PARSE") {
+            opts.parse = p != 0;
         }
         opts
     }
@@ -157,8 +163,10 @@ pub fn scan_volume(volume: Volume, opts: &ScanOptions) -> Result<(VolumeIndex, S
     let outs = Mutex::new(Vec::with_capacity(chunks.len()));
 
     layout.read_parallel(&handle, &chunks, opts.threads, |index, range, buf| {
-        let out = unsafe { parse_chunk(&layout, &writer, index, range, buf) };
-        outs.lock().unwrap().push(out);
+        if opts.parse {
+            let out = unsafe { parse_chunk(&layout, &writer, index, range, buf) };
+            outs.lock().unwrap().push(out);
+        }
     })?;
     drop(handle);
     stats.read_parse = t.elapsed();

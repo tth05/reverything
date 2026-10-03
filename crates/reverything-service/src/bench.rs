@@ -47,6 +47,10 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
+    if std::env::var("RV_READTEST").is_ok() {
+        return read_test(volumes[0], &opts);
+    }
+
     if let Ok(secs) = std::env::var("RV_SERVE_SECS") {
         // Runs the live service for a while, so clients can be tested against it
         crate::logger::init_stderr();
@@ -197,6 +201,94 @@ fn load_env_file() {
 }
 
 /// What the app does on start: load every saved index (or scan) and catch up with the journal.
+/// Where the scan's time goes: the drive's sequential read speed through the same I/O path
+/// (unbuffered overlapped reads of the raw volume) at several request sizes and queue depths,
+/// then the MFT scan without and with parsing.
+fn read_test(volume: reverything_core::ntfs::volume::Volume, opts: &ScanOptions) -> Result<()> {
+    const TOTAL: u64 = 4 << 30;
+    println!("raw sequential reads of the first 4 GB of {}:", volume.id);
+    for (request_mb, depth) in [(32, 1), (32, 2), (32, 4), (32, 8), (8, 8), (8, 32), (2, 32)] {
+        let t = Instant::now();
+        raw_read(volume, TOTAL, request_mb << 20, depth)?;
+        println!(
+            "  {:>2} MB requests, {:>2} in flight: {:>5.0} MB/s",
+            request_mb,
+            depth,
+            TOTAL as f64 / MB / t.elapsed().as_secs_f64()
+        );
+    }
+
+    for parse in [false, true] {
+        let opts = ScanOptions {
+            parse,
+            ..opts.clone()
+        };
+        let (_, stats) = scan_volume(volume, &opts)?;
+        println!(
+            "MFT scan {} parsing ({} threads x {} MB): {} MB in {:?} = {:.0} MB/s, {} chunks",
+            if parse { "with" } else { "without" },
+            opts.threads,
+            opts.chunk_bytes >> 20,
+            stats.bytes_read >> 20,
+            stats.read_parse,
+            stats.bytes_read as f64 / MB / stats.read_parse.as_secs_f64(),
+            stats.chunks
+        );
+    }
+    Ok(())
+}
+
+/// Reads `total` bytes from the start of the volume, keeping `depth` requests in flight.
+fn raw_read(
+    volume: reverything_core::ntfs::volume::Volume,
+    total: u64,
+    request: usize,
+    depth: usize,
+) -> Result<()> {
+    use reverything_core::ntfs::io::{begin_read, finish_read, AlignedBuf, Event};
+    let handle = volume.open(true, true)?;
+    let mut bufs = (0..depth)
+        .map(|_| AlignedBuf::new(request))
+        .collect::<Result<Vec<_>>>()?;
+    let events = (0..depth)
+        .map(|_| Event::new())
+        .collect::<Result<Vec<_>>>()?;
+    let mut pending = std::collections::VecDeque::new();
+    let mut offset = 0u64;
+    for slot in 0..depth {
+        if offset < total {
+            let read = unsafe {
+                begin_read(
+                    &handle,
+                    offset,
+                    bufs[slot].as_mut_ptr(),
+                    request,
+                    &events[slot],
+                )?
+            };
+            pending.push_back((slot, read));
+            offset += request as u64;
+        }
+    }
+    while let Some((slot, read)) = pending.pop_front() {
+        finish_read(&handle, read)?;
+        if offset < total {
+            let read = unsafe {
+                begin_read(
+                    &handle,
+                    offset,
+                    bufs[slot].as_mut_ptr(),
+                    request,
+                    &events[slot],
+                )?
+            };
+            pending.push_back((slot, read));
+            offset += request as u64;
+        }
+    }
+    Ok(())
+}
+
 fn bench_startup(volumes: Vec<reverything_core::ntfs::volume::Volume>) -> Result<()> {
     use reverything_core::service::JournalFollower;
 

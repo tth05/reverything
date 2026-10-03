@@ -177,6 +177,8 @@ Variations are read from `target/bench.env` (`KEY=VALUE` lines):
 | --- | --- |
 | `RV_THREADS`, `RV_CHUNK_KB`, `RV_NOBUF` | Scan options |
 | `RV_SWEEP=threads:chunk_kb,...` | Times scans of the first volume with each combination |
+| `RV_READTEST=1` | Raw sequential read speed of the first volume at several request sizes and queue depths, then its MFT scan with and without parsing |
+| `RV_PARSE=0` | Scans without parsing, to time reading alone (the index stays empty) |
 | `RV_STARTUP=1` | Measures startup from the saved index including the journal replay |
 | `RV_JOURNAL=1` | Creates, renames, links and deletes files in `%TEMP%` and checks the index follows |
 | `RV_SERVE_SECS=90` | Runs the live service for that long, to test clients against it (volumes are turned on through a client, e.g. `RV_QUERY_VOLUMES`) |
