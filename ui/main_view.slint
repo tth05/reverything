@@ -1,27 +1,54 @@
-import { Button, VerticalBox, StandardTableView, LineEdit } from "std-widgets.slint";
+import { VerticalBox, HorizontalBox, StandardTableView, LineEdit } from "std-widgets.slint";
 
 export component App inherits Window {
     title: "Reverything";
 
-    callback search_input_change(string);
-    in property <[[StandardListViewItem]]> data;
+    in property <[[StandardListViewItem]]> rows;
+    in property <string> result-info;
+    in property <string> status;
+
+    callback search-changed(string);
+    callback sort-changed(/* column */ int, /* ascending */ bool);
+    callback row-clicked(/* row */ int);
 
     preferred-width: 1280px;
     preferred-height: 720px;
-    default-font-size: 15px;
+    default-font-size: 14px;
+
     VerticalBox {
         LineEdit {
             font-size: 1.2rem;
-            placeholder-text: "Search...";
-            edited(text) => { search_input_change(text); }
+            placeholder-text: "Search... (name, folder\\name, C:\\path\\, ...)";
+            edited(text) => { root.search-changed(text); }
         }
 
         StandardTableView {
             columns: [
-                { title: "Name" },
-                { title: "Size" },
+                { title: "Name", horizontal-stretch: 0.25 },
+                { title: "Folder", horizontal-stretch: 0.4 },
+                { title: "Size", horizontal-stretch: 0.08 },
+                { title: "Date Modified", horizontal-stretch: 0.11 },
+                { title: "Date Created", horizontal-stretch: 0.11 },
+                { title: "Attributes", horizontal-stretch: 0.05 },
             ];
-            rows: root.data;
+            rows: root.rows;
+            sort-ascending(column) => { root.sort-changed(column, true); }
+            sort-descending(column) => { root.sort-changed(column, false); }
+            row-pointer-event(row, event, position) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    root.row-clicked(row);
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 16px;
+            Text { text: root.result-info; }
+            Text {
+                text: root.status;
+                horizontal-alignment: right;
+                overflow: elide;
+            }
         }
     }
 }

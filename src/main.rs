@@ -1,47 +1,32 @@
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-
-use crate::ntfs::index::NtfsVolumeIndex;
-use crate::ntfs::journal::Journal;
-use crate::ntfs::volume::get_volumes;
-use eyre::{ContextCompat, Result};
+use eyre::{bail, Result};
 use mimalloc_rust::GlobalMiMalloc;
 
+use crate::ntfs::volume::ntfs_volumes;
+use crate::service::IndexSet;
+
+mod bench;
+mod index;
 mod ntfs;
+mod search;
+mod service;
 mod ui;
 
 #[global_allocator]
 static GLOBAL: GlobalMiMalloc = GlobalMiMalloc;
 
 fn main() -> Result<()> {
-    let vol = get_volumes()
-        .into_iter()
-        .next()
-        .with_context(|| "Cannot find first volume")?;
-    let journal = Journal::new(vol)?;
+    if std::env::args().any(|a| a == "--bench") {
+        return bench::run();
+    }
 
-    let t = Instant::now();
-    let index = Arc::new(Mutex::new(NtfsVolumeIndex::new(vol)?));
-    println!("Building index took: {:?}", t.elapsed());
+    let volumes = ntfs_volumes();
+    if volumes.is_empty() {
+        bail!("No fixed NTFS volumes found");
+    }
 
-    start_journal_thread(journal, index.clone());
-    
-    ui::run_ui(index.clone())?;
+    let set = IndexSet::new(volumes);
+    set.start();
+    ui::run_ui(set.clone())?;
+    set.save_all();
     Ok(())
-}
-
-fn start_journal_thread(mut journal: Journal, index: Arc<Mutex<NtfsVolumeIndex>>) {
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-
-            let vec = journal.read_entries().unwrap();
-            if vec.is_empty() {
-                continue;
-            }
-
-            let mut index = index.lock().unwrap();
-            index.process_journal_entries(&vec);
-        }
-    });
 }

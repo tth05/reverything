@@ -7,7 +7,7 @@ build = "build.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-windows = { version = "0.58.0", default-features = false, features = [
+windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Foundation",
     "Win32_System_IO",
     "Win32_System_Diagnostics_Debug",
@@ -16,19 +16,17 @@ windows = { version = "0.58.0", default-features = false, features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
     "Win32_System_Ioctl",
-    "Win32_UI_HiDpi"
+    "Win32_UI_HiDpi",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Memory",
+    "Win32_System_Time"
 ] }
 mimalloc-rust = "0.2.1"
-eyre = "0.6.12"
-rayon = "1.10.0"
-rustc-hash = "2.0.0"
-num_cpus = "1.16.0"
-smartstring = "1.0.1"
-slint = "1.7.2"
-log = "0.4.22"
+eyre = "0.6.14"
+rayon = "1.12.0"
+memchr = "2.8.3"
+slint = "1.18.1"
 
 [build-dependencies]
-slint-build = "1.7.2"
+slint-build = "1.18.1"
 
-[features]
-journal_dbg = []
