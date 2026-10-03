@@ -1,33 +1,25 @@
-[package]
-name = "reverything"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-build = "build.rs"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
-windows = { version = "0.62.2", default-features = false, features = [
-    "Win32_Foundation",
-    "Win32_System_IO",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_Storage_FileSystem",
-    "Win32_Security",
-    "Win32_System_Threading",
-    "Win32_System_WindowsProgramming",
-    "Win32_System_Ioctl",
-    "Win32_UI_HiDpi",
-    "Win32_System_ProcessStatus",
-    "Win32_System_Memory",
-    "Win32_System_Time",
-    "Win32_UI_WindowsAndMessaging"
-] }
-mimalloc-rust = "0.2.1"
+[workspace.dependencies]
+reverything-core = { path = "crates/reverything-core" }
+reverything-protocol = { path = "crates/reverything-protocol" }
+windows = { version = "0.62.2", default-features = false, features = ["std"] }
 eyre = "0.6.14"
 rayon = "1.12.0"
 memchr = "2.8.3"
-slint = "1.18.1"
+mimalloc-rust = "0.2.1"
+log = { version = "0.4.34", features = ["std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 
-[build-dependencies]
-slint-build = "1.18.1"
-
+# Slow to compile, only used for release builds on CI and the installer
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

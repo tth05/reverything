@@ -1,0 +1,23 @@
+[package]
+name = "reverything-service"
+description = "Windows service that keeps the Reverything index and answers searches"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reverything-core.workspace = true
+reverything-protocol.workspace = true
+eyre.workspace = true
+log.workspace = true
+mimalloc-rust.workspace = true
+windows-service = "0.8.1"
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

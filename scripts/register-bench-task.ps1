@@ -1,5 +1,5 @@
 #Requires -RunAsAdministrator
-# Registers the "ReverythingBench" scheduled task, which runs `reverything.exe --bench` elevated
+# Registers the "ReverythingBench" scheduled task, which runs `reverything-service.exe --bench` elevated
 # without a UAC prompt. Start it with `schtasks /run /tn ReverythingBench`; the output goes to
 # target\bench.log. The task can only run this fixed command, for at most 2 minutes.
 #
@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 
 $taskName = 'ReverythingBench'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$exe = Join-Path $repo 'target\release\reverything.exe'
+$exe = Join-Path $repo 'target\release\reverything-service.exe'
 $log = Join-Path $repo 'target\bench.log'
 
 $action = New-ScheduledTaskAction `
