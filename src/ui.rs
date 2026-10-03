@@ -9,7 +9,9 @@ use slint::{
     TimerMode, VecModel,
 };
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use crate::index::VolumeIndex;
 use crate::search::{hit_parts, search_all, Hit, Sort, SortColumn};
@@ -20,7 +22,15 @@ slint::include_modules!();
 struct SearchRequest {
     text: String,
     sort: Sort,
+    /// Re-run because the index changed, not because the user changed the search
+    refresh: bool,
 }
+
+/// Minimum time between the last search and a refresh caused by index changes. Typing or
+/// sorting always searches right away.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// Upper bound for rows updated in place when a refresh did not change the results
+const MAX_ROWS_UPDATED_IN_PLACE: usize = 1000;
 
 pub fn run_ui(set: Arc<IndexSet>) -> Result<(), slint::PlatformError> {
     let app = App::new()?;
@@ -29,6 +39,7 @@ pub fn run_ui(set: Arc<IndexSet>) -> Result<(), slint::PlatformError> {
         set: set.clone(),
         hits: RefCell::new(Vec::new()),
         notify: Default::default(),
+        requested_rows: Cell::new(None),
     });
     app.set_rows(model.clone().into());
 
@@ -38,15 +49,23 @@ pub fn run_ui(set: Arc<IndexSet>) -> Result<(), slint::PlatformError> {
     let query = Rc::new(RefCell::new(String::new()));
     let sort = Rc::new(Cell::new(Sort::default()));
     let searched_generation = Rc::new(Cell::new(u64::MAX));
+    let last_search = Rc::new(Cell::new(Instant::now()));
 
     let submit = {
-        let (set, query, sort, searched_generation) =
-            (set.clone(), query.clone(), sort.clone(), searched_generation.clone());
-        Rc::new(move || {
+        let (set, query, sort, searched_generation, last_search) = (
+            set.clone(),
+            query.clone(),
+            sort.clone(),
+            searched_generation.clone(),
+            last_search.clone(),
+        );
+        Rc::new(move |refresh: bool| {
             searched_generation.set(set.generation());
+            last_search.set(Instant::now());
             let _ = tx.send(SearchRequest {
                 text: query.borrow().clone(),
                 sort: sort.get(),
+                refresh,
             });
         })
     };
@@ -55,7 +74,7 @@ pub fn run_ui(set: Arc<IndexSet>) -> Result<(), slint::PlatformError> {
         let (query, submit) = (query.clone(), submit.clone());
         move |text: SharedString| {
             *query.borrow_mut() = text.to_string();
-            submit();
+            submit(false);
         }
     });
 
@@ -71,7 +90,7 @@ pub fn run_ui(set: Arc<IndexSet>) -> Result<(), slint::PlatformError> {
                 _ => SortColumn::Name,
             };
             sort.set(Sort { column, ascending });
-            submit();
+            submit(false);
         }
     });
 
@@ -95,7 +114,9 @@ pub fn run_ui(set: Arc<IndexSet>) -> Result<(), slint::PlatformError> {
         }
     });
 
-    // Picks up journal updates and status changes
+    // Picks up journal updates and status changes. The index changes almost constantly on a
+    // system volume, so refreshes are throttled and skipped while the window is in the
+    // background.
     let timer = Timer::default();
     timer.start(TimerMode::Repeated, Duration::from_millis(250), {
         let (app, set) = (app.as_weak(), set.clone());
@@ -103,8 +124,11 @@ pub fn run_ui(set: Arc<IndexSet>) -> Result<(), slint::PlatformError> {
             if let Some(app) = app.upgrade() {
                 app.set_status(set.status().into());
             }
-            if set.generation() != searched_generation.get() {
-                submit();
+            if set.generation() != searched_generation.get()
+                && last_search.get().elapsed() >= REFRESH_INTERVAL
+                && window_is_focused()
+            {
+                submit(true);
             }
         }
     });
@@ -122,14 +146,21 @@ fn spawn_search_worker(
     std::thread::Builder::new()
         .name("search".into())
         .spawn(move || {
+            // Refreshes show the time of the last search the user started, so the number does
+            // not change every second while the index is updated
+            let mut took = Duration::ZERO;
             while let Ok(mut request) = rx.recv() {
+                let mut refresh = request.refresh;
                 while let Ok(newer) = rx.try_recv() {
+                    refresh &= newer.refresh;
                     request = newer;
                 }
 
                 let t = Instant::now();
                 let hits = search_all(&set, &request.text, request.sort);
-                let took = t.elapsed();
+                if !refresh {
+                    took = t.elapsed();
+                }
 
                 let _ = app.upgrade_in_event_loop(move |app| {
                     let rows = app.get_rows();
@@ -140,6 +171,15 @@ fn spawn_search_worker(
             }
         })
         .expect("Failed to spawn search thread");
+}
+
+/// Whether the foreground window belongs to this process.
+fn window_is_focused() -> bool {
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
+        pid == GetCurrentProcessId()
+    }
 }
 
 fn format_result_info(count: usize, took: Duration, sort: Sort) -> String {
@@ -154,10 +194,24 @@ pub struct ResultsModel {
     set: Arc<IndexSet>,
     hits: RefCell<Vec<Hit>>,
     notify: ModelNotify,
+    /// Rows the view asked for since the last update, roughly the visible ones
+    requested_rows: Cell<Option<(usize, usize)>>,
 }
 
 impl ResultsModel {
     fn set_hits(&self, hits: Vec<Hit>) {
+        let requested = self.requested_rows.take();
+        if *self.hits.borrow() == hits {
+            // Same results: only refresh the rows on screen, so sizes and dates stay current
+            // without resetting the view
+            if let Some((first, last)) = requested {
+                let last = last.min(first + MAX_ROWS_UPDATED_IN_PLACE);
+                for row in first..=last {
+                    self.notify.row_changed(row);
+                }
+            }
+            return;
+        }
         *self.hits.borrow_mut() = hits;
         self.notify.reset();
     }
@@ -182,6 +236,12 @@ impl Model for ResultsModel {
     }
 
     fn row_data(&self, row: usize) -> Option<Self::Data> {
+        let range = match self.requested_rows.get() {
+            Some((first, last)) => (first.min(row), last.max(row)),
+            None => (row, row),
+        };
+        self.requested_rows.set(Some(range));
+
         let cells = self
             .with_entry(row, |index, id| {
                 [
