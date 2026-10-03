@@ -7,10 +7,13 @@
 pub mod build;
 pub mod exclude;
 pub mod persist;
+pub mod rank;
 pub mod search;
 pub mod sizes;
 pub mod sort;
 pub mod update;
+
+use std::sync::{Arc, Mutex};
 
 use crate::ntfs::volume::Volume;
 use crate::ntfs::ROOT_RECORD;
@@ -189,6 +192,9 @@ pub struct VolumeIndex {
     pub sorted: Vec<u32>,
     /// Bytes in `names` that are no longer referenced
     pub garbage: usize,
+    /// Location of every directory for ranking, see [`VolumeIndex::locations`]. Dropped when
+    /// directories change.
+    pub locations: Mutex<Option<Arc<Vec<u8>>>>,
 }
 
 impl VolumeIndex {
@@ -204,6 +210,7 @@ impl VolumeIndex {
             names: Vec::new(),
             sorted: Vec::new(),
             garbage: 0,
+            locations: Mutex::default(),
         }
     }
 

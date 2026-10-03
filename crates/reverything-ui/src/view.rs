@@ -990,12 +990,11 @@ fn search_help(cx: &App) -> impl IntoElement {
                 )
                 .child(div().text_color(theme.muted_foreground).child(meaning))
         }))
-        .child(
-            div()
-                .mt_1()
-                .text_color(theme.muted_foreground)
-                .child("Separate terms with spaces, every term has to match. Case does not matter, quotes keep spaces in a term."),
-        )
+        .child(div().mt_1().text_color(theme.muted_foreground).child(
+            "Separate terms with spaces, every term has to match. Case does not matter, \
+                     quotes keep spaces in a term. Best matches come first, sort by Name for \
+                     plain name order.",
+        ))
 }
 
 fn hint_owned(theme: &gpui_kit::component::Theme, text: String) -> Div {

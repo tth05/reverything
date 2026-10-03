@@ -165,6 +165,7 @@ impl VolumeIndex {
             names,
             sorted,
             garbage: 0,
+            locations: Default::default(),
         };
         index.validate()?;
         Ok(index)

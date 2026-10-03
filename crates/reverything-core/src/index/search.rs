@@ -39,6 +39,8 @@ pub struct Term {
     pub anchored: bool,
     pub dirs: Vec<Matcher>,
     pub name: Option<Matcher>,
+    /// The name part as typed, for ranking
+    pub name_text: Option<String>,
 }
 
 /// A folder subtree to leave out. Comparable, so resolved exclusions can be cached.
@@ -143,7 +145,10 @@ impl Term {
         }
 
         if !ends_with_separator {
-            term.name = parts.pop().map(Matcher::new);
+            if let Some(name) = parts.pop() {
+                term.name = Some(Matcher::new(name));
+                term.name_text = Some(name.to_string());
+            }
         }
         term.dirs = parts.into_iter().map(Matcher::new).collect();
         term

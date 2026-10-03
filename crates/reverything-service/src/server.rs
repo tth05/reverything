@@ -310,6 +310,7 @@ fn core_sort(sort: Sort) -> reverything_core::search::Sort {
     use reverything_core::search::SortColumn as Core;
     reverything_core::search::Sort {
         column: match sort.column {
+            SortColumn::Relevance => Core::Relevance,
             SortColumn::Name => Core::Name,
             SortColumn::Path => Core::Path,
             SortColumn::Size => Core::Size,

@@ -4,8 +4,8 @@ use std::cmp::Ordering;
 
 use crate::index::build::flags_and_size;
 use crate::index::{
-    is_link, link_id, link_index, VolumeIndex, FLAG_HAS_LINKS, FLAG_IN_USE, FLAG_SIZE_GUESSED,
-    NO_RECORD,
+    is_link, link_id, link_index, VolumeIndex, FLAG_DIRECTORY, FLAG_HAS_LINKS, FLAG_IN_USE,
+    FLAG_SIZE_GUESSED, NO_RECORD,
 };
 use crate::ntfs::io::Handle;
 use crate::ntfs::record::{
@@ -115,8 +115,27 @@ impl VolumeIndex {
     /// Applies record updates and moves the index to `next_usn`.
     pub fn apply_updates(&mut self, updates: &[RecordUpdate], next_usn: i64) {
         let mut touched = Vec::with_capacity(updates.len());
+        let order = parents_first(updates);
 
-        for i in parents_first(updates) {
+        // Directories before the update, to keep the locations for ranking up to date
+        let directories = order
+            .iter()
+            .map(|&i| &updates[i])
+            .filter(|u| {
+                u.state
+                    .as_ref()
+                    .is_some_and(|s| s.flags & FLAG_DIRECTORY != 0)
+                    || self.is_directory(u.record)
+            })
+            .map(|u| {
+                let before = self
+                    .is_directory(u.record)
+                    .then(|| (self.parent(u.record), self.name(u.record).to_vec()));
+                (u.record, before)
+            })
+            .collect::<Vec<_>>();
+
+        for i in order {
             let update = &updates[i];
             let id = update.record;
             let r = id as usize;
@@ -188,6 +207,7 @@ impl VolumeIndex {
             self.add_to_ancestors(id, self.records.size[r] as i64);
         }
 
+        self.update_locations(&directories);
         self.next_usn = next_usn;
         if !touched.is_empty() {
             self.resort(touched);

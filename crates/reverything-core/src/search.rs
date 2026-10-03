@@ -5,6 +5,7 @@ use std::sync::RwLockReadGuard;
 
 use rayon::prelude::*;
 
+use crate::index::rank::{order_by_score, Ranker};
 use crate::index::search::{FolderExclusion, Query};
 use crate::index::sort::cmp_names;
 use crate::index::VolumeIndex;
@@ -25,7 +26,9 @@ pub fn hit_parts(hit: Hit) -> (usize, u32) {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum SortColumn {
+    /// See [`crate::index::rank`]
     #[default]
+    Relevance,
     Name,
     Path,
     Size,
@@ -43,7 +46,7 @@ pub struct Sort {
 impl Default for Sort {
     fn default() -> Self {
         Self {
-            column: SortColumn::Name,
+            column: SortColumn::Relevance,
             ascending: true,
         }
     }
@@ -92,6 +95,23 @@ pub fn search_all(
     let mut hits = merge_by_name(&indices, per_volume);
 
     match sort.column {
+        SortColumn::Relevance => {
+            if let Some(ranker) = Ranker::new(query) {
+                let locations = indices
+                    .par_iter()
+                    .map(|i| i.locations())
+                    .collect::<Vec<_>>();
+                let scores = hits
+                    .par_iter()
+                    .with_min_len(4096)
+                    .map(|&h| {
+                        let (v, id) = hit_parts(h);
+                        ranker.score(&indices[v], &locations[v], id)
+                    })
+                    .collect::<Vec<_>>();
+                order_by_score(&mut hits, &scores);
+            }
+        }
         SortColumn::Name => {}
         SortColumn::Size => hits.par_sort_by_key(|&h| entry(&indices, h, |i, id| i.size(id))),
         SortColumn::Modified => {

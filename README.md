@@ -57,6 +57,16 @@ to the search box explains the search syntax. Column order, widths and visibilit
 Terms are separated by spaces (use quotes for spaces inside a term) and all have to match. Matching is
 case-insensitive.
 
+Results are ordered by relevance unless a column is sorted (the Name column gives plain name order). Compared in
+this order, ties stay in name order:
+1. How the name matches: exactly, exactly without the extension, at the start, at the start of a word, anywhere.
+2. Location: inside a user folder (`C:\Users\<name>`) first, inside Windows, Program Files, ProgramData, AppData,
+   WinSxS, node_modules, target, the Recycle Bin or a folder starting with a dot last.
+3. Same upper/lower case as typed.
+4. Recently modified.
+
+Queries without a name part (empty, or only folders like `system32\`) stay in name order.
+
 | Query | Finds |
 | --- | --- |
 | `notepad` | names containing `notepad` |

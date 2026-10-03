@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use eyre::{bail, Result};
-use reverything_protocol::{Client, Request, Response, Sort};
+use reverything_protocol::{Client, Request, Response, Sort, SortColumn};
 
 pub fn run(query: &str) -> Result<()> {
     let t = Instant::now();
@@ -35,7 +35,15 @@ pub fn run(query: &str) -> Result<()> {
     let t = Instant::now();
     let (search, total, took_us) = match client.request(&Request::Search {
         query: query.to_string(),
-        sort: Sort::default(),
+        // RV_QUERY_NAME_ORDER sorts by name instead of relevance
+        sort: if std::env::var_os("RV_QUERY_NAME_ORDER").is_some() {
+            Sort {
+                column: SortColumn::Name,
+                ascending: true,
+            }
+        } else {
+            Sort::default()
+        },
         files: std::env::var_os("RV_QUERY_NO_FILES").is_none(),
         folders: std::env::var_os("RV_QUERY_NO_FOLDERS").is_none(),
     })? {
@@ -62,7 +70,7 @@ pub fn run(query: &str) -> Result<()> {
     })? {
         Response::Rows { rows, .. } => {
             println!("{} rows in {:?}", rows.len(), t.elapsed());
-            for row in rows.iter().take(20) {
+            for row in rows.iter().take(12) {
                 println!(
                     "  {}\\{}  {} B",
                     row.folder.trim_end_matches('\\'),

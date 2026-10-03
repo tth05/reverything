@@ -223,6 +223,7 @@ pub fn scan_volume(volume: Volume, opts: &ScanOptions) -> Result<(VolumeIndex, S
         names,
         sorted: Vec::new(),
         garbage: 0,
+        locations: Default::default(),
     };
     index.sort_and_compact();
     stats.sort = t.elapsed();

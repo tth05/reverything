@@ -24,7 +24,7 @@ pub fn pipe_name() -> String {
 }
 
 /// Bumped on incompatible changes. Clients and the service have to agree on it.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Upper bound for requests, which come from less privileged processes
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -83,7 +83,9 @@ pub enum Response {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SortColumn {
+    /// Best matches first, see `reverything_core::index::rank`
     #[default]
+    Relevance,
     Name,
     Path,
     Size,
@@ -101,7 +103,7 @@ pub struct Sort {
 impl Default for Sort {
     fn default() -> Self {
         Self {
-            column: SortColumn::Name,
+            column: SortColumn::Relevance,
             ascending: true,
         }
     }
