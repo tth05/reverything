@@ -1,8 +1,34 @@
 # Reverything
-Simple Everything clone written in Rust. It indexes the fixed NTFS volumes you pick by reading the Master File Table
-directly, keeps the index up to date from the USN change journal and searches it as you type.
+Find any file on your PC by name, instantly. Reverything is a fast file name search for Windows, similar to
+[Everything](https://www.voidtools.com/): it reads the file table of your NTFS drives directly, so millions of files
+are indexed in seconds, and results appear as you type.
 
-## Architecture
+![Reverything searching for programs larger than 1 MB in System32, without WinSxS](assets/screenshot.png)
+
+**[Download the latest version](https://github.com/tth05/reverything/releases/latest)** (`reverything-setup-x.y.z.exe`)
+and run it. Windows 10 or 11, 64 bit.
+
+- Search as you type, with wildcards (`*.mp3`), folders (`photos\2024`), exclusions (`!node_modules\`) and size or
+  date filters (`size:>1gb`, `dm:today`). Hover the `?` next to the search box for a short overview.
+- Open files and folders, drag them into other programs, copy them with Ctrl+C, show them in Explorer (or the file
+  manager that replaced it).
+- Lives in the tray and comes up with a global shortcut (Settings shows which one).
+- Uses almost no resources while you do not use it, see [Resource use](#resource-use-while-not-in-use).
+- Checks GitHub for a new version once a day (can be turned off in the settings).
+
+### Why it installs a service and asks for administrator rights
+Reading a drive's file table directly is what makes Reverything fast, and Windows only allows that to
+administrators. So the installer (which asks for administrator rights once) sets up a small background service,
+"Reverything Index", that runs as the system account, keeps the index and answers the app's searches. The app
+itself runs as you, without special rights. The service only reads file names, sizes and dates, never file
+contents, and never changes anything on your drives.
+
+On a fresh install it indexes the drive Windows is on; other drives are turned on in the settings. Uninstalling
+from "Apps & features" removes the service, the index, the settings and the logs.
+
+## Developer documentation
+
+### Architecture
 ```
 crates/
   reverything-core/      NTFS indexing, search, saving/loading and following the journal (library)
@@ -14,16 +40,17 @@ scripts/                 icon generator, installer build, benchmark task
 ```
 
 - **Service** (`reverything-service.exe`): runs as LocalSystem, because reading raw volumes needs it. For every
-  volume turned on in the settings (the Windows drive on a fresh install, the choice is saved in `%ProgramData%\Reverything\config.json`)
-  it loads the saved index from `%ProgramData%\Reverything` (or scans the MFT if there is none), follows the journal
-  and answers requests on `\\.\pipe\reverything`. Turning a volume off drops its index and deletes the saved one. The pipe and the data directory are restricted to SYSTEM, administrators and
-  interactively logged on users, because they expose every file name. Clients are treated as untrusted: message
+  volume turned on in the settings (the Windows drive on a fresh install, the choice is saved in
+  `%ProgramData%\Reverything\config.json`) it loads the saved index from `%ProgramData%\Reverything` (or scans the
+  MFT if there is none), follows the journal and answers requests on `\\.\pipe\reverything`. Turning a volume off
+  drops its index and deletes the saved one. The pipe and the data directory are restricted to SYSTEM,
+  administrators and interactively logged on users, because they expose every file name. Clients are treated as untrusted: message
   sizes are capped and the service never opens or changes files for them.
 - **Window** (`reverything.exe`): asks the service for the number of results and only fetches the rows around the
   visible area. Opening files, the context menu, file icons, the tray icon and the global shortcut all run in this
   process, as the user. It stays in the tray when closed, so showing it again is instant.
 
-### Indexing
+#### Indexing
 - `$MFT` is located through its first record, `$MFT:$BITMAP` is used to skip unused records, and the table is read
   with a few large unbuffered overlapped reads (3 workers × 32 MB, double buffered). Parsing a record is a single
   pass over its attributes without allocations, so the scan runs at disk speed (~2 GB/s on NVMe).
@@ -34,7 +61,7 @@ scripts/                 icon generator, installer build, benchmark task
 - The index is saved only after a full scan and when the service stops (including shutdown), never while running.
   On the next start only the changes since then are applied (~0.1 s instead of a full scan).
 
-### Resource use while not in use
+#### Resource use while not in use
 Both processes do almost nothing while the window is not focused:
 
 - **Service:** the index is only kept live while the app's window has the focus. Without it, nothing is fetched or
@@ -47,15 +74,17 @@ Both processes do almost nothing while the window is not focused:
   only polled while the window has the focus. A window hidden in the tray is closed after 10 minutes to free its
   memory and opened again on demand; started with Windows, it is only opened when first needed (~35 MB in the tray).
 
-## Using it
+### Using it
 | Shortcut | |
 | --- | --- |
 | Enter / double click | Open (folders open in the default file manager, e.g. OneCommander if it replaced Explorer) |
 | Ctrl+Enter | Open the containing folder (selects the entry when Explorer is the file manager) |
+| Ctrl+C | Copy the file, to paste it into Explorer (in the search box with text selected: the text) |
 | Ctrl+Shift+C | Copy the full path |
 | Alt+Enter | Properties |
 | Ctrl+F, Ctrl+L | Focus the search box |
 | Ctrl+, | Settings |
+| F1 | About: version, license, log folder, check for updates |
 | Alt+F | Show or hide files in the results |
 | Alt+D | Show or hide folders in the results |
 | Escape | Hide to the tray |
@@ -66,7 +95,7 @@ Both processes do almost nothing while the window is not focused:
 Hovering the status icon in the bottom right shows a summary, its "Details" switch shows every timing. The `?` next
 to the search box explains the search syntax. Column order, widths and visibility are saved.
 
-### Search syntax
+#### Search syntax
 Terms are separated by spaces (use quotes for spaces inside a term) and all have to match. Matching is
 case-insensitive.
 
@@ -97,7 +126,7 @@ Queries without a name part (empty, or only folders like `system32\`) stay in na
 | `.rs !target\` | leaves out folders matching `target` and everything below them |
 | `notepad !C:\Windows` | leaves out exactly `C:\Windows` and everything below it |
 
-## Building
+### Building
 ```
 cargo build --release
 ```
@@ -111,7 +140,7 @@ does not always contain `fxc.exe`; in that case point `GPUI_FXC_PATH` at one tha
 GPUI_FXC_PATH = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.20348.0\x64\fxc.exe'
 ```
 
-## Running
+### Running
 - Install the service (admin): `reverything-service install`, remove it with `reverything-service uninstall`.
 - Or run it in the foreground (admin): `reverything-service --console`.
 - UI development without admin rights: `reverything-service --console --offline` serves the indices saved in
@@ -123,7 +152,7 @@ GPUI_FXC_PATH = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.20348.0\x64\fxc
   results and `RV_QUERY_STATUS` prints the full status (`RV_QUERY_STATUS_ONLY` without searching, which would count
   as using the index).
 
-## Installer
+### Installer
 `scripts\build-installer.ps1 [-Profile dist]` builds the binaries and
 `target\installer\reverything-setup-<version>.exe` with [Inno Setup 6](https://jrsoftware.org/isinfo.php)
 (`winget install JRSoftware.InnoSetup`). The installer registers and starts the service, optionally adds the window
@@ -132,7 +161,7 @@ service, the program, the saved index, the drive choice and the service log (`%P
 (`%APPDATA%\Reverything`), the UI log (`%LOCALAPPDATA%\Reverything`) and the autostart entry.
 `scripts\generate-icon.py` regenerates `assets\reverything.ico`.
 
-### Updates
+#### Updates
 Installed builds ask `api.github.com` for the latest release at most once a day, while the window has the focus
 (Settings, "Check for a new version once a day", turns it off; development builds never check). A newer version is
 offered at the bottom left. Clicking it looks for the newest release again, downloads its installer, checks it
@@ -140,18 +169,19 @@ against the `.sha256` file published with the release and runs it with `/SILENT 
 That shows one UAC prompt; the installer replaces the app and the service and starts the app again. The release
 workflow publishes the checksum file next to the installer.
 
-## CI
+### CI
 - `.github/workflows/ci.yml` checks formatting, runs clippy and the tests on every push.
 - `.github/workflows/release.yml` builds the installer with the `dist` profile when a tag like `v0.1.0` is pushed
   (it has to match the version in `Cargo.toml`) and attaches it to a GitHub release. Started manually, it only uploads
   the installer as a build artifact.
 
-## Testing everything manually
+### Testing everything manually
 1. Build the installer: `scripts\build-installer.ps1`.
 2. Run `target\installer\reverything-setup-<version>.exe`, confirm the UAC prompt, keep "Start Reverything when I log
    on" checked and let it start Reverything at the end.
 3. On a fresh install the Windows drive (usually C:) is indexed right away; other drives are turned on in the
-   settings. With every drive turned off, the window says so and links to the settings. The status icon in the bottom right shows a spinner while the MFT is scanned (a few seconds), then "Up to date". Hover
+   settings. With every drive turned off, the window says so and links to the settings. The status icon in the
+   bottom right shows a spinner while the MFT is scanned (a few seconds), then "Up to date". Hover
    it for the summary, turn on "Details": the per volume sections show the full scan with its timings and "Saved
    index: None at start, saved now". Make the window small: the popup scrolls instead of being cut off.
 4. Search: `notepad`, `windows\system32\`, `notepad !winsxs\`, sort by clicking column headers, scroll through an empty
@@ -177,7 +207,7 @@ workflow publishes the checksum file next to the installer.
     `%LOCALAPPDATA%\Reverything`, the "Reverything" value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
     and the service (`sc query Reverything`) are gone.
 
-## Benchmarking
+### Benchmarking
 `reverything-service --bench` indexes every volume without the service and prints timings, memory usage and search
 times. To run it elevated without running everything as admin, `scripts/register-bench-task.ps1` (run once from an
 elevated PowerShell) registers a scheduled task that only runs this command. Start it with
@@ -198,7 +228,7 @@ Variations are read from `target/bench.env` (`KEY=VALUE` lines):
 | `REVERYTHING_PIPE=\\.\pipe\reverything-bench` | Serves on another pipe, next to the installed service |
 | `RV_IDLE_CHECK_SECS=5`, `RV_UNLOAD_SECS=25` | Shorter idle timings for `RV_SERVE_SECS` (default 5 and 60 minutes) |
 
-## Resources
+### Resources
 - https://flatcap.github.io/linux-ntfs
 - https://github.com/mgeeky/ntfs-journal-viewer
 - https://github.com/kikijiki/ntfs-reader
