@@ -84,10 +84,12 @@ pub fn apply_theme(window: Option<&mut Window>, cx: &mut App) {
 pub enum UpdateState {
     Idle,
     Checking,
-    /// A check asked for by the user found nothing
+    /// A check asked for in the About dialog found nothing
     UpToDate,
+    /// A check asked for in the About dialog failed
+    CheckFailed(String),
     Installing,
-    Failed(String),
+    InstallFailed(String),
 }
 
 /// The app icon, shown in the title bar
@@ -461,7 +463,7 @@ impl MainView {
                     Err(e) => {
                         crate::log::write(&format!("Checking for updates failed: {}", e));
                         if now {
-                            UpdateState::Failed(e)
+                            UpdateState::CheckFailed(e)
                         } else {
                             UpdateState::Idle
                         }
@@ -494,7 +496,7 @@ impl MainView {
             let _ = view.update(cx, |view, cx| {
                 if let Err(e) = result {
                     crate::log::write(&format!("Updating failed: {}", e));
-                    view.update_state = UpdateState::Failed(e);
+                    view.update_state = UpdateState::InstallFailed(e);
                 }
                 cx.notify();
             });
@@ -717,9 +719,9 @@ impl MainView {
             (None, None) => format!("{} objects", format::group_digits(results.total() as u64)),
         };
         let update_notice = match (&self.update_state, &self.update) {
+            // Only when there is something to install; up to date needs no notice
             (UpdateState::Installing, _) => Some("Downloading the update...".to_string()),
-            (UpdateState::Failed(e), _) => Some(format!("Update failed: {}", e)),
-            (UpdateState::UpToDate, _) => Some("Reverything is up to date".to_string()),
+            (UpdateState::InstallFailed(e), _) => Some(format!("Update failed: {}", e)),
             (_, Some(update)) => Some(format!(
                 "Reverything {} is available, click to update",
                 update.version
@@ -1244,7 +1246,7 @@ fn about_panel(view: WeakEntity<MainView>, cx: &App) -> impl IntoElement {
     let status = match &update_state {
         Some((UpdateState::Checking, _)) => Some("Checking...".to_string()),
         Some((UpdateState::UpToDate, _)) => Some("You have the latest version".to_string()),
-        Some((UpdateState::Failed(e), _)) => Some(e.clone()),
+        Some((UpdateState::CheckFailed(e), _)) => Some(e.clone()),
         Some((_, Some(update))) => Some(format!(
             "Version {} is available, click the notice at the bottom left",
             update.version
