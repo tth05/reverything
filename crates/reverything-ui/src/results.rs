@@ -16,7 +16,9 @@ use crate::client::ServiceClient;
 use crate::format;
 use crate::icons::FileIcons;
 use crate::settings::{ColumnSetting, Settings};
-use crate::view::{CopyFile, CopyName, CopyPath, OpenSelected, RevealSelected, ShowProperties};
+use crate::view::{
+    CopyFile, CopyName, CopyPath, DeleteSelected, OpenSelected, RevealSelected, ShowProperties,
+};
 
 /// Rows fetched per request
 const PAGE: usize = 256;
@@ -636,6 +638,7 @@ impl TableDelegate for Results {
             .menu("Copy full path", Box::new(CopyPath))
             .menu("Copy name", Box::new(CopyName))
             .separator()
+            .menu_with_icon("Delete", IconName::Delete, Box::new(DeleteSelected))
             .menu_with_icon("Properties", IconName::Info, Box::new(ShowProperties))
     }
 

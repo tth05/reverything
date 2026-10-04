@@ -22,6 +22,7 @@ use windows::Win32::UI::Shell::{
     ShellExecuteW, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW,
 };
 use windows::Win32::UI::Shell::{ILFree, SHOpenFolderAndSelectItems, SHParseDisplayName};
+use windows::Win32::UI::Shell::{SHFileOperationW, FOF_ALLOWUNDO, FO_DELETE, SHFILEOPSTRUCTW};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 pub fn full_path(row: &Row) -> String {
@@ -99,6 +100,26 @@ fn select_in_explorer(path: &str) -> bool {
         ILFree(Some(item));
         ok
     }
+}
+
+/// Moves the entry to the Recycle Bin like Explorer's Delete, with Windows' confirmation if
+/// that is turned on (it is off by default). Blocks while the dialog is open. Returns whether
+/// it was deleted.
+pub fn delete(path: &str, window: Option<HWND>) -> bool {
+    // A list of paths, each null terminated, ending with an empty one
+    let from = path.encode_utf16().chain([0, 0]).collect::<Vec<u16>>();
+    let mut operation = SHFILEOPSTRUCTW {
+        hwnd: window.unwrap_or_default(),
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        fFlags: FOF_ALLOWUNDO.0 as u16,
+        ..Default::default()
+    };
+    let result = unsafe { SHFileOperationW(&mut operation) };
+    if result != 0 {
+        crate::log::write(&format!("Deleting {} failed with {}", path, result));
+    }
+    result == 0 && !operation.fAnyOperationsAborted.as_bool()
 }
 
 /// Shows Explorer's properties dialog for the entry.

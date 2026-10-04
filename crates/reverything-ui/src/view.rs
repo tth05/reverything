@@ -38,6 +38,7 @@ gpui_kit::actions!(
         CopyPath,
         CopyName,
         ShowProperties,
+        DeleteSelected,
         FocusSearch,
         HideWindow,
         OpenSettings,
@@ -292,6 +293,29 @@ impl MainView {
         if let Some(path) = self.target_path(cx) {
             shell::properties(&path);
         }
+    }
+
+    /// Moves the entry to the Recycle Bin, then refreshes the results.
+    fn on_delete(&mut self, _: &DeleteSelected, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.target_path(cx) else {
+            return;
+        };
+        let hwnd = desktop::hwnd(window).map(|h| h.0 as usize);
+        // The confirmation dialog is modal, the window keeps drawing meanwhile
+        let task = cx.background_executor().spawn(async move {
+            let hwnd = hwnd.map(|h| windows::Win32::Foundation::HWND(h as *mut _));
+            shell::delete(&path, hwnd)
+        });
+        cx.spawn(async move |view, cx| {
+            if task.await {
+                // Give the service a moment to see the change in the journal
+                cx.background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let _ = view.update(cx, |view, cx| view.search(false, cx));
+            }
+        })
+        .detach();
     }
 
     fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -1513,6 +1537,7 @@ impl Render for MainView {
             .on_action(cx.listener(Self::on_copy_path))
             .on_action(cx.listener(Self::on_copy_name))
             .on_action(cx.listener(Self::on_properties))
+            .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_focus_search))
             .on_action(cx.listener(Self::on_hide))
             .on_action(cx.listener(Self::on_open_settings))

@@ -222,8 +222,8 @@ also attaches them to the release):
    Drag a column header to another place, right click a header to hide a column, restart the window: both are kept.
 5. Live updates: create, rename and delete a file in Explorer, then search for it. The results refresh within 10
    seconds (immediately when you change the search).
-6. Rows: double click opens, right click shows the menu (open, open folder, copy path/name, properties), dragging a
-   row into an Explorer window copies the file.
+6. Rows: double click opens, right click shows the menu (open, open folder, copy, copy path/name, delete to the
+   Recycle Bin, properties), dragging a row into an Explorer window copies the file.
 7. Tray: close the window (it keeps running in the tray), bring it back with the tray icon, the global shortcut
    (Settings shows which one is active) or by starting Reverything again. "Quit" in the tray menu exits. After 10
    minutes in the tray the window is closed (the process drops to ~115 MB or less); the shortcut opens it again.
