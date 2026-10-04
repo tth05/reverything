@@ -140,9 +140,10 @@ pub fn run() -> Result<()> {
     );
     print_memory("after parallel scan");
 
-    let set = reverything_core::service::IndexSet::new(volumes.clone(), dev_db_dir());
-    for (slot, (index, _)) in set.volumes.iter().zip(indices) {
-        *slot.index.write().unwrap() = index;
+    let set = reverything_core::service::IndexSet::new(dev_db_dir());
+    for (volume, (index, _)) in volumes.iter().zip(indices) {
+        let slot = reverything_core::service::IndexSet::slot_of(volume.id).unwrap();
+        *set.volumes[slot].index.write().unwrap() = index;
     }
     bench_search(&set);
     print_memory("final");

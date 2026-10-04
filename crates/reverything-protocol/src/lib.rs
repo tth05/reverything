@@ -24,7 +24,7 @@ pub fn pipe_name() -> String {
 }
 
 /// Bumped on incompatible changes. Clients and the service have to agree on it.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Upper bound for requests, which come from less privileged processes
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -55,6 +55,9 @@ pub enum Request {
         count: u32,
     },
     Status,
+    /// Looks for drives again (new disks, unlocked BitLocker drives, changed letters) and
+    /// answers with the status.
+    RefreshVolumes,
     /// Indexes exactly these volumes (drive letters). The choice is saved by the service.
     SetVolumes {
         volumes: Vec<char>,

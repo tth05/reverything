@@ -172,6 +172,10 @@ impl Server {
                 }
             }
             Request::Status => Response::Status(self.status()),
+            Request::RefreshVolumes => {
+                self.set.refresh_volumes();
+                Response::Status(self.status())
+            }
             Request::SetActive { active } => {
                 if session.active.unwrap_or(false) != active {
                     self.set.client_active(active);
@@ -180,9 +184,15 @@ impl Server {
                 Response::Done
             }
             Request::SetVolumes { volumes } => {
+                // Enabled volumes that are gone (an unplugged disk) stay enabled
                 let volumes = volumes
                     .into_iter()
-                    .filter(|&c| self.set.volumes.iter().any(|v| v.volume.id == c))
+                    .filter(|&c| {
+                        IndexSet::slot_of(c).is_some_and(|i| {
+                            let slot = &self.set.volumes[i];
+                            slot.present() || slot.enabled()
+                        })
+                    })
                     .collect::<Vec<_>>();
                 self.set.set_enabled(&volumes);
                 let config = Config {
@@ -254,7 +264,9 @@ impl Server {
             private_bytes: memory.PagefileUsage as u64,
             searches: self.searches.load(Ordering::Relaxed),
             last_search_us: (last_search != u64::MAX).then_some(last_search),
+            // Drives that exist, and enabled ones even while they are gone
             volumes: (0..self.set.volumes.len())
+                .filter(|&i| self.set.volumes[i].present() || self.set.volumes[i].enabled())
                 .map(|i| volume_status(self.set.volumes[i].volume.id, self.set.stats(i)))
                 .collect(),
         }

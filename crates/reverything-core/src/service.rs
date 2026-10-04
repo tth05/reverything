@@ -33,7 +33,7 @@ use crate::index::update::{fetch_update, RecordUpdate};
 use crate::index::VolumeIndex;
 use crate::ntfs::io::Handle;
 use crate::ntfs::usn::{query_journal, JournalError, JournalReader};
-use crate::ntfs::volume::{volume_data, Volume};
+use crate::ntfs::volume::{ntfs_volumes, volume_data, Volume};
 
 /// How often an inactive volume checks how full the journal is
 const IDLE_CHECK: Duration = Duration::from_secs(5 * 60);
@@ -110,6 +110,8 @@ pub struct VolumeStats {
 
 pub struct VolumeSlot {
     pub volume: Volume,
+    /// The drive letter currently holds a fixed NTFS volume, see [`IndexSet::refresh_volumes`]
+    present: AtomicBool,
     pub index: RwLock<VolumeIndex>,
     pub stats: Mutex<VolumeStats>,
     /// Changed since it was last saved
@@ -129,6 +131,10 @@ pub struct VolumeSlot {
 impl VolumeSlot {
     pub fn enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
+    }
+
+    pub fn present(&self) -> bool {
+        self.present.load(Ordering::Acquire)
     }
 }
 
@@ -158,24 +164,34 @@ pub struct IndexSet {
 }
 
 impl IndexSet {
-    /// All volumes start disabled, see [`IndexSet::set_enabled`]. `db_dir` is where indices
-    /// are saved and loaded from.
-    pub fn new(volumes: Vec<Volume>, db_dir: PathBuf) -> Arc<Self> {
-        Self::create(volumes, db_dir, false)
+    /// There is a slot for every drive letter, so volumes that appear later (a new disk, an
+    /// unlocked BitLocker drive, a changed letter) fit in. All start disabled, see
+    /// [`IndexSet::set_enabled`], and not present, see [`IndexSet::refresh_volumes`]. `db_dir` is
+    /// where indices are saved and loaded from.
+    pub fn new(db_dir: PathBuf) -> Arc<Self> {
+        Self::create(db_dir, false)
     }
 
     /// Like [`IndexSet::new`], but enabled volumes load their saved index without volume
     /// access, which needs no admin rights. They are not kept up to date.
-    pub fn new_offline(volumes: Vec<Volume>, db_dir: PathBuf) -> Arc<Self> {
-        Self::create(volumes, db_dir, true)
+    pub fn new_offline(db_dir: PathBuf) -> Arc<Self> {
+        Self::create(db_dir, true)
     }
 
-    fn create(volumes: Vec<Volume>, db_dir: PathBuf, offline: bool) -> Arc<Self> {
+    /// Slot of the volume with this drive letter.
+    pub fn slot_of(letter: char) -> Option<usize> {
+        letter
+            .is_ascii_uppercase()
+            .then(|| (letter as u8 - b'A') as usize)
+    }
+
+    fn create(db_dir: PathBuf, offline: bool) -> Arc<Self> {
         Arc::new(Self {
-            volumes: volumes
-                .into_iter()
+            volumes: ('A'..='Z')
+                .map(|id| Volume { id })
                 .map(|volume| VolumeSlot {
                     volume,
+                    present: AtomicBool::new(false),
                     index: RwLock::new(VolumeIndex::empty(volume)),
                     stats: Mutex::new(VolumeStats::default()),
                     dirty: AtomicBool::new(false),
@@ -282,6 +298,27 @@ impl IndexSet {
             .join("   ")
     }
 
+    /// Looks for fixed NTFS volumes again. Returns whether anything changed.
+    pub fn refresh_volumes(&self) -> bool {
+        let found = ntfs_volumes();
+        let mut changed = false;
+        for slot in &self.volumes {
+            let present = found.contains(&slot.volume);
+            if slot.present.swap(present, Ordering::AcqRel) != present {
+                log::info!(
+                    "Volume {}: {}",
+                    slot.volume.id,
+                    if present { "found" } else { "gone" }
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
     /// Letters of the enabled volumes
     pub fn enabled(&self) -> Vec<char> {
         self.volumes
@@ -297,6 +334,8 @@ impl IndexSet {
         if active {
             if self.active.fetch_add(1, Ordering::SeqCst) == 0 {
                 log::info!("A client is active");
+                // Cheap, and the app is about to be used: pick up drives that appeared
+                self.refresh_volumes();
                 self.notify();
             }
         } else if self.active.fetch_sub(1, Ordering::SeqCst) == 1 {

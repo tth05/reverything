@@ -50,6 +50,24 @@ pub struct DriveChoice {
 impl Global for DriveChoice {}
 
 impl DriveChoice {
+    /// Updates the listed drives, keeping what the user picked so far.
+    pub fn set_drives(cx: &mut App, letters: &[char]) {
+        if !cx.has_global::<DriveChoice>() {
+            return;
+        }
+        let choice = cx.global_mut::<DriveChoice>();
+        if choice
+            .drives
+            .iter()
+            .map(|d| d.letter)
+            .eq(letters.iter().copied())
+        {
+            return;
+        }
+        choice.drives = letters.iter().map(|&l| Drive::new(l)).collect();
+        cx.refresh_windows();
+    }
+
     pub fn toggle(cx: &mut App, letter: char, on: bool) {
         if cx.has_global::<DriveChoice>() {
             let choice = cx.global_mut::<DriveChoice>();

@@ -307,6 +307,24 @@ impl MainView {
                 .width(px(520.))
                 .child(settings_panel(cx))
         });
+
+        // Drives can appear after the service started (a new disk, an unlocked BitLocker
+        // drive), the service looks again and the list updates
+        let client = self.client.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { client.request(&Request::RefreshVolumes) });
+        cx.spawn(async move |view, cx| {
+            if let Ok(Response::Status(status)) = task.await {
+                let letters = status.volumes.iter().map(|v| v.letter).collect::<Vec<_>>();
+                let _ = view.update(cx, |view, cx| {
+                    view.status = Some(status);
+                    DriveChoice::set_drives(cx, &letters);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     /// Sends the drive selection of the settings dialog to the service, if it changed.

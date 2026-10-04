@@ -18,13 +18,12 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 
-use eyre::{bail, Result};
+use eyre::Result;
 use mimalloc::MiMalloc;
 use windows::core::BOOL;
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 
 use reverything_core::index::persist::dev_db_dir;
-use reverything_core::ntfs::volume::ntfs_volumes;
 use reverything_core::service::IndexSet;
 use reverything_protocol::pipe_name;
 
@@ -49,16 +48,13 @@ impl App {
     /// serving clients on `pipe`. `offline` loads the saved indices without volume access and
     /// does not update them.
     pub fn start(db_dir: PathBuf, pipe: String, offline: bool) -> Result<Self> {
-        let volumes = ntfs_volumes();
-        if volumes.is_empty() {
-            bail!("No fixed NTFS volumes found");
-        }
         let config = config::Config::load(&db_dir);
         let set = if offline {
-            IndexSet::new_offline(volumes, db_dir)
+            IndexSet::new_offline(db_dir)
         } else {
-            IndexSet::new(volumes, db_dir)
+            IndexSet::new(db_dir)
         };
+        set.refresh_volumes();
         // Freed memory goes back to the system instead of staying with the allocator. Every
         // thread caches what it allocated, and indices are built on the rayon threads.
         set.on_trim(|| {
