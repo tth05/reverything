@@ -91,6 +91,9 @@ Queries without a name part (empty, or only folders like `system32\`) stay in na
 | `*.mp3` | names ending in `.mp3`; `*` and `?` make a term match the whole name |
 | `report-??.pdf` | e.g. `report-07.pdf`, `?` is exactly one character |
 | `.rs !test` | names containing `.rs` but not `test` |
+| `size:>1gb`, `size:1mb..5mb`, `size:empty` | size filter (units b, kb, mb, gb, tb; folders use their total size) |
+| `dm:today`, `dm:lastweek`, `dc:2024`, `dm:>=2024-05-01`, `dm:2024-01..2024-03` | modified (`dm:`) or created (`dc:`) date in local time; also `yesterday`, `thisweek`, `thismonth`, `lastmonth`, `thisyear`, `lastyear` |
+| `!size:<1mb` | `!` in front of a filter negates it |
 | `.rs !target\` | leaves out folders matching `target` and everything below them |
 | `notepad !C:\Windows` | leaves out exactly `C:\Windows` and everything below it |
 

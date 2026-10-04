@@ -1057,6 +1057,8 @@ fn search_help(cx: &App) -> impl IntoElement {
             "photos\\2024",
             "\"2024\" inside a folder matching \"photos\"",
         ),
+        ("size:>1gb", "Larger than 1 GB, also <, .. like 1mb..5mb"),
+        ("dm:today", "Modified today, also thisweek, 2024, >=2024-05"),
     ];
     v_flex()
         .gap_1()
