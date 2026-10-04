@@ -1250,7 +1250,7 @@ fn about_panel(view: WeakEntity<MainView>, cx: &App) -> impl IntoElement {
             "Version {} is available, click the notice at the bottom left",
             update.version
         )),
-        _ if !update::enabled() => Some("Development build: updates are turned off".to_string()),
+        _ if !update::enabled() => Some(update::disabled_reason().to_string()),
         _ => None,
     };
     // The license file next to the installed exe, the repository otherwise
@@ -1462,7 +1462,7 @@ fn settings_panel(cx: &App) -> impl IntoElement {
                     "Asks GitHub for the latest release, nothing else is sent. A new version is \
                      offered at the bottom left."
                 } else {
-                    "Development build: updates are turned off."
+                    crate::update::disabled_reason()
                 })),
         )
         .child(

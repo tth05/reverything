@@ -4,10 +4,13 @@
 //!
 //! Only installed builds update.
 
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use windows::core::w;
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 
 const LATEST_RELEASE: &str = "https://api.github.com/repos/tth05/reverything/releases/latest";
 /// Automatic checks happen at most this often
@@ -40,13 +43,57 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
-/// Whether this is an installed build that may update itself. Development builds never do.
+/// Whether this is an installed build that updates itself. Development builds never do, and
+/// installs by winget or Scoop leave updates to them.
 pub fn enabled() -> bool {
+    installed() && managed_by().is_none()
+}
+
+fn installed() -> bool {
     !cfg!(debug_assertions)
         && std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join("unins000.exe").exists()))
             .unwrap_or(false)
+}
+
+/// The package manager that installed the app and keeps it up to date, as the installer noted
+/// it (`/MANAGED=winget`).
+pub fn managed_by() -> Option<&'static str> {
+    static MANAGED_BY: OnceLock<Option<String>> = OnceLock::new();
+    MANAGED_BY
+        .get_or_init(|| {
+            let mut buf = [0u16; 64];
+            let mut len = size_of_val(&buf) as u32;
+            let result = unsafe {
+                RegGetValueW(
+                    HKEY_LOCAL_MACHINE,
+                    w!(r"Software\Reverything"),
+                    w!("ManagedBy"),
+                    RRF_RT_REG_SZ,
+                    None,
+                    Some(buf.as_mut_ptr() as *mut _),
+                    Some(&mut len),
+                )
+            };
+            let value = String::from_utf16_lossy(&buf[..(len as usize / 2).saturating_sub(1)]);
+            (result.is_ok() && !value.is_empty()).then_some(value)
+        })
+        .as_deref()
+}
+
+/// Why updates are off, for the settings and the About dialog.
+pub fn disabled_reason() -> &'static str {
+    match managed_by() {
+        Some(m) if m.eq_ignore_ascii_case("winget") => {
+            "Installed with winget, which also updates Reverything (winget upgrade)."
+        }
+        Some(m) if m.eq_ignore_ascii_case("scoop") => {
+            "Installed with Scoop, which also updates Reverything (scoop update)."
+        }
+        Some(_) => "Installed by a package manager, which also updates Reverything.",
+        None => "Development build: updates are turned off.",
+    }
 }
 
 pub fn now() -> u64 {

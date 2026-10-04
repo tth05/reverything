@@ -183,7 +183,10 @@ service, the program, the saved index, the drive choice and the service log (`%P
 
 #### Updates
 Installed builds ask `api.github.com` for the latest release at most once a day, while the window has the focus
-(Settings, "Check for a new version once a day", turns it off; development builds never check). A newer version is
+(Settings, "Check for a new version once a day", turns it off; development builds never check). Installs by winget
+or Scoop pass `/MANAGED=winget` or `/MANAGED=scoop` to the installer, which notes it in
+`HKLM\Software\Reverything\ManagedBy`; the app then leaves updates to the package manager, so its version
+records stay right. A newer version is
 offered at the bottom left. Clicking it looks for the newest release again, downloads its installer, checks it
 against the `.sha256` file published with the release and runs it with `/SILENT /SUPPRESSMSGBOXES /NORESTART`.
 That shows one UAC prompt; the installer replaces the app and the service and starts the app again. The release

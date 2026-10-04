@@ -59,6 +59,12 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 ; Same value the app's own "Start with Windows" setting uses
 Root: HKCU; Subkey: "{#RunKey}"; ValueType: string; ValueName: "{#AppName}"; \
     ValueData: """{app}\{#AppExe}"" --background"; Flags: uninsdeletevalue; Tasks: autostart
+; Installed by a package manager (/MANAGED=winget or /MANAGED=scoop), which then also does the
+; updates: the app does not check for them itself
+Root: HKLM; Subkey: "Software\{#AppName}"; ValueType: string; ValueName: "ManagedBy"; \
+    ValueData: "{param:MANAGED}"; Flags: uninsdeletekey; Check: IsManaged
+Root: HKLM; Subkey: "Software\{#AppName}"; ValueType: none; ValueName: "ManagedBy"; \
+    Flags: deletevalue; Check: not IsManaged
 
 [Run]
 ; Registers (or updates) and starts the service
@@ -83,6 +89,11 @@ Type: filesandordirs; Name: "{userappdata}\Reverything"
 Type: filesandordirs; Name: "{localappdata}\Reverything"
 
 [Code]
+function IsManaged: Boolean;
+begin
+  Result := ExpandConstant('{param:MANAGED}') <> '';
+end;
+
 procedure StopRunning();
 var
   ResultCode: Integer;

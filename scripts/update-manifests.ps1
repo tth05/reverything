@@ -25,7 +25,8 @@ if ($Installer) {
 }
 if ($sha256 -notmatch '^[0-9a-f]{64}$') { throw "No valid SHA256 for $name" }
 
-# Scoop runs the real installer: the service has to be registered, which extracting it would skip
+# Scoop runs the real installer: the service has to be registered, which extracting it would skip.
+# /MANAGED tells the app to leave updates to the package manager (both manifests pass it).
 $scoop = [ordered]@{
     version     = $Version
     description = 'Fast file name search for NTFS drives'
@@ -39,7 +40,7 @@ $scoop = [ordered]@{
     hash        = $sha256
     installer   = [ordered]@{
         script = @(
-            'Start-Process "$dir\setup.exe" -ArgumentList ''/VERYSILENT'', ''/SUPPRESSMSGBOXES'', ''/NORESTART'' -Wait'
+            'Start-Process "$dir\setup.exe" -ArgumentList ''/VERYSILENT'', ''/SUPPRESSMSGBOXES'', ''/NORESTART'', ''/MANAGED=scoop'' -Wait'
         )
     }
     uninstaller = [ordered]@{
@@ -78,6 +79,8 @@ InstallerType: inno
 Scope: machine
 ElevationRequirement: elevatesSelf
 UpgradeBehavior: install
+InstallerSwitches:
+  Custom: /MANAGED=winget
 ProductCode: '{6B0E2F47-9C1D-4E4B-A6E8-3F2C8D9B5A71}_is1'
 Installers:
   - Architecture: x64
