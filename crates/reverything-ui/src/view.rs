@@ -11,8 +11,8 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme, Icon, IconName, Selectable, Sizable, StyledExt, TitleBar,
-    WindowExt,
+    h_flex, v_flex, ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, StyledExt,
+    TitleBar, WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -41,6 +41,7 @@ gpui_kit::actions!(
         FocusSearch,
         HideWindow,
         OpenSettings,
+        OpenAbout,
         ToggleFiles,
         ToggleFolders,
     ]
@@ -60,6 +61,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-f", FocusSearch, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-l", FocusSearch, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-,", OpenSettings, Some(KEY_CONTEXT)),
+        KeyBinding::new("f1", OpenAbout, Some(KEY_CONTEXT)),
         KeyBinding::new("alt-f", ToggleFiles, Some(KEY_CONTEXT)),
         KeyBinding::new("alt-d", ToggleFolders, Some(KEY_CONTEXT)),
         KeyBinding::new("escape", HideWindow, Some(KEY_CONTEXT)),
@@ -365,6 +367,19 @@ impl MainView {
         .detach();
     }
 
+    fn on_open_about(&mut self, _: &OpenAbout, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let view = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            dialog
+                .title("About Reverything")
+                .width(px(440.))
+                .child(about_panel(view.clone(), cx))
+        });
+    }
+
     /// Sends the drive selection of the settings dialog to the service, if it changed.
     fn apply_drive_choice(&mut self, cx: &mut Context<Self>) {
         let Some(choice) = cx.try_global::<DriveChoice>() else {
@@ -574,16 +589,29 @@ impl MainView {
                 )
                 .child(
                     // Occluding keeps the title bar's drag area from swallowing the click
-                    div().id("settings-area").occlude().child(
-                        Button::new("settings")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Settings)
-                            .tooltip("Settings (Ctrl+,)")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.on_open_settings(&OpenSettings, window, cx)
-                            })),
-                    ),
+                    h_flex()
+                        .id("settings-area")
+                        .occlude()
+                        .child(
+                            Button::new("settings")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Settings)
+                                .tooltip("Settings (Ctrl+,)")
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.on_open_settings(&OpenSettings, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("about")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Info)
+                                .tooltip("About (F1)")
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.on_open_about(&OpenAbout, window, cx)
+                                })),
+                        ),
                 ),
         )
     }
@@ -1206,6 +1234,109 @@ fn hint_owned(theme: &gpui_kit::component::Theme, text: String) -> Div {
         .child(text)
 }
 
+const REPOSITORY: &str = "https://github.com/tth05/reverything";
+
+/// About dialog content: version, links, logs and checking for updates.
+fn about_panel(view: WeakEntity<MainView>, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let update_state = view
+        .upgrade()
+        .map(|v| (v.read(cx).update_state.clone(), v.read(cx).update.clone()));
+    let status = match &update_state {
+        Some((UpdateState::Checking, _)) => Some("Checking...".to_string()),
+        Some((UpdateState::UpToDate, _)) => Some("You have the latest version".to_string()),
+        Some((UpdateState::Failed(e), _)) => Some(e.clone()),
+        Some((_, Some(update))) => Some(format!(
+            "Version {} is available, click the notice at the bottom left",
+            update.version
+        )),
+        _ if !update::enabled() => Some("Development build: updates are turned off".to_string()),
+        _ => None,
+    };
+    // The license file next to the installed exe, the repository otherwise
+    let license = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("LICENSE.txt")))
+        .filter(|path| path.exists())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| format!("{}/blob/master/LICENSE", REPOSITORY));
+    let logs = std::env::var_os("LOCALAPPDATA")
+        .map(|dir| std::path::PathBuf::from(dir).join("Reverything"));
+
+    v_flex()
+        .gap_4()
+        .text_sm()
+        .child(
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .font_semibold()
+                        .child(concat!("Reverything ", env!("CARGO_PKG_VERSION"))),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Fast file name search for NTFS drives."),
+                ),
+        )
+        .child(
+            v_flex()
+                .gap_1()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("The indexing library (reverything-core) is MIT licensed.")
+                .child("The app is free to use; its source code is all rights reserved."),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .child(
+                    Button::new("about-github")
+                        .small()
+                        .icon(IconName::ExternalLink)
+                        .label("GitHub")
+                        .on_click(|_, _, _| shell::open(REPOSITORY)),
+                )
+                .child(
+                    Button::new("about-license")
+                        .small()
+                        .label("License")
+                        .on_click(move |_, _, _| shell::open(&license)),
+                )
+                .child(
+                    Button::new("about-logs")
+                        .small()
+                        .icon(IconName::FolderOpen)
+                        .label("Open log folder")
+                        .disabled(logs.is_none())
+                        .on_click(move |_, _, _| {
+                            if let Some(logs) = &logs {
+                                let _ = std::fs::create_dir_all(logs);
+                                shell::open(&logs.display().to_string());
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("about-update")
+                        .small()
+                        .label("Check for updates")
+                        .disabled(!update::enabled())
+                        .on_click(move |_, _, cx| {
+                            let _ = view.update(cx, |view, cx| view.check_for_update(true, cx));
+                        }),
+                ),
+        )
+        .children(status.map(|status| {
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(status)
+        }))
+}
+
 /// Settings dialog content. Rebuilt on every render from the [`Settings`] and
 /// [`DriveChoice`] globals.
 fn settings_panel(cx: &App) -> impl IntoElement {
@@ -1390,6 +1521,7 @@ impl Render for MainView {
             .on_action(cx.listener(Self::on_focus_search))
             .on_action(cx.listener(Self::on_hide))
             .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_open_about))
             .on_action(cx.listener(Self::on_toggle_files))
             .on_action(cx.listener(Self::on_toggle_folders))
             .size_full()
