@@ -178,6 +178,8 @@ fn match_quality(name: &[u8], matcher: &Matcher) -> u8 {
             let name = String::from_utf8_lossy(name).to_lowercase();
             quality_ascii(name.as_bytes(), needle.as_bytes())
         }
+        // Every hit matches the whole pattern, location and the rest decide
+        Matcher::Glob(_) | Matcher::Suffix(_) => 2,
     }
 }
 

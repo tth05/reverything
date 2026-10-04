@@ -88,6 +88,8 @@ Queries without a name part (empty, or only folders like `system32\`) stay in na
 | `windows\system32\note` | `note` directly in a folder matching `system32`, inside one matching `windows` |
 | `system32\` | everything directly in folders matching `system32` |
 | `C:\Users\` | everything directly in `C:\Users` |
+| `*.mp3` | names ending in `.mp3`; `*` and `?` make a term match the whole name |
+| `report-??.pdf` | e.g. `report-07.pdf`, `?` is exactly one character |
 | `.rs !test` | names containing `.rs` but not `test` |
 | `.rs !target\` | leaves out folders matching `target` and everything below them |
 | `notepad !C:\Windows` | leaves out exactly `C:\Windows` and everything below it |

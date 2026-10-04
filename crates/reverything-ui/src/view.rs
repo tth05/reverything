@@ -124,7 +124,7 @@ impl MainView {
         let client = Arc::new(ServiceClient::new(true));
         let input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Search, e.g. report, .pdf, photos\\2024, !draft, !node_modules\\")
+                .placeholder("Search, e.g. report, *.pdf, photos\\2024, !draft, !node_modules\\")
         });
         let columns = cx.global::<Settings>().columns.clone();
         let table = cx.new(|cx| {
@@ -1043,7 +1043,7 @@ fn search_help(cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     let examples = [
         ("report", "Names containing \"report\""),
-        (".pdf", "Files by extension"),
+        ("*.pdf", "Files by extension (* and ? match the whole name)"),
         ("!draft", "Leave out names containing \"draft\""),
         (
             "!node_modules\\",

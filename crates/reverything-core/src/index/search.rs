@@ -9,6 +9,8 @@
 //! - `!term` leaves out entries matching `term`.
 //! - `!term\` leaves out the directories matching `term` and everything below them.
 //! - `!C:\some\folder` leaves out that exact folder and everything below it.
+//! - A name or folder with `*` (any characters) or `?` (one character) has to match as a whole,
+//!   e.g. `*.mp3` or `report-??.pdf`. Without them it matches anywhere in the name.
 
 use memchr::{memchr2_iter, memchr_iter};
 use rayon::prelude::*;
@@ -144,6 +146,13 @@ impl Term {
             }
         }
 
+        // `*` alone matches every name, like no name part at all
+        if parts.last().is_some_and(|p| p.chars().all(|c| c == '*')) && !ends_with_separator {
+            parts.pop();
+            term.name_text = None;
+            term.dirs = parts.into_iter().map(Matcher::new).collect();
+            return term;
+        }
         if !ends_with_separator {
             if let Some(name) = parts.pop() {
                 term.name = Some(Matcher::new(name));
@@ -165,11 +174,24 @@ pub enum Matcher {
     Ascii(Vec<u8>),
     /// Lowercased needle containing non-ASCII characters
     Unicode(String),
+    /// Lowercased pattern with `*` and `?` that has to match the whole name
+    Glob(String),
+    /// A pattern like `*.mp3`: the name ends with this lowercased ASCII text
+    Suffix(Vec<u8>),
 }
 
 impl Matcher {
     pub fn new(needle: &str) -> Self {
-        if needle.is_ascii() {
+        if needle.contains(['*', '?']) {
+            let pattern = needle.to_lowercase();
+            match pattern.strip_prefix('*') {
+                // The most common pattern, checked without the general matching
+                Some(rest) if rest.is_ascii() && !rest.contains(['*', '?']) => {
+                    Matcher::Suffix(rest.as_bytes().to_vec())
+                }
+                _ => Matcher::Glob(pattern),
+            }
+        } else if needle.is_ascii() {
             Matcher::Ascii(needle.to_ascii_lowercase().into_bytes())
         } else {
             Matcher::Unicode(needle.to_lowercase())
@@ -184,8 +206,59 @@ impl Matcher {
                 let hay = String::from_utf8_lossy(hay).to_lowercase();
                 hay.contains(needle.as_str())
             }
+            Matcher::Glob(pattern) => glob_matches(pattern, hay),
+            Matcher::Suffix(suffix) => {
+                hay.len() >= suffix.len()
+                    && hay[hay.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+            }
         }
     }
+}
+
+/// Whether the whole `hay` matches `pattern` (lowercase) with `*` and `?`, ignoring case.
+fn glob_matches(pattern: &str, hay: &[u8]) -> bool {
+    if pattern.is_ascii() && hay.is_ascii() {
+        // No allocation for the common case
+        return glob(pattern.as_bytes(), hay, |p, t| p == t.to_ascii_lowercase());
+    }
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let text = String::from_utf8_lossy(hay)
+        .to_lowercase()
+        .chars()
+        .collect::<Vec<_>>();
+    glob(&pattern, &text, |p, t| p == t)
+}
+
+/// Greedy wildcard matching that goes back to the last `*` on a mismatch.
+fn glob<T: Copy + From<u8> + PartialEq>(
+    pattern: &[T],
+    text: &[T],
+    eq: impl Fn(T, T) -> bool,
+) -> bool {
+    let (any, one) = (T::from(b'*'), T::from(b'?'));
+    let (mut p, mut t) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some(&c) if c == any => {
+                star = Some((p, t));
+                p += 1;
+            }
+            Some(&c) if c == one || eq(c, text[t]) => {
+                p += 1;
+                t += 1;
+            }
+            _ => match star {
+                Some((sp, st)) => {
+                    p = sp + 1;
+                    t = st + 1;
+                    star = Some((sp, st + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == any)
 }
 
 /// ASCII case-insensitive substring search. Candidates are found with SIMD (`memchr2`) on the
@@ -374,6 +447,25 @@ mod tests {
         assert!(contains_ascii_ci(b"a", b"a"));
         assert!(!contains_ascii_ci(b"", b"a"));
         assert!(contains_ascii_ci(b"x_1", b"_1"));
+    }
+
+    #[test]
+    fn globs() {
+        let m = |pattern: &str, name: &str| Matcher::new(pattern).matches(name.as_bytes());
+        assert!(m("*.mp3", "Song.MP3"));
+        assert!(!m("*.mp3", "song.mp3.part"));
+        assert!(m("report-??.pdf", "Report-07.pdf"));
+        assert!(!m("report-??.pdf", "report-7.pdf"));
+        assert!(m("*", ""));
+        assert!(m("a*b*c", "aXXbYYc"));
+        assert!(!m("a*b*c", "aXXbYY"));
+        assert!(m("*ärger*", "Großer ÄRGER.txt"));
+        assert!(m("*.MP3", "song.mp3"));
+        assert!(!m("*.mp3", "mp3"));
+        // Without wildcards, still a substring
+        assert!(m("song", "my song.mp3"));
+        assert!(Term::parse("*").is_match_all());
+        assert!(Term::parse(r"system32\*").name.is_none());
     }
 
     #[test]
