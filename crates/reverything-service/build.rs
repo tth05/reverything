@@ -4,8 +4,8 @@ fn main() {
     let icon = "../../assets/reverything.ico";
     println!("cargo:rerun-if-changed={}", icon);
     let rc = version_rc(
-        "reverything.exe",
-        "Reverything",
+        "reverything-service.exe",
+        "Reverything index service",
         &std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join(icon),
     );
     let path = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("reverything.rc");

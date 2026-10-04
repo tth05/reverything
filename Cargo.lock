@@ -6135,6 +6135,7 @@ dependencies = [
 name = "reverything-service"
 version = "0.1.0"
 dependencies = [
+ "embed-resource",
  "eyre",
  "libmimalloc-sys",
  "log",
