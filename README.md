@@ -26,6 +26,18 @@ contents, and never changes anything on your drives.
 On a fresh install it indexes the drive Windows is on; other drives are turned on in the settings. Uninstalling
 from "Apps & features" removes the service, the index, the settings and the logs.
 
+### Limitations and things to know
+- **Only NTFS drives** that Windows reports as fixed. exFAT, FAT32 and ReFS drives, network drives and USB sticks
+  are not indexed.
+- **Every user sees every file name.** Anyone logged on to the PC can search the names of all indexed files,
+  including those in other users' profiles, and can change which drives are indexed for everyone. That is fine on a
+  PC you use alone (Everything's service works the same way), but keep it in mind on shared PCs.
+- **Install from the account that uses Reverything.** If a standard user installs it by entering an
+  administrator's password, the per-user parts (start with Windows, and removing the settings and logs on
+  uninstall) apply to the administrator's account instead.
+- **Updates on shared PCs** close Reverything in every user's session but only start it again for the person who
+  updated; the others get it back at their next logon (with "Start with Windows") or by starting it.
+
 ### "Windows protected your PC"
 The installer is not code signed yet. When you run it from a browser download, Windows SmartScreen shows "Windows
 protected your PC"; click "More info" and "Run anyway". The administrator prompt shows "Unknown publisher", also
