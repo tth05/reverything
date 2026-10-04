@@ -13,6 +13,16 @@ are indexed in seconds, and results appear as you type.
 - Uses almost no resources while you do not use it: the index is only kept up to date while the window has the
   focus, and is dropped from memory after an hour without it.
 
+## Contents
+- [Installation](#installation)
+- [Using it](#using-it)
+  - [Search syntax](#search-syntax)
+  - [Result order](#result-order)
+- [Why it installs a service and asks for administrator rights](#why-it-installs-a-service-and-asks-for-administrator-rights)
+- [Limitations and things to know](#limitations-and-things-to-know)
+- ["Windows protected your PC"](#windows-protected-your-pc)
+- [Development](#development)
+
 ## Installation
 Windows 10 or 11, 64 bit. All three ways run the same installer, which asks for administrator rights once (see
 [why](#why-it-installs-a-service-and-asks-for-administrator-rights)).
