@@ -33,6 +33,9 @@ scripts/                 icon generator, installer build, benchmark task
   sizes, dates and hard links stay exact. Folder sizes are updated incrementally.
 - The index is saved only after a full scan and when the service stops (including shutdown), never while running.
   On the next start only the changes since then are applied (~0.1 s instead of a full scan).
+- The saved file holds the same arrays, split into 4 MB chunks that are compressed with zstd (level 1) in
+  parallel. Names are saved in sorted order, so their offsets are rebuilt from the lengths instead of stored.
+  4.2 million files take 53 MB on disk (255 MB uncompressed); saving takes ~0.2 s and loading ~0.1 s.
 
 ### Resource use while not in use
 Both processes do almost nothing while the window is not focused:

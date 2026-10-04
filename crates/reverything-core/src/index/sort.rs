@@ -65,13 +65,21 @@ impl VolumeIndex {
         self.compact_names();
     }
 
-    /// Rewrites the name arena in sorted order, dropping names that are no longer referenced.
-    /// Searching in sorted order then reads the arena mostly sequentially.
-    pub fn compact_names(&mut self) {
-        let mut order = self.sorted.clone();
+    /// The entries with a name, in the order [`VolumeIndex::compact_names`] lays them out: the
+    /// sorted entries, then the root.
+    pub fn name_order(&self) -> Vec<u32> {
+        let mut order = Vec::with_capacity(self.sorted.len() + 1);
+        order.extend_from_slice(&self.sorted);
         if self.records.len() > ROOT_RECORD as usize {
             order.push(ROOT_RECORD);
         }
+        order
+    }
+
+    /// Rewrites the name arena in sorted order, dropping names that are no longer referenced.
+    /// Searching in sorted order then reads the arena mostly sequentially.
+    pub fn compact_names(&mut self) {
+        let order = self.name_order();
         // Free link slots end up with an empty name
         for (l, &r) in self.links.record.iter().enumerate() {
             if r == NO_RECORD {

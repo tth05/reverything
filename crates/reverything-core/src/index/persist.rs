@@ -1,18 +1,32 @@
 //! Saving and loading an index, so startup only has to replay the journal instead of reading the
 //! whole MFT.
+//!
+//! After a header, the file holds the index arrays one after another. Each array is split into
+//! chunks of about [`CHUNK`] bytes that are compressed with zstd separately, so saving and loading
+//! use all cores. An array is stored as its element count, the chunk count, the uncompressed and
+//! compressed size of every chunk, then the compressed chunks. Name offsets are not stored: names
+//! are saved in the order [`VolumeIndex::name_order`] gives, so the offsets follow from the
+//! lengths.
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use eyre::{bail, ensure, Context, Result};
+use eyre::{bail, ensure, eyre, Context, Result};
+use rayon::prelude::*;
 
-use crate::index::{is_link, link_index, Links, Records, VolumeIndex, FLAG_IN_USE, NO_RECORD};
+use crate::index::{
+    is_link, link_index, Links, Records, SyncPtr, VolumeIndex, FLAG_IN_USE, NO_RECORD,
+};
 use crate::ntfs::usn::query_journal;
 use crate::ntfs::volume::{volume_data, Volume};
 
 const MAGIC: [u8; 8] = *b"RVINDEX\0";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
+/// zstd level. Higher levels barely shrink the index further but take much longer.
+const LEVEL: i32 = 1;
+/// Uncompressed size of a chunk
+const CHUNK: usize = 4 << 20;
 
 /// Plain old data that can be written as raw bytes.
 trait Pod: Copy + Default {}
@@ -126,21 +140,43 @@ impl VolumeIndex {
         w.write_all(&self.journal_id.to_le_bytes())?;
         w.write_all(&self.next_usn.to_le_bytes())?;
 
-        let r = &self.records;
-        write_slice(&mut w, &r.name_off)?;
-        write_slice(&mut w, &r.name_len)?;
-        write_slice(&mut w, &r.parent)?;
-        write_slice(&mut w, &r.flags)?;
-        write_slice(&mut w, &r.size)?;
-        write_slice(&mut w, &r.created)?;
-        write_slice(&mut w, &r.modified)?;
-        write_slice(&mut w, &r.sequence)?;
-        write_slice(&mut w, &self.links.record)?;
-        write_slice(&mut w, &self.links.parent)?;
-        write_slice(&mut w, &self.links.name_off)?;
-        write_slice(&mut w, &self.links.name_len)?;
-        write_slice(&mut w, &self.names)?;
-        write_slice(&mut w, &self.sorted)?;
+        let (r, l) = (&self.records, &self.links);
+        let order = self.name_order();
+        let sections = [
+            array(&r.name_len),
+            array(&r.parent),
+            array(&r.flags),
+            array(&r.size),
+            array(&r.created),
+            array(&r.modified),
+            array(&r.sequence),
+            array(&l.record),
+            array(&l.parent),
+            array(&l.name_len),
+            self.name_chunks(&order),
+            array(&self.sorted),
+        ];
+        let compressed = sections
+            .iter()
+            .flat_map(|(_, chunks)| chunks)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|chunk| self.compress(chunk))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut compressed = compressed.into_iter();
+        for (count, chunks) in &sections {
+            let chunks = compressed.by_ref().take(chunks.len()).collect::<Vec<_>>();
+            w.write_all(&count.to_le_bytes())?;
+            w.write_all(&(chunks.len() as u32).to_le_bytes())?;
+            for (raw_len, data) in &chunks {
+                w.write_all(&raw_len.to_le_bytes())?;
+                w.write_all(&(data.len() as u32).to_le_bytes())?;
+            }
+            for (_, data) in &chunks {
+                w.write_all(data)?;
+            }
+        }
 
         let file = w.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
@@ -171,30 +207,43 @@ impl VolumeIndex {
         );
         let volume_serial = serial;
 
-        let records = Records {
-            name_off: read_vec(&mut file)?,
-            name_len: read_vec(&mut file)?,
-            parent: read_vec(&mut file)?,
-            flags: read_vec(&mut file)?,
-            size: read_vec(&mut file)?,
-            created: read_vec(&mut file)?,
-            modified: read_vec(&mut file)?,
-            sequence: read_vec(&mut file)?,
+        let mut data = Vec::with_capacity(file.metadata()?.len() as usize);
+        file.read_to_end(&mut data)?;
+        let mut reader = Reader {
+            data: &data,
+            pos: 0,
+            jobs: Vec::new(),
         };
+        // Allocates the arrays and collects their chunks, then decompresses all chunks at once
+        let name_len: Vec<u16> = reader.array()?;
+        let records = Records {
+            name_off: vec![u32::MAX; name_len.len()],
+            name_len,
+            parent: reader.array()?,
+            flags: reader.array()?,
+            size: reader.array()?,
+            created: reader.array()?,
+            modified: reader.array()?,
+            sequence: reader.array()?,
+        };
+        let record: Vec<u32> = reader.array()?;
         let mut links = Links {
-            record: read_vec(&mut file)?,
-            parent: read_vec(&mut file)?,
-            name_off: read_vec(&mut file)?,
-            name_len: read_vec(&mut file)?,
+            name_off: vec![u32::MAX; record.len()],
+            record,
+            parent: reader.array()?,
+            name_len: reader.array()?,
             free: Vec::new(),
         };
+        let names = reader.array()?;
+        let sorted = reader.array()?;
+        ensure!(reader.pos == data.len(), "Index file has trailing data");
+        reader.decompress()?;
+
         links.free = (0..links.record.len() as u32)
             .filter(|&l| links.record[l as usize] == NO_RECORD)
             .collect();
-        let names = read_vec(&mut file)?;
-        let sorted = read_vec(&mut file)?;
 
-        let index = VolumeIndex {
+        let mut index = VolumeIndex {
             volume,
             volume_serial,
             journal_id,
@@ -207,8 +256,86 @@ impl VolumeIndex {
             garbage: 0,
             locations: Default::default(),
         };
+        index.place_names()?;
         index.validate()?;
         Ok(index)
+    }
+
+    /// Splits the names, in the order they are saved in, into chunks.
+    fn name_chunks<'a>(&self, order: &'a [u32]) -> (u64, Vec<Chunk<'a>>) {
+        let (mut chunks, mut start, mut bytes, mut total) = (Vec::new(), 0, 0, 0);
+        for (i, &id) in order.iter().enumerate() {
+            bytes += self.name(id).len();
+            if bytes >= CHUNK || i + 1 == order.len() {
+                chunks.push(Chunk::Names(&order[start..i + 1]));
+                total += bytes as u64;
+                (start, bytes) = (i + 1, 0);
+            }
+        }
+        (total, chunks)
+    }
+
+    /// Returns the uncompressed size and the compressed data of a chunk.
+    fn compress(&self, chunk: &Chunk) -> Result<(u32, Vec<u8>)> {
+        let names;
+        let raw = match *chunk {
+            Chunk::Bytes(bytes) => bytes,
+            Chunk::Names(ids) => {
+                names = ids
+                    .iter()
+                    .flat_map(|&id| self.name(id))
+                    .copied()
+                    .collect::<Vec<_>>();
+                &names
+            }
+        };
+        Ok((raw.len() as u32, zstd::bulk::compress(raw, LEVEL)?))
+    }
+
+    /// Sets the name offsets of a loaded index from the order the names were saved in.
+    fn place_names(&mut self) -> Result<()> {
+        let mut off = 0usize;
+        for id in self.name_order() {
+            let (slot, len) = if is_link(id) {
+                let l = link_index(id);
+                ensure!(
+                    l < self.links.len(),
+                    "Sorted list references unknown entries"
+                );
+                (&mut self.links.name_off[l], self.links.name_len[l])
+            } else {
+                let i = id as usize;
+                ensure!(
+                    i < self.records.len(),
+                    "Sorted list references unknown entries"
+                );
+                (&mut self.records.name_off[i], self.records.name_len[i])
+            };
+            *slot = off as u32;
+            off += len as usize;
+            ensure!(
+                off <= self.names.len(),
+                "Names are shorter than their lengths"
+            );
+        }
+        ensure!(
+            off == self.names.len(),
+            "Names are longer than their lengths"
+        );
+        // Entries that were not saved with a name, e.g. free link slots
+        let r = &mut self.records;
+        let l = &mut self.links;
+        for (off, len) in r.name_off.iter_mut().zip(&mut r.name_len) {
+            if *off == u32::MAX {
+                (*off, *len) = (0, 0);
+            }
+        }
+        for (off, len) in l.name_off.iter_mut().zip(&mut l.name_len) {
+            if *off == u32::MAX {
+                (*off, *len) = (0, 0);
+            }
+        }
+        Ok(())
     }
 
     /// Makes sure a loaded index can not cause out of bounds accesses.
@@ -264,22 +391,92 @@ impl VolumeIndex {
     }
 }
 
-fn write_slice<T: Pod>(w: &mut impl Write, data: &[T]) -> Result<()> {
-    w.write_all(&(data.len() as u64).to_le_bytes())?;
-    let bytes =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, size_of_val(data)) };
-    w.write_all(bytes)?;
-    Ok(())
+/// Uncompressed data of a chunk
+enum Chunk<'a> {
+    Bytes(&'a [u8]),
+    /// The names of these entries, back to back
+    Names(&'a [u32]),
 }
 
-fn read_vec<T: Pod>(r: &mut impl Read) -> Result<Vec<T>> {
-    let len = read_u64(r)? as usize;
-    ensure!(len < (1 << 34), "Implausible array length {}", len);
-    let mut v = vec![T::default(); len];
+/// The element count and the chunks of an array.
+fn array<T: Pod>(data: &[T]) -> (u64, Vec<Chunk<'_>>) {
     let bytes =
-        unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, len * size_of::<T>()) };
-    r.read_exact(bytes)?;
-    Ok(v)
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, size_of_val(data)) };
+    (
+        data.len() as u64,
+        bytes.chunks(CHUNK).map(Chunk::Bytes).collect(),
+    )
+}
+
+/// Reads the arrays of a saved index from its file contents.
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    jobs: Vec<Job<'a>>,
+}
+
+/// A chunk to decompress into an array allocated by [`Reader::array`]
+struct Job<'a> {
+    dst: SyncPtr<u8>,
+    len: usize,
+    src: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let bytes = self
+            .data
+            .get(self.pos..self.pos.saturating_add(len))
+            .ok_or_else(|| eyre!("Index file is truncated"))?;
+        self.pos += len;
+        Ok(bytes)
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    /// Allocates the next array. Its contents are filled in by [`Reader::decompress`], the
+    /// array must not be touched before.
+    fn array<T: Pod>(&mut self) -> Result<Vec<T>> {
+        let count = u64::from_le_bytes(self.take(8)?.try_into().unwrap()) as usize;
+        let chunks = self.u32()? as usize;
+        let mut sizes = Vec::with_capacity(chunks.min(self.data.len() / 8));
+        for _ in 0..chunks {
+            let (raw, compressed) = (self.u32()? as usize, self.u32()? as usize);
+            // Name chunks end after the name that reaches CHUNK
+            ensure!(
+                raw <= CHUNK + u16::MAX as usize,
+                "Implausible chunk size {}",
+                raw
+            );
+            sizes.push((raw, compressed));
+        }
+        ensure!(
+            sizes.iter().map(|&(raw, _)| raw).sum::<usize>() == count * size_of::<T>(),
+            "Chunk sizes do not match the array length"
+        );
+
+        let mut array = vec![T::default(); count];
+        let mut dst = SyncPtr(array.as_mut_ptr() as *mut u8);
+        for (raw, compressed) in sizes {
+            let src = self.take(compressed)?;
+            self.jobs.push(Job { dst, len: raw, src });
+            dst = SyncPtr(unsafe { dst.get().add(raw) });
+        }
+        Ok(array)
+    }
+
+    /// Decompresses the chunks of all arrays.
+    fn decompress(self) -> Result<()> {
+        self.jobs.par_iter().try_for_each(|job| {
+            // The chunks of an array cover it exactly once and the array is still alive
+            let dst = unsafe { std::slice::from_raw_parts_mut(job.dst.get(), job.len) };
+            let len = zstd::bulk::decompress_to_buffer(job.src, dst)?;
+            ensure!(len == job.len, "Chunk is shorter than its size");
+            Ok(())
+        })
+    }
 }
 
 fn read_u32(r: &mut impl Read) -> Result<u32> {
@@ -292,4 +489,84 @@ fn read_u64(r: &mut impl Read) -> Result<u64> {
     let mut b = [0u8; 8];
     r.read_exact(&mut b)?;
     Ok(u64::from_le_bytes(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::update::{RecordState, RecordUpdate};
+    use crate::index::FLAG_DIRECTORY;
+    use crate::ntfs::ROOT_RECORD;
+
+    fn state(names: &[(u32, &str)], directory: bool, size: u64) -> Option<RecordState> {
+        Some(RecordState {
+            names: names
+                .iter()
+                .map(|&(p, n)| (p, n.as_bytes().to_vec()))
+                .collect(),
+            flags: FLAG_IN_USE | if directory { FLAG_DIRECTORY } else { 0 },
+            size: (!directory).then_some(size),
+            created: 1,
+            modified: 2,
+            sequence: 1,
+        })
+    }
+
+    #[test]
+    fn save_and_load() {
+        let volume = Volume { id: 'Z' };
+        let mut index = VolumeIndex::empty(volume);
+        let update = |record, state| RecordUpdate { record, state };
+        index.apply_updates(
+            &[
+                update(ROOT_RECORD, state(&[(ROOT_RECORD, ".")], true, 0)),
+                update(40, state(&[(ROOT_RECORD, "Users")], true, 0)),
+                update(41, state(&[(40, "notes.txt")], false, 10)),
+                update(
+                    42,
+                    state(&[(40, "a.dll"), (ROOT_RECORD, "b.dll")], false, 20),
+                ),
+                update(
+                    43,
+                    state(
+                        &[(40, "Ärger.md"), (40, "c.md"), (ROOT_RECORD, "d.md")],
+                        false,
+                        30,
+                    ),
+                ),
+                update(44, state(&[(40, "gone.txt")], false, 40)),
+            ],
+            1,
+        );
+        // Leaves names out of sorted order, garbage and a free link slot behind
+        index.apply_updates(
+            &[
+                update(41, state(&[(ROOT_RECORD, "renamed.txt")], false, 11)),
+                update(43, state(&[(40, "Ärger.md")], false, 30)),
+                update(44, None),
+                update(45, state(&[(40, "zz new")], false, 50)),
+            ],
+            2,
+        );
+
+        let dir = std::env::temp_dir().join(format!("rv-persist-test-{}", std::process::id()));
+        index.save(&dir).unwrap();
+        let loaded = load_offline(volume, &dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.sorted, index.sorted);
+        assert_eq!(loaded.next_usn, 2);
+        assert_eq!(loaded.links.record, index.links.record);
+        assert_eq!(loaded.links.free.len(), index.links.free.len());
+        assert!(!index.links.free.is_empty());
+        for id in index.name_order() {
+            assert_eq!(loaded.name_str(id), index.name_str(id));
+            assert_eq!(loaded.parent(id), index.parent(id));
+            assert_eq!(loaded.flags(id), index.flags(id));
+        }
+        assert_eq!(loaded.records.size, index.records.size);
+        assert_eq!(loaded.records.modified, index.records.modified);
+        // Saving dropped the garbage
+        assert!(loaded.names.len() < index.names.len());
+    }
 }

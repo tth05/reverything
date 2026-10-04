@@ -344,10 +344,26 @@ fn bench_persist(index: &VolumeIndex) {
             "  loaded {} entries in {:?} (identical: {})",
             loaded.file_count(),
             t.elapsed(),
-            loaded.sorted == index.sorted && loaded.names == index.names
+            same_index(&loaded, index)
         ),
         Err(e) => println!("  load failed: {:#}", e),
     }
+}
+
+/// Whether a loaded index has the same entries as the saved one.
+fn same_index(a: &VolumeIndex, b: &VolumeIndex) -> bool {
+    let (ra, rb) = (&a.records, &b.records);
+    a.sorted == b.sorted
+        && ra.flags == rb.flags
+        && ra.parent == rb.parent
+        && ra.size == rb.size
+        && ra.created == rb.created
+        && ra.modified == rb.modified
+        && ra.sequence == rb.sequence
+        && a.links.record == b.links.record
+        && a.name_order()
+            .iter()
+            .all(|&id| a.name(id) == b.name(id) && a.parent(id) == b.parent(id))
 }
 
 fn print_index_memory(index: &VolumeIndex) {
