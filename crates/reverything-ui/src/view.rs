@@ -1456,13 +1456,7 @@ fn settings_panel(cx: &App) -> impl IntoElement {
                             let checked = *checked;
                             Settings::update(cx, |s| s.check_updates = checked)
                         }),
-                )
-                .child(hint(if crate::update::enabled() {
-                    "Asks GitHub for the latest release, nothing else is sent. A new version is \
-                     offered at the bottom left."
-                } else {
-                    crate::update::disabled_reason()
-                })),
+                ),
         )
         .child(
             v_flex()
