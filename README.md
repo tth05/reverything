@@ -26,6 +26,14 @@ contents, and never changes anything on your drives.
 On a fresh install it indexes the drive Windows is on; other drives are turned on in the settings. Uninstalling
 from "Apps & features" removes the service, the index, the settings and the logs.
 
+### "Windows protected your PC"
+The installer is not code signed yet. When you run it from a browser download, Windows SmartScreen shows "Windows
+protected your PC"; click "More info" and "Run anyway". The administrator prompt shows "Unknown publisher", also
+for updates (those are downloaded by the app, which checks them against the checksum published with the release,
+so SmartScreen does not show up for them). Some antivirus tools may flag the installer on heuristics, since it
+installs a service that runs with full system rights and reads disks directly. Signing the installer and both
+executables would fix all of this.
+
 ## Developer documentation
 
 ### Architecture
