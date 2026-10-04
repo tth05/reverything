@@ -33,6 +33,7 @@ gpui_kit::actions!(
     [
         OpenSelected,
         RevealSelected,
+        CopyFile,
         CopyPath,
         CopyName,
         ShowProperties,
@@ -49,6 +50,10 @@ pub const KEY_CONTEXT: &str = "Reverything";
 pub fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("ctrl-enter", RevealSelected, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-c", CopyFile, Some(KEY_CONTEXT)),
+        // Also in the search box, which usually has the focus. Text selected there is still
+        // copied as text, see `on_copy_file`.
+        KeyBinding::new("ctrl-c", CopyFile, Some("Reverything > Input")),
         KeyBinding::new("ctrl-shift-c", CopyPath, Some(KEY_CONTEXT)),
         KeyBinding::new("alt-enter", ShowProperties, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-f", FocusSearch, Some(KEY_CONTEXT)),
@@ -232,6 +237,21 @@ impl MainView {
     fn on_reveal(&mut self, _: &RevealSelected, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = self.target_path(cx) {
             shell::reveal(&path);
+        }
+    }
+
+    /// Copies the entry as a file, like Explorer. In the search box with text selected, the
+    /// text is copied instead.
+    fn on_copy_file(&mut self, _: &CopyFile, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.input.read(cx);
+        let range = input.selected_range();
+        if input.focus_handle(cx).is_focused(window) && !range.is_empty() {
+            let text = input.value().get(range).unwrap_or_default().to_string();
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            return;
+        }
+        if let Some(path) = self.target_path(cx) {
+            shell::copy_to_clipboard(&path);
         }
     }
 
@@ -1227,6 +1247,7 @@ impl Render for MainView {
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::on_open))
             .on_action(cx.listener(Self::on_reveal))
+            .on_action(cx.listener(Self::on_copy_file))
             .on_action(cx.listener(Self::on_copy_path))
             .on_action(cx.listener(Self::on_copy_name))
             .on_action(cx.listener(Self::on_properties))

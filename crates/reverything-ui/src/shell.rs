@@ -11,7 +11,10 @@ use reverything_protocol::Row;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::IDataObject;
-use windows::Win32::System::Ole::{IDropSource, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
+use windows::Win32::System::Ole::{
+    IDropSource, OleFlushClipboard, OleSetClipboard, DROPEFFECT_COPY, DROPEFFECT_LINK,
+    DROPEFFECT_MOVE,
+};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CLASSES_ROOT, RRF_RT_REG_SZ};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
@@ -111,6 +114,21 @@ pub fn properties(path: &str) {
     };
     unsafe {
         let _ = ShellExecuteExW(&mut info);
+    }
+}
+
+/// Puts the entry on the clipboard the way Explorer's copy does, so it can be pasted into
+/// Explorer or any other program.
+pub fn copy_to_clipboard(path: &str) {
+    let result = unsafe {
+        SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(path), None)
+            .and_then(|item| item.BindToHandler::<_, IDataObject>(None, &BHID_DataObject))
+            .and_then(|data| OleSetClipboard(&data))
+            // Keeps the data on the clipboard after the app exits
+            .and_then(|()| OleFlushClipboard())
+    };
+    if let Err(e) = result {
+        crate::log::write(&format!("Copying {} failed: {}", path, e));
     }
 }
 
