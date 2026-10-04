@@ -43,6 +43,10 @@ const READ_AT_FRACTION: u64 = 4;
 const UNLOAD_AFTER: Duration = Duration::from_secs(60 * 60);
 /// With more changed records than this, a full scan is about as fast as fetching them
 const MAX_PENDING: usize = 1_000_000;
+/// A failed volume (e.g. an unplugged USB disk) is tried again after this, doubling up to
+/// [`RETRY_MAX`]. A client becoming active retries right away.
+const RETRY_FIRST: Duration = Duration::from_secs(30);
+const RETRY_MAX: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum VolumeState {
@@ -148,6 +152,8 @@ pub struct IndexSet {
     offline: bool,
     /// Clients whose window is active
     active: AtomicUsize,
+    /// Counts the times a client became active, so waiting threads notice even a short one
+    activations: AtomicU64,
     stopping: AtomicBool,
     /// Wakes volume threads waiting while inactive
     wake_lock: Mutex<()>,
@@ -207,6 +213,7 @@ impl IndexSet {
             db_dir,
             offline,
             active: AtomicUsize::new(0),
+            activations: AtomicU64::new(0),
             stopping: AtomicBool::new(false),
             wake_lock: Mutex::new(()),
             wake: Condvar::new(),
@@ -336,6 +343,7 @@ impl IndexSet {
                 log::info!("A client is active");
                 // Cheap, and the app is about to be used: pick up drives that appeared
                 self.refresh_volumes();
+                self.activations.fetch_add(1, Ordering::SeqCst);
                 self.notify();
             }
         } else if self.active.fetch_sub(1, Ordering::SeqCst) == 1 {
@@ -516,6 +524,7 @@ impl IndexSet {
         }
 
         let mut rt = Runtime::default();
+        let mut retry = RETRY_FIRST;
         self.prepare(i, run, &mut rt);
         loop {
             if !self.is_current(i, run) {
@@ -526,13 +535,26 @@ impl IndexSet {
                 return;
             }
 
+            if rt.failed {
+                rt.set_background(true);
+                self.wait_retry(i, run, retry);
+                if !self.is_current(i, run) || self.is_stopping() {
+                    continue;
+                }
+                retry = (retry * 2).min(RETRY_MAX);
+                log::info!("Trying {} again", self.volumes[i].volume.id);
+                rt = Runtime::default();
+                self.prepare(i, run, &mut rt);
+                continue;
+            }
+
             if self.is_active() {
                 rt.set_background(false);
                 if let Err(e) = self.wake_up(i, run, &mut rt) {
-                    log::error!("Indexing {} failed: {}", self.volumes[i].volume.id, e);
-                    self.update_stats(i, run, |s| s.state = VolumeState::Failed(e));
-                    return;
+                    self.fail(i, run, &mut rt, e);
+                    continue;
                 }
+                retry = RETRY_FIRST;
                 match self.follow_journal(i, run, &mut rt) {
                     Ok(()) => {}
                     Err(JournalError::Reset) => {
@@ -544,15 +566,7 @@ impl IndexSet {
                     }
                     // Waiting for the journal is cancelled when the app becomes inactive
                     Err(JournalError::Other(e)) if self.should_follow(i, run) => {
-                        log::error!(
-                            "Live updates of {} stopped: {:#}",
-                            self.volumes[i].volume.id,
-                            e
-                        );
-                        self.update_stats(i, run, |s| {
-                            s.state = VolumeState::Failed(format!("Live updates stopped: {:#}", e))
-                        });
-                        return;
+                        self.fail(i, run, &mut rt, format!("Live updates stopped: {:#}", e));
                     }
                     Err(JournalError::Other(_)) => {}
                 }
@@ -570,6 +584,31 @@ impl IndexSet {
                 self.check_journal(i, &mut rt);
             }
         }
+    }
+
+    /// Marks volume `i` as failed. It is tried again later, see [`RETRY_FIRST`].
+    fn fail(&self, i: usize, run: u64, rt: &mut Runtime, error: String) {
+        log::error!("Indexing {} failed: {}", self.volumes[i].volume.id, error);
+        // Drops the volume handles, the disk may be gone
+        *rt = Runtime {
+            failed: true,
+            ..Runtime::default()
+        };
+        self.update_stats(i, run, |s| s.state = VolumeState::Failed(error));
+    }
+
+    /// Waits before trying a failed volume again, less when a client becomes active.
+    fn wait_retry(&self, i: usize, run: u64, delay: Duration) {
+        let activations = self.activations.load(Ordering::SeqCst);
+        let lock = self.wake_lock.lock().unwrap();
+        let _ = self
+            .wake
+            .wait_timeout_while(lock, delay, |_| {
+                self.activations.load(Ordering::SeqCst) == activations
+                    && !self.is_stopping()
+                    && self.is_current(i, run)
+            })
+            .unwrap();
     }
 
     /// Loads the saved index without volume access, it is not updated.
@@ -611,11 +650,18 @@ impl IndexSet {
     /// index is loaded when a client becomes active.
     fn prepare(&self, i: usize, run: u64, rt: &mut Runtime) {
         let volume = self.volumes[i].volume;
+        // Not there (an unplugged disk, a locked BitLocker drive), tried again later
+        let handle = match volume.open(false, false) {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.fail(i, run, rt, format!("{:#}", e));
+                return;
+            }
+        };
         let saved = || -> Result<Option<(u64, JournalFollower)>> {
             let Some(header) = read_header(volume, &self.db_dir)? else {
                 return Ok(None);
             };
-            let handle = volume.open(false, false)?;
             ensure!(
                 header.volume_serial == volume_data(&handle)?.VolumeSerialNumber as u64,
                 "Index file is for another volume"
@@ -966,6 +1012,8 @@ struct Runtime {
     loaded: bool,
     /// Nothing can bring the index up to date anymore, only a full scan
     needs_scan: bool,
+    /// Indexing failed, it is tried again later
+    failed: bool,
     /// Serial number of the volume the saved index belongs to
     serial: u64,
     /// Records changed since the index was saved
@@ -984,6 +1032,7 @@ impl Default for Runtime {
             follower: None,
             loaded: false,
             needs_scan: false,
+            failed: false,
             serial: 0,
             since_save: RecordSet::default(),
             since_index: RecordSet::default(),
