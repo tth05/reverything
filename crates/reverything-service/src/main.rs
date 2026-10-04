@@ -9,7 +9,7 @@
 //! reverything-service --console --offline
 //!                                        serve the development indices without admin rights,
 //!                                        not kept up to date
-//! reverything-service --bench            benchmarks, see the README (admin)
+//! reverything-service --bench            benchmarks, see DEVELOPMENT.md (admin)
 //! reverything-service query <text>       search through a running service
 //! ```
 
