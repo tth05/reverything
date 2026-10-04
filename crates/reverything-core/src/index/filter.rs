@@ -5,9 +5,7 @@
 //! A comparison with a period works on its edges: `dm:>2024` is after the end of 2024,
 //! `dm:>=2024` from its start, `dm:<2024` before its start and `dm:<=2024` until its end.
 
-use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
-use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::System::Time::{SystemTimeToFileTime, TzSpecificLocalTimeToSystemTime};
+use chrono::{Datelike, Days, Local, Months, NaiveDate, NaiveTime, TimeZone};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -44,7 +42,7 @@ impl Filter {
         let (min, max) = match field {
             Field::Size => parse_range(&spec, parse_size)?,
             Field::Modified | Field::Created => {
-                let today = local_today();
+                let today = Local::now().date_naive();
                 parse_range(&spec, |s| parse_period(s, today).map(to_unix_range))?
             }
         };
@@ -100,141 +98,58 @@ fn parse_size(s: &str) -> Option<(u64, u64)> {
     Some((bytes, bytes))
 }
 
-/// A calendar day in local time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Day {
-    pub year: i32,
-    pub month: u32,
-    pub day: u32,
-}
-
-impl Day {
-    fn new(year: i32, month: u32, day: u32) -> Self {
-        Self { year, month, day }
-    }
-
-    /// Days since 1970-01-01 (proleptic Gregorian calendar).
-    fn number(self) -> i64 {
-        let y = if self.month <= 2 {
-            self.year - 1
-        } else {
-            self.year
-        } as i64;
-        let era = y.div_euclid(400);
-        let yoe = y - era * 400;
-        let m = self.month as i64;
-        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + self.day as i64 - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        era * 146097 + doe - 719468
-    }
-
-    fn from_number(n: i64) -> Self {
-        let z = n + 719468;
-        let era = z.div_euclid(146097);
-        let doe = z - era * 146097;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-        let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-        let year = (yoe + era * 400 + if month <= 2 { 1 } else { 0 }) as i32;
-        Self::new(year, month, day)
-    }
-
-    fn add_days(self, days: i64) -> Self {
-        Self::from_number(self.number() + days)
-    }
-
-    /// 0 for Monday
-    fn weekday(self) -> i64 {
-        (self.number() + 3).rem_euclid(7)
-    }
-
-    fn next_month(self) -> Self {
-        if self.month == 12 {
-            Self::new(self.year + 1, 1, 1)
-        } else {
-            Self::new(self.year, self.month + 1, 1)
-        }
-    }
-}
-
-/// A period of days, `start` included and `end` excluded.
-fn parse_period(s: &str, today: Day) -> Option<(Day, Day)> {
-    let s = s.trim();
-    let month_start = Day::new(today.year, today.month, 1);
-    let week_start = today.add_days(-today.weekday());
-    let period = match s {
-        "today" => (today, today.add_days(1)),
-        "yesterday" => (today.add_days(-1), today),
-        "thisweek" => (week_start, week_start.add_days(7)),
-        "lastweek" => (week_start.add_days(-7), week_start),
-        "thismonth" => (month_start, month_start.next_month()),
-        "lastmonth" => {
-            let last = month_start.add_days(-1);
-            (Day::new(last.year, last.month, 1), month_start)
-        }
-        "thisyear" => (Day::new(today.year, 1, 1), Day::new(today.year + 1, 1, 1)),
-        "lastyear" => (Day::new(today.year - 1, 1, 1), Day::new(today.year, 1, 1)),
-        _ => {
-            let parts = s.split('-').collect::<Vec<_>>();
-            let number = |i: usize| parts.get(i)?.parse::<u32>().ok();
-            match parts.len() {
-                1 => {
-                    let year = number(0)? as i32;
-                    (Day::new(year, 1, 1), Day::new(year + 1, 1, 1))
+/// A period of local days, `start` included and `end` excluded.
+fn parse_period(s: &str, today: NaiveDate) -> Option<(NaiveDate, NaiveDate)> {
+    let month_start = today.with_day(1)?;
+    let week_start = today - Days::new(today.weekday().num_days_from_monday() as u64);
+    let year_start = |year: i32| NaiveDate::from_ymd_opt(year, 1, 1);
+    let next_month = |d: NaiveDate| d.checked_add_months(Months::new(1));
+    Some(match s.trim() {
+        "today" => (today, today.succ_opt()?),
+        "yesterday" => (today.pred_opt()?, today),
+        "thisweek" => (week_start, week_start + Days::new(7)),
+        "lastweek" => (week_start - Days::new(7), week_start),
+        "thismonth" => (month_start, next_month(month_start)?),
+        "lastmonth" => (month_start.checked_sub_months(Months::new(1))?, month_start),
+        "thisyear" => (year_start(today.year())?, year_start(today.year() + 1)?),
+        "lastyear" => (year_start(today.year() - 1)?, year_start(today.year())?),
+        s => {
+            let parts = s
+                .split('-')
+                .map(|p| p.parse::<u32>().ok())
+                .collect::<Option<Vec<_>>>()?;
+            match parts[..] {
+                [year] => (year_start(year as i32)?, year_start(year as i32 + 1)?),
+                [year, month] => {
+                    let start = NaiveDate::from_ymd_opt(year as i32, month, 1)?;
+                    (start, next_month(start)?)
                 }
-                2 => {
-                    let start = Day::new(number(0)? as i32, number(1)?, 1);
-                    (start, start.next_month())
-                }
-                3 => {
-                    let start = Day::new(number(0)? as i32, number(1)?, number(2)?);
-                    (start, start.add_days(1))
+                [year, month, day] => {
+                    let start = NaiveDate::from_ymd_opt(year as i32, month, day)?;
+                    (start, start.succ_opt()?)
                 }
                 _ => return None,
             }
         }
-    };
-    let valid = |d: Day| (1..=12).contains(&d.month) && (1..=31).contains(&d.day);
-    (valid(period.0) && valid(period.1) && (1601..=9999).contains(&period.0.year)).then_some(period)
+    })
 }
 
 /// The inclusive range of unix timestamps of a period of local days.
-fn to_unix_range((start, end): (Day, Day)) -> (u64, u64) {
+fn to_unix_range((start, end): (NaiveDate, NaiveDate)) -> (u64, u64) {
     let start = local_midnight_unix(start).max(0) as u64;
     let end = local_midnight_unix(end).max(1) as u64;
     (start, end - 1)
 }
 
-fn local_today() -> Day {
-    let now = unsafe { GetLocalTime() };
-    Day::new(now.wYear as i32, now.wMonth as u32, now.wDay as u32)
-}
-
-/// Unix time of the local midnight starting `day`, following the time zone's rules for that
-/// date (daylight saving time).
-fn local_midnight_unix(day: Day) -> i64 {
-    let local = SYSTEMTIME {
-        wYear: day.year as u16,
-        wMonth: day.month as u16,
-        wDay: day.day as u16,
-        ..Default::default()
-    };
-    let mut utc = SYSTEMTIME::default();
-    let fallback = day.number() * 86400;
-    unsafe {
-        if TzSpecificLocalTimeToSystemTime(None, &local, &mut utc).is_err() {
-            return fallback;
-        }
-        let mut ft = FILETIME::default();
-        if SystemTimeToFileTime(&utc, &mut ft).is_err() {
-            return fallback;
-        }
-        let ticks = ((ft.dwHighDateTime as i64) << 32) | ft.dwLowDateTime as i64;
-        // FILETIME counts 100 ns since 1601
-        ticks / 10_000_000 - 11_644_473_600
-    }
+/// Unix time of the local midnight starting `day`, following the time zone's daylight saving
+/// rules for that date.
+fn local_midnight_unix(day: NaiveDate) -> i64 {
+    let midnight = day.and_time(NaiveTime::MIN);
+    // Where clocks jump at midnight, the day starts at the first valid time
+    Local
+        .from_local_datetime(&midnight)
+        .earliest()
+        .map_or_else(|| midnight.and_utc().timestamp(), |t| t.timestamp())
 }
 
 #[cfg(test)]
@@ -254,38 +169,17 @@ mod tests {
     }
 
     #[test]
-    fn days() {
-        for (y, m, d) in [(1970, 1, 1), (2000, 2, 29), (2024, 12, 31), (1601, 1, 1)] {
-            let day = Day::new(y, m, d);
-            assert_eq!(Day::from_number(day.number()), day);
-        }
-        assert_eq!(Day::new(1970, 1, 2).number(), 1);
-        // 2026-10-05 is a Monday
-        assert_eq!(Day::new(2026, 10, 5).weekday(), 0);
-    }
-
-    #[test]
     fn periods() {
-        let today = Day::new(2026, 10, 7); // Wednesday
+        let day = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        let today = day(2026, 10, 7); // Wednesday
         let p = |s: &str| parse_period(s, today);
-        assert_eq!(p("today"), Some((today, Day::new(2026, 10, 8))));
-        assert_eq!(
-            p("thisweek"),
-            Some((Day::new(2026, 10, 5), Day::new(2026, 10, 12)))
-        );
-        assert_eq!(
-            p("lastmonth"),
-            Some((Day::new(2026, 9, 1), Day::new(2026, 10, 1)))
-        );
-        assert_eq!(
-            p("2024-12"),
-            Some((Day::new(2024, 12, 1), Day::new(2025, 1, 1)))
-        );
-        assert_eq!(
-            p("2024-02-29"),
-            Some((Day::new(2024, 2, 29), Day::new(2024, 3, 1)))
-        );
+        assert_eq!(p("today"), Some((today, day(2026, 10, 8))));
+        assert_eq!(p("thisweek"), Some((day(2026, 10, 5), day(2026, 10, 12))));
+        assert_eq!(p("lastmonth"), Some((day(2026, 9, 1), day(2026, 10, 1))));
+        assert_eq!(p("2024-12"), Some((day(2024, 12, 1), day(2025, 1, 1))));
+        assert_eq!(p("2024-02-29"), Some((day(2024, 2, 29), day(2024, 3, 1))));
         assert_eq!(p("2024-13"), None);
+        assert_eq!(p("2023-02-29"), None);
         assert_eq!(p("someday"), None);
     }
 }

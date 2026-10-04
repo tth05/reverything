@@ -6116,6 +6116,7 @@ dependencies = [
 name = "reverything-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "eyre",
  "log",
  "memchr",
