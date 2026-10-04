@@ -160,6 +160,9 @@ pub struct Results {
     search: u64,
     total: usize,
     pages: HashMap<usize, Vec<Row>>,
+    /// Pages of the previous result set, shown while a refresh fetches the new ones so the table
+    /// does not blank out in between
+    stale: HashMap<usize, Vec<Row>>,
     pending: HashSet<usize>,
     visible: Range<usize>,
     icons: FileIcons,
@@ -185,6 +188,7 @@ impl Results {
             search: 0,
             total: 0,
             pages: HashMap::new(),
+            stale: HashMap::new(),
             pending: HashSet::new(),
             visible: 0..0,
             icons: FileIcons::default(),
@@ -201,8 +205,10 @@ impl Results {
     }
 
     pub fn row(&self, ix: usize) -> Option<&Row> {
+        let page = ix / PAGE;
         self.pages
-            .get(&(ix / PAGE))
+            .get(&page)
+            .or_else(|| self.stale.get(&page))
             .and_then(|page| page.get(ix % PAGE))
     }
 
@@ -256,7 +262,14 @@ impl Results {
                     }) => {
                         results.search = search;
                         results.total = total as usize;
-                        results.pages.clear();
+                        if scroll_to_top {
+                            results.stale.clear();
+                            results.pages.clear();
+                        } else {
+                            // Pages of an earlier refresh that did not arrive yet stay stale
+                            let pages = std::mem::take(&mut results.pages);
+                            results.stale.extend(pages);
+                        }
                         results.pending.clear();
                         results.error = None;
                         results.last_search = Some(SearchTiming {
@@ -269,6 +282,7 @@ impl Results {
                         results.error = Some(e);
                         results.total = 0;
                         results.pages.clear();
+                        results.stale.clear();
                     }
                 }
 
@@ -327,6 +341,7 @@ impl Results {
                 }
                 results.pending.remove(&page);
                 if let Ok(Response::Rows { rows, .. }) = response {
+                    results.stale.remove(&page);
                     results.pages.insert(page, rows);
                     results.last_page = Some(took);
                     cx.notify();
