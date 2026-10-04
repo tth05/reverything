@@ -29,7 +29,7 @@ if ($sha256 -notmatch '^[0-9a-f]{64}$') { throw "No valid SHA256 for $name" }
 # /MANAGED tells the app to leave updates to the package manager (both manifests pass it).
 $scoop = [ordered]@{
     version     = $Version
-    description = 'Fast file name search for NTFS drives'
+    description = 'Blazingly fast, resource-efficient global file search for Windows'
     homepage    = 'https://github.com/tth05/reverything'
     license     = [ordered]@{
         identifier = 'Proprietary'
@@ -58,58 +58,83 @@ $scoop = [ordered]@{
 New-Item -ItemType Directory -Force (Join-Path $repo 'bucket') | Out-Null
 $scoop | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $repo 'bucket\reverything.json') -Encoding utf8NoBOM
 
-# winget
+# winget, in the form microsoft/winget-pkgs expects: schema 1.12.0, CRLF line endings
 $id = 'tth05.Reverything'
 $dir = Join-Path $repo "packaging\winget\manifests\t\tth05\Reverything\$Version"
 New-Item -ItemType Directory -Force $dir | Out-Null
-$schema = '1.6.0'
-@"
+$schema = '1.12.0'
+$date = Get-Date -Format 'yyyy-MM-dd'
+function Write-Manifest([string] $File, [string] $Text) {
+    $crlf = ($Text.Trim() -replace "`r?`n", "`r`n") + "`r`n"
+    [IO.File]::WriteAllText((Join-Path $dir $File), $crlf, [Text.UTF8Encoding]::new($false))
+}
+Write-Manifest "$id.yaml" @"
 # yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.$schema.schema.json
+
 PackageIdentifier: $id
 PackageVersion: $Version
 DefaultLocale: en-US
 ManifestType: version
 ManifestVersion: $schema
-"@ | Set-Content (Join-Path $dir "$id.yaml") -Encoding utf8NoBOM
-@"
+"@
+Write-Manifest "$id.installer.yaml" @"
 # yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.$schema.schema.json
+
 PackageIdentifier: $id
 PackageVersion: $Version
 InstallerType: inno
 Scope: machine
-ElevationRequirement: elevatesSelf
-UpgradeBehavior: install
+InstallModes:
+- interactive
+- silent
+- silentWithProgress
 InstallerSwitches:
   Custom: /MANAGED=winget
+UpgradeBehavior: install
+ElevationRequirement: elevatesSelf
 ProductCode: '{6B0E2F47-9C1D-4E4B-A6E8-3F2C8D9B5A71}_is1'
+ReleaseDate: $date
 Installers:
-  - Architecture: x64
-    InstallerUrl: $url
-    InstallerSha256: $($sha256.ToUpper())
+- Architecture: x64
+  InstallerUrl: $url
+  InstallerSha256: $($sha256.ToUpper())
 ManifestType: installer
 ManifestVersion: $schema
-"@ | Set-Content (Join-Path $dir "$id.installer.yaml") -Encoding utf8NoBOM
-@"
+"@
+Write-Manifest "$id.locale.en-US.yaml" @"
 # yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.$schema.schema.json
+
 PackageIdentifier: $id
 PackageVersion: $Version
 PackageLocale: en-US
 Publisher: tth05
 PublisherUrl: https://github.com/tth05
+PublisherSupportUrl: https://github.com/tth05/reverything/issues
+Author: tth05
 PackageName: Reverything
 PackageUrl: https://github.com/tth05/reverything
 License: Proprietary (indexing library MIT)
 LicenseUrl: https://github.com/tth05/reverything/blob/master/LICENSE
-ShortDescription: Fast file name search for NTFS drives, similar to Everything.
-Description: Reverything indexes the file tables of NTFS drives through a small background service and finds files by name as you type, with wildcards, folder exclusions and size and date filters.
+Copyright: Copyright (c) 2026 tth05
+ShortDescription: Blazingly fast, resource-efficient global file search for Windows. Can index millions of files in seconds.
+Description: |-
+  Reverything finds any file on your PC by name, as you type. It reads the file tables of NTFS drives directly, so millions of files are indexed in seconds, and keeps the index up to date through the NTFS change journal.
+  Searches support wildcards, folders, exclusions and size or date filters. Results can be opened, dragged into other programs, copied or shown in Explorer.
+  A small background service, running as the system account, keeps the index and answers the searches; the search window runs as the user, lives in the tray and comes up with a global shortcut. While the window is not in use, the service uses almost no CPU or memory.
+Moniker: reverything
 Tags:
-  - search
-  - file-search
-  - everything
-  - ntfs
+- everything
+- everything-alternative
+- file-search
+- file-finder
+- files
+- mft
+- ntfs
+- search
+- usn-journal
 ReleaseNotesUrl: https://github.com/tth05/reverything/releases/tag/v$Version
 ManifestType: defaultLocale
 ManifestVersion: $schema
-"@ | Set-Content (Join-Path $dir "$id.locale.en-US.yaml") -Encoding utf8NoBOM
+"@
 
 Write-Host "Wrote bucket\reverything.json and $dir for $Version ($sha256)"

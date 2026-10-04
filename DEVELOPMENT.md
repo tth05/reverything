@@ -56,6 +56,7 @@ cargo build --release
 ```
 The `dist` profile (`cargo build --profile dist`) adds fat LTO and a single codegen unit. It is slow to compile and
 used by CI for the released installer.
+`.cargo\config.toml` links the C runtime statically, so the binaries do not need the Visual C++ Redistributable.
 GPUI compiles its shaders with `fxc.exe` from the Windows SDK. Its build script picks the newest installed SDK, which
 does not always contain `fxc.exe`; in that case point `GPUI_FXC_PATH` at one that does, e.g. in
 `%USERPROFILE%\.cargo\config.toml`:
