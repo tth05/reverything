@@ -1,0 +1,29 @@
+Reverything
+Copyright (c) 2026 tth05
+
+This repository contains code under two licenses:
+
+1. crates/reverything-core (NTFS indexing, search and live updates) is licensed
+   under the MIT License, see crates/reverything-core/LICENSE.
+
+2. Everything else, including the Reverything app (crates/reverything-ui), the
+   service (crates/reverything-service), the protocol crate
+   (crates/reverything-protocol), the installer, scripts and assets, is
+   proprietary. All rights reserved.
+
+   You may download the official release binaries of Reverything from
+   https://github.com/tth05/reverything/releases and install and use them
+   free of charge, for private and commercial purposes. No other rights are
+   granted: you may not modify, redistribute or sell this part of the source
+   code or binaries built from it without written permission.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Reverything uses third-party open source libraries under their own licenses
+(MIT, Apache-2.0, ISC and others), which apply to those libraries.

@@ -3,6 +3,8 @@ name = "reverything-service"
 description = "Windows service that keeps the Reverything index and answers searches"
 version.workspace = true
 edition.workspace = true
+license-file = "../../LICENSE"
+publish = false
 
 [dependencies]
 reverything-core.workspace = true
