@@ -24,7 +24,7 @@ pub fn pipe_name() -> String {
 }
 
 /// Bumped on incompatible changes. Clients and the service have to agree on it.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Upper bound for requests, which come from less privileged processes
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -134,6 +134,8 @@ pub struct Row {
     pub attributes: u32,
     /// Byte ranges of `name` that matched the search, for highlighting
     pub highlights: Vec<(u32, u32)>,
+    /// Byte ranges of `folder` that matched folder parts of the search (`system32\`)
+    pub folder_highlights: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

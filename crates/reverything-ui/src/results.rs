@@ -407,6 +407,24 @@ impl Results {
     }
 }
 
+/// The parts of `text` that matched the search, in bold.
+fn bold_ranges(text: &str, ranges: &[(u32, u32)]) -> Vec<(Range<usize>, HighlightStyle)> {
+    let bold = HighlightStyle {
+        font_weight: Some(FontWeight::BOLD),
+        ..Default::default()
+    };
+    ranges
+        .iter()
+        .map(|&(start, end)| (start as usize..end as usize, bold))
+        .filter(|(r, _)| {
+            r.start < r.end
+                && r.end <= text.len()
+                && text.is_char_boundary(r.start)
+                && text.is_char_boundary(r.end)
+        })
+        .collect()
+}
+
 impl TableDelegate for Results {
     fn columns_count(&self, _: &App) -> usize {
         self.columns.len()
@@ -471,6 +489,15 @@ impl TableDelegate for Results {
         };
         let kind = self.columns[col_ix].kind;
         let text = Self::cell_text(row, kind);
+        if kind == ColumnKind::Folder {
+            let highlights = bold_ranges(&text, &row.folder_highlights);
+            return div()
+                .text_xs()
+                .line_height(CELL_LINE_HEIGHT)
+                .truncate()
+                .child(StyledText::new(text).with_highlights(highlights))
+                .into_any_element();
+        }
         if kind != ColumnKind::Name {
             return div()
                 .text_xs()
@@ -492,20 +519,7 @@ impl TableDelegate for Results {
             .text_color(cx.theme().muted_foreground)
             .into_any_element(),
         };
-        // The parts of the name that matched the search in bold
-        let bold = HighlightStyle {
-            font_weight: Some(FontWeight::BOLD),
-            ..Default::default()
-        };
-        let highlights = matched
-            .iter()
-            .map(|&(start, end)| (start as usize..end as usize, bold))
-            .filter(|(r, _)| {
-                r.end <= text.len()
-                    && text.is_char_boundary(r.start)
-                    && text.is_char_boundary(r.end)
-            })
-            .collect::<Vec<_>>();
+        let highlights = bold_ranges(&text, &matched);
         h_flex()
             .gap_1p5()
             .overflow_hidden()

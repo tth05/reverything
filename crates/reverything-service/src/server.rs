@@ -140,6 +140,11 @@ impl Server {
                     .filter_map(|t| t.name_text.as_deref())
                     .map(Matcher::new)
                     .collect();
+                session.folders = query
+                    .include
+                    .iter()
+                    .flat_map(|t| t.dirs.iter().cloned())
+                    .collect();
                 query.folders.truncate(MAX_EXCLUDED_FOLDERS);
                 query.skip_files = !files;
                 query.skip_folders = !folders;
@@ -174,7 +179,7 @@ impl Server {
                 Response::Rows {
                     search,
                     start,
-                    rows: self.rows(&session.hits[start_ix..end], &session.names),
+                    rows: self.rows(&session.hits[start_ix..end], session),
                 }
             }
             Request::Status => Response::Status(self.status()),
@@ -212,7 +217,7 @@ impl Server {
         }
     }
 
-    fn rows(&self, hits: &[Hit], names: &[Matcher]) -> Vec<Row> {
+    fn rows(&self, hits: &[Hit], session: &Session) -> Vec<Row> {
         let indices = self
             .set
             .volumes
@@ -228,10 +233,12 @@ impl Server {
                     Some(index) if index.is_in_use(id) => {
                         let flags = index.flags(id);
                         let name = index.name_str(id).to_string();
+                        let folder = index.folder_path(id);
                         Row {
-                            highlights: highlights(&name, names),
+                            highlights: highlights(&name, &session.names),
+                            folder_highlights: folder_highlights(&folder, &session.folders),
                             name,
-                            folder: index.folder_path(id),
+                            folder,
                             size: index.size(id),
                             directory: flags & FLAG_DIRECTORY != 0,
                             modified: index.modified(id),
@@ -248,6 +255,7 @@ impl Server {
                         created: 0,
                         attributes: 0,
                         highlights: Vec::new(),
+                        folder_highlights: Vec::new(),
                     },
                 }
             })
@@ -284,7 +292,34 @@ impl Server {
 
 /// Matched byte ranges of `name`, sorted and without overlaps.
 fn highlights(name: &str, names: &[Matcher]) -> Vec<(u32, u32)> {
-    let mut ranges = names.iter().flat_map(|m| m.find(name)).collect::<Vec<_>>();
+    merge(names.iter().flat_map(|m| m.find(name)).collect())
+}
+
+/// Byte ranges of the folders in `path` that match the folder parts of the search.
+fn folder_highlights(path: &str, folders: &[Matcher]) -> Vec<(u32, u32)> {
+    if folders.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for part in path.split('\\') {
+        for m in folders {
+            // Wildcard patterns have to match the whole folder name
+            if m.matches(part.as_bytes()) {
+                ranges.extend(
+                    m.find(part)
+                        .into_iter()
+                        .map(|r| r.start + start..r.end + start),
+                );
+            }
+        }
+        start += part.len() + 1;
+    }
+    merge(ranges)
+}
+
+/// Sorted ranges without overlaps.
+fn merge(mut ranges: Vec<std::ops::Range<usize>>) -> Vec<(u32, u32)> {
     ranges.sort_by_key(|r| r.start);
     let mut merged: Vec<(u32, u32)> = Vec::new();
     for r in ranges {
@@ -315,6 +350,8 @@ struct Session {
     hits: Vec<Hit>,
     /// Name parts of the search, to highlight them in the rows
     names: Vec<Matcher>,
+    /// Folder parts of the search (`system32\`), to highlight them in the folder column
+    folders: Vec<Matcher>,
     /// Folder exclusions of the last query, when they were resolved, and the resulting bitsets
     /// per volume
     exclusions: Option<CachedExclusions>,

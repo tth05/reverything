@@ -179,7 +179,7 @@ impl Term {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Matcher {
     /// Lowercased ASCII needle, matched with ASCII case folding
     Ascii(Vec<u8>),
