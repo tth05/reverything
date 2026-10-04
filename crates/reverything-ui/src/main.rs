@@ -18,6 +18,7 @@ mod log;
 mod results;
 mod settings;
 mod shell;
+mod update;
 mod view;
 
 // Icons beyond the ones the components bundle

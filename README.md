@@ -132,6 +132,14 @@ service, the program, the saved index, the drive choice and the service log (`%P
 (`%APPDATA%\Reverything`), the UI log (`%LOCALAPPDATA%\Reverything`) and the autostart entry.
 `scripts\generate-icon.py` regenerates `assets\reverything.ico`.
 
+### Updates
+Installed builds ask `api.github.com` for the latest release at most once a day, while the window has the focus
+(Settings, "Check for a new version once a day", turns it off; development builds never check). A newer version is
+offered at the bottom left. Clicking it looks for the newest release again, downloads its installer, checks it
+against the `.sha256` file published with the release and runs it with `/SILENT /SUPPRESSMSGBOXES /NORESTART`.
+That shows one UAC prompt; the installer replaces the app and the service and starts the app again. The release
+workflow publishes the checksum file next to the installer.
+
 ## CI
 - `.github/workflows/ci.yml` checks formatting, runs clippy and the tests on every push.
 - `.github/workflows/release.yml` builds the installer with the `dist` profile when a tag like `v0.1.0` is pushed

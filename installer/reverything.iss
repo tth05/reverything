@@ -66,6 +66,8 @@ Filename: "{app}\{#ServiceExe}"; Parameters: "install"; Flags: runhidden waitunt
     StatusMsg: "Installing the index service..."
 Filename: "{app}\{#AppExe}"; Description: "Start {#AppName}"; \
     Flags: nowait postinstall skipifsilent runasoriginaluser
+; Silent installs are updates started by the app, which closed the app first
+Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: WizardSilent
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#AppExe}"; Flags: runhidden; RunOnceId: "StopApp"

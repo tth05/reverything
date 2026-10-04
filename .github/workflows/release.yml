@@ -38,15 +38,23 @@ jobs:
       - name: Build the installer
         shell: pwsh
         run: scripts/build-installer.ps1 -Profile dist
+      # The app's updater only runs an installer that matches this checksum
+      - name: Checksum
+        shell: pwsh
+        run: |
+          foreach ($file in Get-Item target/installer/*.exe) {
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower()
+            Set-Content "$($file.FullName).sha256" "$hash  $($file.Name)" -NoNewline
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: installer
-          path: target/installer/*.exe
+          path: target/installer/*
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" (Get-Item target/installer/*.exe).FullName `
+          gh release create "${{ github.ref_name }}" (Get-Item target/installer/*).FullName `
             --title "Reverything ${{ github.ref_name }}" --generate-notes

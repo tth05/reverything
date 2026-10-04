@@ -127,6 +127,10 @@ pub struct Settings {
     pub detailed_status: bool,
     /// Size and position of the window when it was last hidden or closed
     pub window: Option<WindowPlacement>,
+    /// Look for a new release once a day
+    pub check_updates: bool,
+    /// Unix time of the last check for a new release
+    pub last_update_check: u64,
 }
 
 impl Default for Settings {
@@ -139,6 +143,8 @@ impl Default for Settings {
             columns: Vec::new(),
             detailed_status: false,
             window: None,
+            check_updates: true,
+            last_update_check: 0,
         }
     }
 }

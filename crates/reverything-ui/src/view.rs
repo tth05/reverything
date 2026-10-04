@@ -27,6 +27,7 @@ use crate::format;
 use crate::results::Results;
 use crate::settings::{HotkeyChoice, Settings, ThemeChoice};
 use crate::shell;
+use crate::update;
 
 gpui_kit::actions!(
     reverything,
@@ -77,6 +78,17 @@ pub fn apply_theme(window: Option<&mut Window>, cx: &mut App) {
     Theme::global_mut(cx).focus_ring = false;
 }
 
+/// Progress of looking for and installing an update
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateState {
+    Idle,
+    Checking,
+    /// A check asked for by the user found nothing
+    UpToDate,
+    Installing,
+    Failed(String),
+}
+
 /// The app icon, shown in the title bar
 static APP_ICON: &[u8] = include_bytes!("../../../assets/reverything.png");
 
@@ -113,6 +125,10 @@ pub struct MainView {
     polling: bool,
     /// Changing the indexed drives failed
     drive_error: Option<String>,
+    /// A newer release, offered at the bottom left
+    update: Option<update::Update>,
+    /// What the update is doing, shown at the bottom left
+    update_state: UpdateState,
     started: Instant,
     first_frame: Option<Duration>,
     _subscriptions: Vec<Subscription>,
@@ -176,6 +192,8 @@ impl MainView {
             activated_at: Instant::now(),
             polling: false,
             drive_error: None,
+            update: None,
+            update_state: UpdateState::Idle,
             started,
             first_frame: None,
             _subscriptions: subscriptions,
@@ -395,7 +413,79 @@ impl MainView {
         if active {
             self.activated_at = Instant::now();
             self.poll_status(window, cx);
+            self.check_for_update(false, cx);
         }
+    }
+
+    /// Looks for a newer release, at most once a day unless `now`. Never in development builds
+    /// or when turned off.
+    pub fn check_for_update(&mut self, now: bool, cx: &mut Context<Self>) {
+        let settings = cx.global::<Settings>();
+        let due = update::now().saturating_sub(settings.last_update_check)
+            >= update::CHECK_INTERVAL.as_secs();
+        if !update::enabled() || matches!(self.update_state, UpdateState::Checking) {
+            return;
+        }
+        if !now && (!settings.check_updates || !due) {
+            return;
+        }
+        Settings::update(cx, |s| s.last_update_check = update::now());
+        self.update_state = UpdateState::Checking;
+        let task = cx.background_executor().spawn(async { update::check() });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |view, cx| {
+                view.update_state = match result {
+                    Ok(found) => {
+                        view.update = found;
+                        if view.update.is_none() && now {
+                            UpdateState::UpToDate
+                        } else {
+                            UpdateState::Idle
+                        }
+                    }
+                    Err(e) => {
+                        crate::log::write(&format!("Checking for updates failed: {}", e));
+                        if now {
+                            UpdateState::Failed(e)
+                        } else {
+                            UpdateState::Idle
+                        }
+                    }
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Looks for the newest release again, then downloads, verifies and runs its installer,
+    /// which updates the app and the service and starts the app again.
+    fn install_update(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.update_state, UpdateState::Installing) {
+            return;
+        }
+        self.update_state = UpdateState::Installing;
+        cx.notify();
+        let known = self.update.clone();
+        let task = cx.background_executor().spawn(async move {
+            let newest = update::check()?.or(known);
+            match newest {
+                Some(newest) => update::install(&newest),
+                None => Err("No update found".into()),
+            }
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |view, cx| {
+                if let Err(e) = result {
+                    crate::log::write(&format!("Updating failed: {}", e));
+                    view.update_state = UpdateState::Failed(e);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Fetches the service status every second while the window is active, and refreshes the
@@ -599,6 +689,16 @@ impl MainView {
             (None, Some(e)) => e.clone(),
             (None, None) => format!("{} objects", format::group_digits(results.total() as u64)),
         };
+        let update_notice = match (&self.update_state, &self.update) {
+            (UpdateState::Installing, _) => Some("Downloading the update...".to_string()),
+            (UpdateState::Failed(e), _) => Some(format!("Update failed: {}", e)),
+            (UpdateState::UpToDate, _) => Some("Reverything is up to date".to_string()),
+            (_, Some(update)) => Some(format!(
+                "Reverything {} is available, click to update",
+                update.version
+            )),
+            _ => None,
+        };
 
         h_flex()
             .px_3()
@@ -609,6 +709,20 @@ impl MainView {
             .text_sm()
             .text_color(cx.theme().muted_foreground)
             .child(div().flex_1().truncate().child(left))
+            .children(update_notice.map(|notice| {
+                let clickable =
+                    self.update.is_some() && !matches!(self.update_state, UpdateState::Installing);
+                div()
+                    .id("update-notice")
+                    .flex_shrink_0()
+                    .text_color(cx.theme().primary)
+                    .when(clickable, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.underline())
+                            .on_click(cx.listener(|view, _, _, cx| view.install_update(cx)))
+                    })
+                    .child(notice)
+            }))
             .child(self.render_health(window, cx))
     }
 
@@ -1199,6 +1313,26 @@ fn settings_panel(cx: &App) -> impl IntoElement {
                         .and_then(|d| d.hotkey_error.clone())
                         .map(|e| div().text_xs().text_color(theme.danger).child(e)),
                 ),
+        )
+        .child(
+            v_flex()
+                .gap_3()
+                .child(heading("Updates"))
+                .child(
+                    Switch::new("check-updates")
+                        .checked(settings.check_updates)
+                        .label("Check for a new version once a day")
+                        .on_click(|checked, _, cx| {
+                            let checked = *checked;
+                            Settings::update(cx, |s| s.check_updates = checked)
+                        }),
+                )
+                .child(hint(if crate::update::enabled() {
+                    "Asks GitHub for the latest release, nothing else is sent. A new version is \
+                     offered at the bottom left."
+                } else {
+                    "Development build: updates are turned off."
+                })),
         )
         .child(
             v_flex()
