@@ -104,7 +104,6 @@ Both processes do almost nothing while the window is not focused:
 | Alt+Enter | Properties |
 | Ctrl+F, Ctrl+L | Focus the search box |
 | Ctrl+, | Settings |
-| F1 | About: version, license, log folder, check for updates |
 | Alt+F | Show or hide files in the results |
 | Alt+D | Show or hide folders in the results |
 | Escape | Hide to the tray |

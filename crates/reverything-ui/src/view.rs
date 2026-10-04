@@ -61,7 +61,6 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-f", FocusSearch, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-l", FocusSearch, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-,", OpenSettings, Some(KEY_CONTEXT)),
-        KeyBinding::new("f1", OpenAbout, Some(KEY_CONTEXT)),
         KeyBinding::new("alt-f", ToggleFiles, Some(KEY_CONTEXT)),
         KeyBinding::new("alt-d", ToggleFolders, Some(KEY_CONTEXT)),
         KeyBinding::new("escape", HideWindow, Some(KEY_CONTEXT)),
@@ -607,7 +606,7 @@ impl MainView {
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Info)
-                                .tooltip("About (F1)")
+                                .tooltip("About")
                                 .on_click(cx.listener(|view, _, window, cx| {
                                     view.on_open_about(&OpenAbout, window, cx)
                                 })),
