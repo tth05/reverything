@@ -46,6 +46,15 @@ jobs:
             $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower()
             Set-Content "$($file.FullName).sha256" "$hash  $($file.Name)" -NoNewline
           }
+      # winget and Scoop manifests with the installer's URL and checksum, see the README
+      - name: Package manager manifests
+        shell: pwsh
+        run: |
+          $installer = Get-Item target/installer/*.exe
+          $version = $installer.BaseName -replace '^reverything-setup-', ''
+          scripts/update-manifests.ps1 -Version $version -Installer $installer.FullName
+          Compress-Archive packaging/winget/manifests "target/installer/winget-manifests-$version.zip"
+          Copy-Item bucket/reverything.json target/installer/scoop-reverything.json
       - uses: actions/upload-artifact@v4
         with:
           name: installer

@@ -189,6 +189,18 @@ against the `.sha256` file published with the release and runs it with `/SILENT 
 That shows one UAC prompt; the installer replaces the app and the service and starts the app again. The release
 workflow publishes the checksum file next to the installer.
 
+### Package managers
+`scripts\update-manifests.ps1 -Version x.y.z` writes the manifests for a published release (the release workflow
+also attaches them to the release):
+
+- **Scoop:** `bucket\reverything.json`. This repository is a Scoop bucket once that file is committed:
+  `scoop bucket add reverything https://github.com/tth05/reverything` and `scoop install reverything`. Scoop runs
+  the normal installer (one UAC prompt), because the service has to be registered.
+- **winget:** `packaging\winget\manifests\t\tth05\Reverything\x.y.z\`, in the layout of
+  [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs). Check it with `winget validate --manifest
+  <that folder>`, then submit it with `wingetcreate submit <that folder>` or a pull request to winget-pkgs. After it
+  is merged, `winget install tth05.Reverything` works.
+
 ### CI
 - `.github/workflows/ci.yml` checks formatting, runs clippy and the tests on every push.
 - `.github/workflows/release.yml` builds the installer with the `dist` profile when a tag like `v0.1.0` is pushed
