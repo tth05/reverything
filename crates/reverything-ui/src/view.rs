@@ -1576,11 +1576,27 @@ impl Render for MainView {
                     this.child(self.render_no_drives(cx))
                 } else {
                     this.child(
-                        div().flex_1().overflow_hidden().child(
-                            DataTable::new(&self.table)
-                                .stripe(true)
-                                .with_size(crate::results::ROW_SIZE),
-                        ),
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            // The table opens its row menu for any right click inside it, for the
+                            // last right clicked row. Forget that row before a right click
+                            // reaches the table, a row sets it again, the header and empty space
+                            // do not.
+                            .capture_any_mouse_down(cx.listener(
+                                |view, event: &MouseDownEvent, _, cx| {
+                                    if event.button == MouseButton::Right {
+                                        view.table.update(cx, |table, cx| {
+                                            table.set_right_clicked_row(None, cx)
+                                        });
+                                    }
+                                },
+                            ))
+                            .child(
+                                DataTable::new(&self.table)
+                                    .stripe(true)
+                                    .with_size(crate::results::ROW_SIZE),
+                            ),
                     )
                 }
             })
