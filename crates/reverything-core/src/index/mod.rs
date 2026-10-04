@@ -6,6 +6,7 @@
 
 pub mod build;
 pub mod exclude;
+pub mod filter;
 pub mod persist;
 pub mod rank;
 pub mod search;

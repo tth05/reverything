@@ -9,12 +9,15 @@
 //! - `!term` leaves out entries matching `term`.
 //! - `!term\` leaves out the directories matching `term` and everything below them.
 //! - `!C:\some\folder` leaves out that exact folder and everything below it.
+//! - `size:`, `dm:` and `dc:` filter by size, modification and creation date, see
+//!   [`crate::index::filter`].
 //! - A name or folder with `*` (any characters) or `?` (one character) has to match as a whole,
 //!   e.g. `*.mp3` or `report-??.pdf`. Without them it matches anywhere in the name.
 
 use memchr::{memchr2_iter, memchr_iter};
 use rayon::prelude::*;
 
+use crate::index::filter::{Field, Filter};
 use crate::index::{VolumeIndex, FLAG_DIRECTORY, FLAG_IN_USE};
 use crate::ntfs::ROOT_RECORD;
 
@@ -28,6 +31,8 @@ pub struct Query {
     pub exclude: Vec<Term>,
     /// Folders whose whole subtree is left out
     pub folders: Vec<FolderExclusion>,
+    /// Size and date conditions
+    pub filters: Vec<Filter>,
     /// Leave out files
     pub skip_files: bool,
     /// Leave out directories
@@ -58,6 +63,11 @@ impl Query {
     pub fn parse(text: &str) -> Self {
         let mut query = Query::default();
         for token in tokenize(text) {
+            let negate = token.starts_with('!');
+            if let Some(filter) = Filter::parse(token.trim_start_matches('!'), negate) {
+                query.filters.push(filter);
+                continue;
+            }
             let Some(negated) = token.strip_prefix('!') else {
                 query.include.push(Term::parse(&token));
                 continue;
@@ -87,6 +97,7 @@ impl Query {
         self.include.iter().all(Term::is_match_all)
             && self.exclude.is_empty()
             && self.folders.is_empty()
+            && self.filters.is_empty()
             && !self.skip_files
             && !self.skip_folders
     }
@@ -421,6 +432,13 @@ impl VolumeIndex {
             .copied()
             .filter(|&id| {
                 skip_kind.is_none_or(|skip| self.flags(id) & FLAG_DIRECTORY != skip)
+                    && query.filters.iter().all(|f| {
+                        f.matches(match f.field {
+                            Field::Size => self.size(id),
+                            Field::Modified => self.modified(id) as u64,
+                            Field::Created => self.created(id) as u64,
+                        })
+                    })
                     && excluded.is_none_or(|set| !bit(set, self.parent(id)) && !bit(set, id))
                     && include.iter().all(|t| t.matches(self, id))
                     && !exclude.iter().any(|t| t.matches(self, id))
@@ -556,6 +574,16 @@ mod tests {
         let t = Term::parse("c:");
         assert!(t.volume.is_none());
         assert!(t.name.is_some());
+    }
+
+    #[test]
+    fn parse_filters() {
+        let q = Query::parse("report size:>1mb !dm:today dm:");
+        assert_eq!(q.filters.len(), 2);
+        assert!(q.filters[1].negate);
+        // Not a valid filter, so a normal term
+        assert_eq!(q.include.len(), 2);
+        assert!(!q.is_match_all());
     }
 
     #[test]
