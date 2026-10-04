@@ -76,8 +76,12 @@ pub fn apply_theme(window: Option<&mut Window>, cx: &mut App) {
         ThemeChoice::Light => Theme::change(ThemeMode::Light, window, cx),
         ThemeChoice::Dark => Theme::change(ThemeMode::Dark, window, cx),
     }
+    let theme = Theme::global_mut(cx);
     // Focused inputs only get a colored border instead of an extra ring around them
-    Theme::global_mut(cx).focus_ring = false;
+    theme.focus_ring = false;
+    // The dark theme's table header text is barely readable, use the muted text color like the
+    // light theme does
+    theme.table_head_foreground = theme.muted_foreground;
 }
 
 /// Progress of looking for and installing an update
