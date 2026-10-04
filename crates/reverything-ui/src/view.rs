@@ -318,8 +318,13 @@ impl MainView {
         .detach();
     }
 
+    /// Focuses the search box with its text selected, so typing replaces the last search. Also
+    /// used when the window is shown again.
     fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
-        self.input.update(cx, |input, cx| input.focus(window, cx));
+        self.input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
     }
 
     fn on_hide(&mut self, _: &HideWindow, window: &mut Window, cx: &mut Context<Self>) {
