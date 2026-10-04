@@ -81,14 +81,28 @@ fn main() {
     });
 }
 
+/// Where the window was last time, if that is still on a connected display.
+fn saved_bounds(cx: &App) -> Option<(Bounds<Pixels>, bool)> {
+    let p = cx.global::<settings::Settings>().window?;
+    let bounds = Bounds::new(
+        point(px(p.x), px(p.y)),
+        size(px(p.width.max(640.)), px(p.height.max(360.))),
+    );
+    cx.displays()
+        .iter()
+        .any(|display| display.bounds().intersects(&bounds))
+        .then_some((bounds, p.maximized))
+}
+
 /// Opens the search window, shown and focused.
 fn open_main_window(started: Instant, cx: &mut App) -> AnyWindowHandle {
+    let (bounds, maximized) = saved_bounds(cx)
+        .unwrap_or_else(|| (Bounds::centered(None, size(px(1280.), px(780.)), cx), false));
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            size(px(1280.), px(780.)),
-            cx,
-        ))),
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        // Shown below, after moving it to the monitor with the mouse
+        show: false,
+        focus: false,
         // The window draws its own title bar, see `view::MainView::render_title_bar`
         titlebar: Some(TitlebarOptions {
             title: Some("Reverything".into()),
@@ -117,6 +131,7 @@ fn open_main_window(started: Instant, cx: &mut App) -> AnyWindowHandle {
                 desktop::hide(window, cx);
                 false
             } else {
+                desktop::remember_bounds(window, cx);
                 cx.quit();
                 true
             }
@@ -124,6 +139,7 @@ fn open_main_window(started: Instant, cx: &mut App) -> AnyWindowHandle {
         view
     })
     .expect("Failed to open the window");
+    let _ = window.update(cx, |_, window, cx| desktop::present(window, cx, maximized));
     window
 }
 

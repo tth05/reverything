@@ -16,16 +16,23 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND};
+use windows::Win32::Foundation::{POINT, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+};
 use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
 use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, GetCurrentProcess, OpenEventW, SetEvent, WaitForSingleObject,
     EVENT_MODIFY_STATE, INFINITE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_HIDE, SW_RESTORE, SW_SHOW,
+    GetCursorPos, GetWindowPlacement, IsIconic, IsWindowVisible, SetForegroundWindow,
+    SetWindowPlacement, ShowWindow, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWMAXIMIZED,
+    WINDOWPLACEMENT,
 };
 
-use crate::settings::{HotkeyChoice, Settings};
+use crate::settings::{HotkeyChoice, Settings, WindowPlacement};
 use crate::view::{FocusSearch, OpenSettings};
 
 /// A window hidden in the tray for this long is closed, and opened again when needed
@@ -245,6 +252,9 @@ impl Desktop {
 
     fn handle(event: Event, cx: &mut App) {
         if let Event::Quit = event {
+            if let Some(window) = cx.global::<Desktop>().window {
+                let _ = window.update(cx, |_, window, cx| remember_bounds(window, cx));
+            }
             cx.quit();
             return;
         }
@@ -304,6 +314,61 @@ impl Desktop {
     }
 }
 
+/// Centers the window on the monitor with the mouse, unless it is already on it. Keeps its
+/// size and maximized state.
+fn move_to_cursor_monitor(hwnd: HWND) {
+    unsafe {
+        let mut cursor = POINT::default();
+        if GetCursorPos(&mut cursor).is_err() {
+            return;
+        }
+        let target = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        if target == MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) {
+            return;
+        }
+        let primary = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
+        let (Some(to), Some(primary)) = (monitor_info(target), monitor_info(primary)) else {
+            return;
+        };
+        let mut placement = WINDOWPLACEMENT {
+            length: size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        if GetWindowPlacement(hwnd, &mut placement).is_err() {
+            return;
+        }
+        // The placement is in workspace coordinates, which are offset from screen coordinates
+        // by a taskbar on the left or top of the primary monitor
+        let dx = primary.rcWork.left - primary.rcMonitor.left;
+        let dy = primary.rcWork.top - primary.rcMonitor.top;
+        let r = placement.rcNormalPosition;
+        let work = to.rcWork;
+        let width = (r.right - r.left).min(work.right - work.left);
+        let height = (r.bottom - r.top).min(work.bottom - work.top);
+        let left = work.left + (work.right - work.left - width) / 2 - dx;
+        let top = work.top + (work.bottom - work.top - height) / 2 - dy;
+        placement.rcNormalPosition = RECT {
+            left,
+            top,
+            right: left + width,
+            bottom: top + height,
+        };
+        let _ = SetWindowPlacement(hwnd, &placement);
+    }
+}
+
+fn monitor_info(monitor: HMONITOR) -> Option<MONITORINFO> {
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        GetMonitorInfoW(monitor, &mut info)
+            .as_bool()
+            .then_some(info)
+    }
+}
+
 pub fn hwnd(window: &Window) -> Option<HWND> {
     match HasWindowHandle::window_handle(window).ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(HWND(handle.hwnd.get() as *mut _)),
@@ -315,8 +380,27 @@ fn is_visible(window: &Window) -> bool {
     hwnd(window).is_some_and(|h| unsafe { IsWindowVisible(h).as_bool() })
 }
 
+/// Saves the window's size and position, to open it there the next time.
+pub fn remember_bounds(window: &Window, cx: &mut App) {
+    let (bounds, maximized) = match window.window_bounds() {
+        WindowBounds::Windowed(bounds) => (bounds, false),
+        WindowBounds::Maximized(bounds) | WindowBounds::Fullscreen(bounds) => (bounds, true),
+    };
+    let placement = WindowPlacement {
+        x: bounds.origin.x.into(),
+        y: bounds.origin.y.into(),
+        width: bounds.size.width.into(),
+        height: bounds.size.height.into(),
+        maximized,
+    };
+    if cx.global::<Settings>().window != Some(placement) {
+        Settings::update(cx, |s| s.window = Some(placement));
+    }
+}
+
 /// Hides the window to the tray. If it stays hidden for [`CLOSE_HIDDEN_AFTER`] it is closed.
 pub fn hide(window: &Window, cx: &mut App) {
+    remember_bounds(window, cx);
     if let Some(h) = hwnd(window) {
         unsafe {
             let _ = ShowWindow(h, SW_HIDE);
@@ -331,16 +415,25 @@ pub fn hide(window: &Window, cx: &mut App) {
     }
 }
 
-/// Shows, restores and focuses the window, with the search box focused.
+/// Shows, restores and focuses the window, with the search box focused. It moves to the
+/// monitor with the mouse first.
 pub fn show_window(window: &mut Window, cx: &mut App) {
+    present(window, cx, false);
+}
+
+/// [`show_window`], maximized if `maximize`.
+pub fn present(window: &mut Window, cx: &mut App, maximize: bool) {
     if cx.has_global::<Desktop>() {
         cx.global_mut::<Desktop>().close_hidden = None;
     }
     if let Some(h) = hwnd(window) {
+        move_to_cursor_monitor(h);
         unsafe {
             let _ = ShowWindow(
                 h,
-                if IsIconic(h).as_bool() {
+                if maximize {
+                    SW_SHOWMAXIMIZED
+                } else if IsIconic(h).as_bool() {
                     SW_RESTORE
                 } else {
                     SW_SHOW

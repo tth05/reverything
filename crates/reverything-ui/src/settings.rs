@@ -93,6 +93,16 @@ impl HotkeyChoice {
     }
 }
 
+/// Where the window was, in logical pixels, to open it there again.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowPlacement {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub maximized: bool,
+}
+
 /// A visible column of the result table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnSetting {
@@ -115,6 +125,8 @@ pub struct Settings {
     pub columns: Vec<ColumnSetting>,
     /// The status popup shows every timing instead of a short summary
     pub detailed_status: bool,
+    /// Size and position of the window when it was last hidden or closed
+    pub window: Option<WindowPlacement>,
 }
 
 impl Default for Settings {
@@ -126,6 +138,7 @@ impl Default for Settings {
             start_with_windows: false,
             columns: Vec::new(),
             detailed_status: false,
+            window: None,
         }
     }
 }
