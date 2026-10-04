@@ -6114,7 +6114,7 @@ dependencies = [
 
 [[package]]
 name = "reverything-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "eyre",
@@ -6126,7 +6126,7 @@ dependencies = [
 
 [[package]]
 name = "reverything-protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "postcard",
  "serde",
@@ -6134,7 +6134,7 @@ dependencies = [
 
 [[package]]
 name = "reverything-service"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "embed-resource",
  "eyre",
@@ -6152,7 +6152,7 @@ dependencies = [
 
 [[package]]
 name = "reverything-ui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-channel",
  "embed-resource",
