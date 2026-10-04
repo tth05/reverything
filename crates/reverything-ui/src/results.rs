@@ -480,7 +480,7 @@ impl TableDelegate for Results {
                 .into_any_element();
         }
 
-        let (name, directory) = (row.name.clone(), row.directory);
+        let (name, directory, matched) = (row.name.clone(), row.directory, row.highlights.clone());
         let icon = match self.icons.get(&name, directory) {
             Some(image) => img(image).size_4().flex_shrink_0().into_any_element(),
             None => Icon::new(if directory {
@@ -492,6 +492,20 @@ impl TableDelegate for Results {
             .text_color(cx.theme().muted_foreground)
             .into_any_element(),
         };
+        // The parts of the name that matched the search in bold
+        let bold = HighlightStyle {
+            font_weight: Some(FontWeight::BOLD),
+            ..Default::default()
+        };
+        let highlights = matched
+            .iter()
+            .map(|&(start, end)| (start as usize..end as usize, bold))
+            .filter(|(r, _)| {
+                r.end <= text.len()
+                    && text.is_char_boundary(r.start)
+                    && text.is_char_boundary(r.end)
+            })
+            .collect::<Vec<_>>();
         h_flex()
             .gap_1p5()
             .overflow_hidden()
@@ -501,7 +515,7 @@ impl TableDelegate for Results {
                     .text_xs()
                     .line_height(CELL_LINE_HEIGHT)
                     .truncate()
-                    .child(text),
+                    .child(StyledText::new(text).with_highlights(highlights)),
             )
             .into_any_element()
     }

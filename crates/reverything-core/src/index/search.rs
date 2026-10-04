@@ -215,6 +215,69 @@ impl Matcher {
     }
 }
 
+impl Matcher {
+    /// Byte ranges of `name` that the matcher matched, for highlighting. Only for display, so it
+    /// may be approximate for unusual names.
+    pub fn find(&self, name: &str) -> Vec<std::ops::Range<usize>> {
+        match self {
+            Matcher::Ascii(needle) => find_ci(name, std::str::from_utf8(needle).unwrap_or(""), 0)
+                .into_iter()
+                .collect(),
+            Matcher::Unicode(needle) => find_ci(name, needle, 0).into_iter().collect(),
+            Matcher::Suffix(suffix) => {
+                let start = name.len().saturating_sub(suffix.len());
+                if name.is_char_boundary(start)
+                    && name[start..].eq_ignore_ascii_case(std::str::from_utf8(suffix).unwrap_or(""))
+                    && !suffix.is_empty()
+                {
+                    std::iter::once(start..name.len()).collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            // The literal parts between the wildcards, in order
+            Matcher::Glob(pattern) => {
+                let mut ranges = Vec::new();
+                let mut from = 0;
+                for part in pattern.split(['*', '?']).filter(|p| !p.is_empty()) {
+                    match find_ci(name, part, from) {
+                        Some(range) => {
+                            from = range.end;
+                            ranges.push(range);
+                        }
+                        None => break,
+                    }
+                }
+                ranges
+            }
+        }
+    }
+}
+
+/// First case-insensitive occurrence of `needle` (lowercase) in `hay` at or after byte `from`.
+fn find_ci(hay: &str, needle: &str, from: usize) -> Option<std::ops::Range<usize>> {
+    if needle.is_empty() {
+        return None;
+    }
+    let lower = |c: char| c.to_lowercase();
+    hay.char_indices()
+        .filter(|&(i, _)| i >= from)
+        .find_map(|(start, _)| {
+            let mut hay_chars = hay[start..].char_indices().flat_map(|(i, c)| {
+                let end = start + i + c.len_utf8();
+                lower(c).map(move |l| (l, end))
+            });
+            let mut end = start;
+            for n in needle.chars() {
+                match hay_chars.next() {
+                    Some((l, e)) if l == n => end = e,
+                    _ => return None,
+                }
+            }
+            Some(start..end)
+        })
+}
+
 /// Whether the whole `hay` matches `pattern` (lowercase) with `*` and `?`, ignoring case.
 fn glob_matches(pattern: &str, hay: &[u8]) -> bool {
     if pattern.is_ascii() && hay.is_ascii() {
@@ -466,6 +529,16 @@ mod tests {
         assert!(m("song", "my song.mp3"));
         assert!(Term::parse("*").is_match_all());
         assert!(Term::parse(r"system32\*").name.is_none());
+    }
+
+    #[test]
+    fn find_ranges() {
+        let f = |pattern: &str, name: &str| Matcher::new(pattern).find(name);
+        assert_eq!(f("pad", "Notepad.exe"), vec![4..7]);
+        assert_eq!(f("*.EXE", "Notepad.exe"), vec![7..11]);
+        assert_eq!(f("note*.e?e", "Notepad.exe"), vec![0..4, 7..9, 10..11]);
+        assert_eq!(f("ärger", "Großer ÄRGER"), vec![8..14]);
+        assert!(f("xyz", "Notepad.exe").is_empty());
     }
 
     #[test]

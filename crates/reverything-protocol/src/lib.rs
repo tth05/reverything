@@ -132,6 +132,8 @@ pub struct Row {
     pub created: u32,
     /// FILE_ATTRIBUTE_* flags
     pub attributes: u32,
+    /// Byte ranges of `name` that matched the search, for highlighting
+    pub highlights: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
