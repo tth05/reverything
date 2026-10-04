@@ -196,8 +196,21 @@ That shows one UAC prompt; the installer replaces the app and the service and st
 workflow publishes the checksum file next to the installer.
 
 ### Package managers
-`scripts\update-manifests.ps1 -Version x.y.z` writes the manifests for a published release (the release workflow
-also attaches them to the release):
+The release workflow publishes new versions to both after creating the GitHub release:
+
+- **Scoop:** it commits the updated `bucket\reverything.json` to master. Nothing to set up.
+- **winget:** [winget-releaser](https://github.com/vedantmgoyal9/winget-releaser) opens the pull request to
+  microsoft/winget-pkgs, based on the previous version there. Pull requests to that repository come from a fork,
+  and the workflow's own token can not write outside this repository, so it needs, once:
+  1. the first version submitted by hand (below), since the action only updates existing packages,
+  2. a fork of [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) in your account,
+  3. a classic personal access token with the `public_repo` and `workflow` scopes, saved as the repository secret
+     `WINGET_TOKEN`. Without it the step is skipped.
+
+  Microsoft's pipeline then installs and scans the package and a moderator merges it, usually within a few days.
+
+`scripts\update-manifests.ps1 -Version x.y.z` writes the manifests by hand (the release workflow also attaches them
+to the release):
 
 - **Scoop:** `bucket\reverything.json`. This repository is a Scoop bucket once that file is committed:
   `scoop bucket add reverything https://github.com/tth05/reverything` and `scoop install reverything`. Scoop runs

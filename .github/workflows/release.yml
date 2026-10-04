@@ -2,6 +2,11 @@ name: Release
 
 # Push a tag matching the version in Cargo.toml, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
 # Without a tag (manual run) the installer is only uploaded as a build artifact.
+#
+# After publishing the release, this also updates the Scoop bucket (bucket/reverything.json on
+# master) and, once the WINGET_TOKEN secret exists, opens the pull request for winget. Both run
+# here and not in workflows started by the release: releases created with the workflow's token
+# do not start other workflows.
 on:
   push:
     tags: ['v*']
@@ -13,6 +18,9 @@ permissions:
 jobs:
   installer:
     runs-on: windows-2022
+    env:
+      # Whether the winget step can run, without exposing the token to every step
+      HAS_WINGET_TOKEN: ${{ secrets.WINGET_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -71,3 +79,31 @@ jobs:
         run: |
           gh release create "${{ github.ref_name }}" (Get-Item target/installer/*).FullName `
             --title "Reverything ${{ github.ref_name }}" --generate-notes
+      # Scoop users get the new version from this repository, which is their bucket
+      - name: Update the Scoop bucket
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          # The manifests step left generated files behind, master may track them
+          Remove-Item -Recurse -Force bucket, packaging -ErrorAction SilentlyContinue
+          git fetch --depth 1 origin master
+          git checkout -B master origin/master
+          New-Item -ItemType Directory -Force bucket | Out-Null
+          Copy-Item target/installer/scoop-reverything.json bucket/reverything.json
+          git add bucket/reverything.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) { Write-Host 'Scoop manifest unchanged'; exit 0 }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Update the Scoop manifest to ${{ github.ref_name }}"
+          git push origin master
+      # Opens a pull request to microsoft/winget-pkgs from the fork of the WINGET_TOKEN owner,
+      # based on the previous version there (the first version is submitted by hand)
+      - name: Publish to winget
+        if: startsWith(github.ref, 'refs/tags/') && env.HAS_WINGET_TOKEN == 'true'
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: tth05.Reverything
+          installers-regex: 'reverything-setup-.*\.exe$'
+          release-tag: ${{ github.ref_name }}
+          token: ${{ secrets.WINGET_TOKEN }}
