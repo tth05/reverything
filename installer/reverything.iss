@@ -50,6 +50,7 @@ Name: desktopicon; Description: "Create a desktop shortcut"; Flags: unchecked
 Source: "{#BinDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinDir}\{#ServiceExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "{#BinDir}\THIRD-PARTY-NOTICES.html"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

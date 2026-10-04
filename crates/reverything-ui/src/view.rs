@@ -1284,12 +1284,18 @@ fn about_panel(view: WeakEntity<MainView>, cx: &App) -> impl IntoElement {
         _ => None,
     };
     // The license file next to the installed exe, the repository otherwise
-    let license = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("LICENSE.txt")))
-        .filter(|path| path.exists())
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| format!("{}/blob/master/LICENSE", REPOSITORY));
+    // Files next to the installed exe
+    let shipped = |name: &str| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
+            .filter(|path| path.exists())
+            .map(|path| path.display().to_string())
+    };
+    let license =
+        shipped("LICENSE.txt").unwrap_or_else(|| format!("{}/blob/master/LICENSE", REPOSITORY));
+    // Generated when the installer is built
+    let notices = shipped("THIRD-PARTY-NOTICES.html");
     let logs = std::env::var_os("LOCALAPPDATA")
         .map(|dir| std::path::PathBuf::from(dir).join("Reverything"));
 
@@ -1335,6 +1341,17 @@ fn about_panel(view: WeakEntity<MainView>, cx: &App) -> impl IntoElement {
                         .small()
                         .label("License")
                         .on_click(move |_, _, _| shell::open(&license)),
+                )
+                .child(
+                    Button::new("about-notices")
+                        .small()
+                        .label("Third-party licenses")
+                        .disabled(notices.is_none())
+                        .on_click(move |_, _, _| {
+                            if let Some(notices) = &notices {
+                                shell::open(notices);
+                            }
+                        }),
                 )
                 .child(
                     Button::new("about-logs")

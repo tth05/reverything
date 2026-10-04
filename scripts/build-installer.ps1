@@ -1,5 +1,6 @@
 # Builds the binaries and the installer (target\installer\reverything-setup-<version>.exe).
-# Needs Inno Setup 6 and the Windows SDK (for fxc.exe, the shader compiler GPUI uses).
+# Needs Inno Setup 6, the Windows SDK (for fxc.exe, the shader compiler GPUI uses) and
+# cargo-about for the third-party licenses (cargo install cargo-about --locked --features cli).
 #
 #   scripts\build-installer.ps1                  release profile, quick to build
 #   scripts\build-installer.ps1 -Profile dist    fat LTO, what CI ships
@@ -28,6 +29,17 @@ try {
     Pop-Location
 }
 
+# The licenses of the libraries in the binaries, shipped next to them and shown in About
+$binDir = Join-Path $repo "target\$Profile"
+$notices = Join-Path $binDir 'THIRD-PARTY-NOTICES.html'
+Push-Location $repo
+try {
+    cargo about generate about.hbs -o $notices
+    if ($LASTEXITCODE -ne 0) { throw 'cargo about failed (cargo install cargo-about --locked --features cli)' }
+} finally {
+    Pop-Location
+}
+
 $iscc = @(
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
     "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
@@ -35,7 +47,6 @@ $iscc = @(
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $iscc) { throw 'Inno Setup 6 not found (https://jrsoftware.org/isinfo.php, or: winget install JRSoftware.InnoSetup)' }
 
-$binDir = Join-Path $repo "target\$Profile"
 & $iscc "/DAppVersion=$version" "/DBinDir=$binDir" (Join-Path $repo 'installer\reverything.iss')
 if ($LASTEXITCODE -ne 0) { throw 'ISCC failed' }
 Get-Item (Join-Path $repo "target\installer\reverything-setup-$version.exe")

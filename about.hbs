@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Reverything: third-party licenses</title>
+<style>
+  body { font-family: "Segoe UI", system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.5rem; }
+  h2 { font-size: 1.1rem; margin-top: 2.5rem; }
+  ul.crates { columns: 3; font-size: 0.85rem; padding-left: 1.2rem; }
+  pre { white-space: pre-wrap; background: #f5f5f5; padding: 1rem; font-size: 0.8rem; border-radius: 4px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1e1e1e; color: #ddd; }
+    pre { background: #2a2a2a; }
+    a { color: #8ab4f8; }
+  }
+</style>
+</head>
+<body>
+<h1>Third-party licenses</h1>
+<p>Reverything uses the following open source libraries. Their licenses are listed below, each with
+the libraries it applies to.</p>
+<ul>
+{{#each overview}}
+  <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+{{/each}}
+</ul>
+{{#each licenses}}
+<h2 id="{{id}}">{{name}}</h2>
+<p>Used by:</p>
+<ul class="crates">
+{{#each used_by}}
+  <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+{{/each}}
+</ul>
+<pre>{{text}}</pre>
+{{/each}}
+</body>
+</html>

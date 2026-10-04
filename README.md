@@ -180,6 +180,10 @@ service, the program, the saved index, the drive choice and the service log (`%P
 (`%APPDATA%\Reverything`), the UI log (`%LOCALAPPDATA%\Reverything`) and the autostart entry.
 `scripts\generate-icon.py` regenerates `assets\reverything.ico`.
 
+The build also generates `THIRD-PARTY-NOTICES.html`, the licenses of all libraries in the binaries, with
+[cargo-about](https://github.com/EmbarkStudios/cargo-about) (`cargo install cargo-about --locked --features cli`;
+`about.toml` lists the accepted licenses, `about.hbs` is the template). The installer ships it and About opens it.
+
 #### Updates
 Installed builds ask `api.github.com` for the latest release at most once a day, while the window has the focus
 (Settings, "Check for a new version once a day", turns it off; development builds never check). Installs by winget

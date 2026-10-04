@@ -28,6 +28,10 @@ jobs:
           if ("v$version" -ne "${{ github.ref_name }}") {
             throw "Tag ${{ github.ref_name }} does not match the version $version in Cargo.toml"
           }
+      # Generates the third-party licenses shipped with the app
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
       - name: Install Inno Setup
         shell: pwsh
         run: |
