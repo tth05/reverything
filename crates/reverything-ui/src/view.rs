@@ -1501,8 +1501,10 @@ fn settings_panel(cx: &App) -> impl IntoElement {
                 .gap_3()
                 .child(heading("Updates"))
                 .child(
+                    // winget and Scoop installs never check, the package manager updates them
                     Switch::new("check-updates")
-                        .checked(settings.check_updates)
+                        .checked(settings.check_updates && update::managed_by().is_none())
+                        .disabled(update::managed_by().is_some())
                         .label("Check for a new version once a day")
                         .on_click(|checked, _, cx| {
                             let checked = *checked;
