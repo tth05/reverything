@@ -23,7 +23,7 @@ administrators. So the installer (which asks for administrator rights once) sets
 itself runs as you, without special rights. The service only reads file names, sizes and dates, never file
 contents, and never changes anything on your drives.
 
-On a fresh install it indexes the drive Windows is on; other drives are turned on in the settings. Uninstalling
+No drive is indexed until you turn it on in the settings, the app shows how. Uninstalling
 from "Apps & features" removes the service, the index, the settings and the logs.
 
 ### Limitations and things to know
@@ -60,12 +60,12 @@ scripts/                 icon generator, installer build, benchmark task
 ```
 
 - **Service** (`reverything-service.exe`): runs as LocalSystem, because reading raw volumes needs it. For every
-  volume turned on in the settings (the Windows drive on a fresh install, the choice is saved in
+  volume turned on in the settings (none by default, the choice is saved in
   `%ProgramData%\Reverything\config.json`) it loads the saved index from `%ProgramData%\Reverything` (or scans the
   MFT if there is none), follows the journal and answers requests on `\\.\pipe\reverything`. Turning a volume off
   drops its index and deletes the saved one. The pipe and the data directory are restricted to SYSTEM,
-  administrators and interactively logged on users, because they expose every file name. Clients are treated as untrusted: message
-  sizes are capped and the service never opens or changes files for them.
+  administrators and interactively logged on users, because they expose every file name. Clients are treated as
+  untrusted: message sizes are capped and the service never opens or changes files for them.
 - **Window** (`reverything.exe`): asks the service for the number of results and only fetches the rows around the
   visible area. Opening files, the context menu, file icons, the tray icon and the global shortcut all run in this
   process, as the user. It stays in the tray when closed, so showing it again is instant.
@@ -214,9 +214,8 @@ also attaches them to the release):
 1. Build the installer: `scripts\build-installer.ps1`.
 2. Run `target\installer\reverything-setup-<version>.exe`, confirm the UAC prompt, keep "Start Reverything when I log
    on" checked and let it start Reverything at the end.
-3. On a fresh install the Windows drive (usually C:) is indexed right away; other drives are turned on in the
-   settings. With every drive turned off, the window says so and links to the settings. The status icon in the
-   bottom right shows a spinner while the MFT is scanned (a few seconds), then "Up to date". Hover
+3. No drive is indexed yet: the window says so. "Open settings", turn on the drives and close the settings. The
+   status icon in the bottom right shows a spinner while the MFT is scanned (a few seconds), then "Up to date". Hover
    it for the summary, turn on "Details": the per volume sections show the full scan with its timings and "Saved
    index: None at start, saved now". Make the window small: the popup scrolls instead of being cut off.
 4. Search: `notepad`, `windows\system32\`, `notepad !winsxs\`, sort by clicking column headers, scroll through an empty

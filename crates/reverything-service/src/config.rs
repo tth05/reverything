@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Drive letters of the indexed volumes. On the first run the Windows drive, so the app
-    /// is not empty; the user picks them in the settings.
+    /// Drive letters of the indexed volumes. None by default, the user picks them in the app.
     pub volumes: Vec<char>,
 }
 
@@ -25,21 +24,7 @@ impl Config {
                 log::warn!("Ignoring invalid {}: {}", path.display(), e);
                 Self::default()
             }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::first_run(),
             Err(_) => Self::default(),
-        }
-    }
-
-    /// Nothing was chosen yet: index the drive Windows is installed on.
-    fn first_run() -> Self {
-        let system_drive = std::env::var("SystemDrive")
-            .ok()
-            .and_then(|d| d.chars().next())
-            .filter(char::is_ascii_alphabetic)
-            .map_or('C', |c| c.to_ascii_uppercase());
-        log::info!("No drives chosen yet, indexing {}:", system_drive);
-        Self {
-            volumes: vec![system_drive],
         }
     }
 
