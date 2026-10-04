@@ -35,6 +35,9 @@ fn service_main(_arguments: Vec<OsString>) {
     }
 }
 
+/// Exit code reported when the service could not start, so the service manager restarts it
+const START_FAILED: u32 = 1;
+
 fn run_service() -> Result<()> {
     let data_dir = security::data_dir()?;
     logger::init_file(&data_dir.join("service.log"));
@@ -63,11 +66,33 @@ fn run_service() -> Result<()> {
     };
 
     report(
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
+        Duration::from_secs(10),
+    )?;
+    let app = match App::start(data_dir, reverything_protocol::PIPE_NAME.to_string(), false) {
+        Ok(app) => app,
+        Err(e) => {
+            // A failed start has to end in Stopped with an error, not in a dead Running state,
+            // so the restart actions apply
+            log::error!("Failed to start: {:#}", e);
+            status.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::ServiceSpecific(START_FAILED),
+                checkpoint: 0,
+                wait_hint: Duration::ZERO,
+                process_id: None,
+            })?;
+            return Ok(());
+        }
+    };
+    report(
         ServiceState::Running,
         ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN,
         Duration::ZERO,
     )?;
-    let app = App::start(data_dir, reverything_protocol::PIPE_NAME.to_string(), false)?;
 
     let _ = stop_rx.recv();
     log::info!("Stopping service");
@@ -127,6 +152,8 @@ pub fn install() -> Result<()> {
     service.set_description(DESCRIPTION)?;
     // Saving at shutdown can take a few seconds, the default allows only 10
     service.set_preshutdown_timeout(Duration::from_secs(30))?;
+    // Also restart after a failed start, not only after crashes
+    service.set_failure_actions_on_non_crash_failures(true)?;
     // Restart after crashes
     service.update_failure_actions(ServiceFailureActions {
         reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 60 * 60)),

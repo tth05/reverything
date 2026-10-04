@@ -85,6 +85,16 @@ impl App {
 }
 
 fn main() -> ExitCode {
+    // A panic in one thread would leave poisoned locks behind, making every later request fail
+    // while Windows still sees a running service. Log it and exit instead, so the service
+    // manager restarts the service.
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let message = format!("Panic: {}\n{}", info, backtrace);
+        log::error!("{}", message);
+        eprintln!("{}", message);
+        std::process::abort();
+    }));
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let has = |flag: &str| args.iter().any(|a| a == flag);
 

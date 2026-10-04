@@ -43,6 +43,11 @@ impl AssetSource for AppAssets {
 }
 
 fn main() {
+    // The window has no console, without this a panic would close it without a trace
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        log::write(&format!("Panic: {}\n{}", info, backtrace));
+    }));
     let started = Instant::now();
     // A second start just brings the running window to the front
     let Some(second_instance) = desktop::single_instance() else {
