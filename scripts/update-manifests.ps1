@@ -123,15 +123,14 @@ Description: |-
   A small background service, running as the system account, keeps the index and answers the searches; the search window runs as the user, lives in the tray and comes up with a global shortcut. While the window is not in use, the service uses almost no CPU or memory.
 Moniker: reverything
 Tags:
-- everything
-- everything-alternative
-- file-search
-- file-finder
-- files
-- mft
+- journal
 - ntfs
+- rust
 - search
-- usn-journal
+- file-search
+- mft
+- windows
+- everything-alternative
 ReleaseNotesUrl: https://github.com/tth05/reverything/releases/tag/v$Version
 ManifestType: defaultLocale
 ManifestVersion: $schema
