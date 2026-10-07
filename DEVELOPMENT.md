@@ -197,6 +197,8 @@ Variations are read from `target/bench.env` (`KEY=VALUE` lines):
 3. `reverything-bench search --dir target/synth --save target/bench-results/<name>.json` runs the query suite in
    process and prints the median and slowest run and the time of each search phase (`search.*` tracing spans).
 4. `reverything-bench compare before.json after.json` compares two saved runs.
+5. `reverything-bench journal --dir target/synth --volume C` times applying batches of journal changes (modified,
+   created, renamed and deleted files) to one volume, per phase (`update.*` tracing spans).
 
 `reverything-service --console --offline` with `REVERYTHING_DEV_DIR=target\synth` serves the synthetic indices.
 

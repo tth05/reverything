@@ -7,6 +7,8 @@
 //!     times the query suite in process
 //! reverything-bench compare BEFORE.json AFTER.json
 //!     compares two saved runs
+//! reverything-bench journal [--dir DIR] [--volume C] [--runs N]
+//!     times applying batches of journal changes to one volume
 //! ```
 //!
 //! The saved indices come from the elevated `reverything-service --bench`, which writes them
@@ -22,6 +24,7 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 
 use reverything_core::index::persist::dev_db_dir;
 
+mod journal;
 mod phases;
 mod search;
 mod synth;
@@ -55,6 +58,16 @@ fn main() -> Result<()> {
                 value("--runs").map_or(Ok(5), str::parse)?,
                 value("--only"),
                 value("--save").map(PathBuf::from).as_deref(),
+            )
+        }
+        Some("journal") => {
+            phases::install();
+            journal::run(
+                &value("--dir").map_or_else(synth_dir, PathBuf::from),
+                value("--volume")
+                    .and_then(|v| v.chars().next())
+                    .unwrap_or('C'),
+                value("--runs").map_or(Ok(5), str::parse)?,
             )
         }
         Some("compare") if args.len() == 3 => search::compare(args[1].as_ref(), args[2].as_ref()),

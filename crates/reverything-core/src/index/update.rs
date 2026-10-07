@@ -3,6 +3,8 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use tracing::info_span;
+
 use crate::index::build::flags_and_size;
 use crate::index::{
     is_link, link_id, link_index, VolumeIndex, FLAG_DIRECTORY, FLAG_HAS_LINKS, FLAG_IN_USE,
@@ -113,8 +115,11 @@ pub fn fetch_update(handle: &Handle, record: u32, record_size: usize) -> Option<
 }
 
 impl VolumeIndex {
-    /// Applies record updates and moves the index to `next_usn`.
+    /// Applies record updates and moves the index to `next_usn`. The phases run in `tracing`
+    /// spans named `update.*`.
     pub fn apply_updates(&mut self, updates: &[RecordUpdate], next_usn: i64) {
+        let _span = info_span!("update").entered();
+        let records = info_span!("update.records").entered();
         let mut touched = Vec::with_capacity(updates.len());
         let order = parents_first(updates);
 
@@ -208,13 +213,15 @@ impl VolumeIndex {
             self.add_to_ancestors(id, self.records.size[r] as i64);
         }
 
-        self.update_locations(&directories);
+        drop(records);
+
+        info_span!("update.locations").in_scope(|| self.update_locations(&directories));
         self.next_usn = next_usn;
         if !touched.is_empty() {
-            self.resort(touched);
+            info_span!("update.resort").in_scope(|| self.resort(touched));
         }
         if self.garbage > (1 << 20) && self.garbage > self.names.len() / 4 {
-            self.compact_names();
+            info_span!("update.compact").in_scope(|| self.compact_names());
         }
     }
 
