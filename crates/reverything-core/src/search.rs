@@ -1,18 +1,18 @@
 //! Searching all volumes and ordering the combined results.
 
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::sync::RwLockReadGuard;
+use std::sync::{Arc, RwLockReadGuard};
 
 use rayon::prelude::*;
 use tracing::info_span;
 
-use crate::index::rank::{order_by_score, Ranker};
+use crate::index::rank::{group_by_score, Ranker};
 use crate::index::search::{FolderExclusion, Query};
 use crate::index::sort::{cmp_names, sort_key};
 use crate::index::VolumeIndex;
+use crate::results::{List, Order, Results};
 use crate::service::IndexSet;
 
 /// A search result: volume slot in the high 32 bits, record number in the low 32 bits.
@@ -69,25 +69,28 @@ pub fn exclusions(set: &IndexSet, folders: &[FolderExclusion]) -> Vec<Option<Vec
         .collect()
 }
 
+/// Read access to the indices of all volume slots, e.g. for [`Results::page`].
+pub fn read_all(set: &IndexSet) -> Vec<RwLockReadGuard<'_, VolumeIndex>> {
+    set.volumes
+        .iter()
+        .map(|v| v.index.read().unwrap())
+        .collect()
+}
+
 /// Searches all volumes. `excluded` holds the resolved folder exclusions of the query per
 /// volume, see [`exclusions`].
 ///
-/// Each phase runs in a `tracing` span named `search.*`, so benchmarks and traces can tell
-/// where the time goes.
+/// The hits of every volume are put in their final order within the volume; the combined order
+/// is only worked out for the rows that are read, see [`Results`]. Each phase runs in a
+/// `tracing` span named `search.*`, so benchmarks and traces can tell where the time goes.
 pub fn search_all(
     set: &IndexSet,
     query: &Query,
     sort: Sort,
     excluded: &[Option<Vec<u64>>],
-) -> Vec<Hit> {
+) -> Results {
     let _span = info_span!("search").entered();
-    let lock = info_span!("search.lock").entered();
-    let indices = set
-        .volumes
-        .iter()
-        .map(|v| v.index.read().unwrap())
-        .collect::<Vec<_>>();
-    drop(lock);
+    let indices = info_span!("search.lock").in_scope(|| read_all(set));
 
     let matching = info_span!("search.match").entered();
     let per_volume = indices
@@ -96,74 +99,99 @@ pub fn search_all(
         .map(|(i, index)| {
             let excluded = excluded.get(i).and_then(|e| e.as_deref());
             if query.is_match_all() && excluded.is_none() {
-                Cow::Borrowed(index.sorted.as_slice())
+                index.sorted.clone()
             } else {
-                Cow::Owned(index.search(query, excluded))
+                Arc::new(index.search(query, excluded))
             }
         })
+        .enumerate()
+        .filter(|(_, ids)| !ids.is_empty())
         .collect::<Vec<_>>();
     drop(matching);
 
-    let mut hits = info_span!("search.merge").in_scope(|| {
-        let lists = per_volume.iter().map(|l| &**l).collect::<Vec<_>>();
-        merge_by_name(&indices, &lists)
-    });
-    drop(per_volume);
-
-    let sorting = info_span!("search.sort").entered();
+    let descending = !sort.ascending;
+    let total = per_volume.iter().map(|(_, ids)| ids.len()).sum::<usize>();
+    let list = |volume, ids| List {
+        volume,
+        ids,
+        groups: Vec::new(),
+    };
+    let by_key =
+        |per_volume: Vec<(usize, Arc<Vec<u32>>)>, order, key: fn(&VolumeIndex, u32) -> u64| {
+            let lists = per_volume
+                .into_iter()
+                .map(|(v, ids)| {
+                    let mut ids = Arc::unwrap_or_clone(ids);
+                    // Stable, so equal keys stay in name order
+                    ids.par_sort_by_key(|&id| key(&indices[v], id));
+                    list(v, Arc::new(ids))
+                })
+                .collect();
+            Results::lazy(order, descending, lists)
+        };
+    let _sorting = info_span!("search.sort").entered();
     match sort.column {
-        SortColumn::Relevance => {
-            if let Some(ranker) = Ranker::new(query) {
-                let locations = info_span!("search.locations").in_scope(|| {
-                    indices
-                        .par_iter()
-                        .map(|i| i.locations())
-                        .collect::<Vec<_>>()
-                });
-                let score = info_span!("search.score").entered();
-                let scores = hits
-                    .par_iter()
-                    .with_min_len(4096)
-                    .map(|&h| {
-                        let (v, id) = hit_parts(h);
-                        ranker.score(&indices[v], &locations[v], id)
+        SortColumn::Relevance => match Ranker::new(query) {
+            Some(ranker) => {
+                let lists = per_volume
+                    .into_iter()
+                    .map(|(v, ids)| {
+                        let index = &*indices[v];
+                        let locations =
+                            info_span!("search.locations").in_scope(|| index.locations());
+                        let scores = info_span!("search.score").in_scope(|| {
+                            ids.par_iter()
+                                .with_min_len(4096)
+                                .map(|&id| ranker.score(index, &locations, id))
+                                .collect::<Vec<_>>()
+                        });
+                        let (ids, groups) =
+                            info_span!("search.group").in_scope(|| group_by_score(&ids, &scores));
+                        List {
+                            volume: v,
+                            ids: Arc::new(ids),
+                            groups,
+                        }
                     })
-                    .collect::<Vec<_>>();
-                drop(score);
-                info_span!("search.reorder").in_scope(|| order_by_score(&mut hits, &scores));
+                    .collect();
+                Results::lazy(Order::Score, descending, lists)
             }
-        }
-        SortColumn::Name => {}
-        SortColumn::Size => hits.par_sort_by_key(|&h| entry(&indices, h, |i, id| i.size(id))),
-        SortColumn::Modified => {
-            hits.par_sort_by_key(|&h| entry(&indices, h, |i, id| i.modified(id)))
-        }
-        SortColumn::Created => hits.par_sort_by_key(|&h| entry(&indices, h, |i, id| i.created(id))),
-        SortColumn::Attributes => hits.par_sort_by_key(|&h| {
-            entry(&indices, h, |i, id| {
-                i.flags(id) & crate::index::ATTRIBUTE_MASK
-            })
+            None => Results::lazy(
+                Order::Name,
+                descending,
+                per_volume
+                    .into_iter()
+                    .map(|(v, ids)| list(v, ids))
+                    .collect(),
+            ),
+        },
+        SortColumn::Size => by_key(per_volume, Order::Size, |i, id| i.size(id)),
+        SortColumn::Modified => by_key(per_volume, Order::Modified, |i, id| i.modified(id) as u64),
+        SortColumn::Created => by_key(per_volume, Order::Created, |i, id| i.created(id) as u64),
+        SortColumn::Attributes => by_key(per_volume, Order::Attributes, |i, id| {
+            (i.flags(id) & crate::index::ATTRIBUTE_MASK) as u64
         }),
-        SortColumn::Path if hits.len() <= MAX_PATH_SORT => hits.par_sort_by_cached_key(|&h| {
-            entry(&indices, h, |i, id| i.folder_path(id).to_lowercase())
-        }),
-        SortColumn::Path => {}
+        SortColumn::Path if total <= MAX_PATH_SORT => {
+            let mut lists = vec![&[][..]; indices.len()];
+            for (v, ids) in &per_volume {
+                lists[*v] = ids.as_slice();
+            }
+            let mut hits = info_span!("search.merge").in_scope(|| merge_by_name(&indices, &lists));
+            hits.par_sort_by_cached_key(|&h| {
+                let (v, id) = hit_parts(h);
+                indices[v].folder_path(id).to_lowercase()
+            });
+            Results::flat(hits, descending)
+        }
+        SortColumn::Name | SortColumn::Path => Results::lazy(
+            Order::Name,
+            descending,
+            per_volume
+                .into_iter()
+                .map(|(v, ids)| list(v, ids))
+                .collect(),
+        ),
     }
-    if !sort.ascending {
-        hits.reverse();
-    }
-    drop(sorting);
-    hits
-}
-
-#[inline]
-fn entry<T>(
-    indices: &[RwLockReadGuard<VolumeIndex>],
-    hit: Hit,
-    f: impl Fn(&VolumeIndex, u32) -> T,
-) -> T {
-    let (v, id) = hit_parts(hit);
-    f(&indices[v], id)
 }
 
 /// Merges the per volume results, which are each in name order, into one list ordered by name,
@@ -435,5 +463,154 @@ mod tests {
         let only = [&[][..], &indices[1].sorted[..]];
         assert_eq!(merge_by_name(&indices, &only), reference(&indices, &only));
         assert!(merge_by_name(&indices, &[&[][..]; 3]).is_empty());
+    }
+
+    /// Checks pages at many positions, in both directions, against sorting everything by
+    /// `key`, then name, then volume, then position in the volume's list.
+    fn check_pages(
+        indices: &[&VolumeIndex],
+        lists: Vec<List>,
+        order: Order,
+        key: impl Fn(usize, usize, u32) -> u64,
+    ) {
+        let mut all = lists
+            .iter()
+            .enumerate()
+            .flat_map(|(l, list)| {
+                list.ids
+                    .iter()
+                    .enumerate()
+                    .map(move |(pos, &id)| (l, list.volume, pos, id))
+            })
+            .collect::<Vec<_>>();
+        all.sort_by(|&(la, va, pa, a), &(lb, vb, pb, b)| {
+            key(la, pa, a)
+                .cmp(&key(lb, pb, b))
+                .then_with(|| cmp_names(indices[va].name(a), indices[vb].name(b)))
+                .then(va.cmp(&vb))
+                .then(pa.cmp(&pb))
+        });
+        let expected = all
+            .iter()
+            .map(|&(_, v, _, id)| hit(v, id))
+            .collect::<Vec<_>>();
+        let reversed = expected.iter().rev().copied().collect::<Vec<_>>();
+        let total = expected.len();
+
+        let shared = lists
+            .iter()
+            .map(|l| List {
+                volume: l.volume,
+                ids: l.ids.clone(),
+                groups: l.groups.clone(),
+            })
+            .collect();
+        let ascending = Results::lazy(order, false, shared);
+        let descending = Results::lazy(order, true, lists);
+        assert_eq!(ascending.len(), total);
+        let mut starts = vec![
+            0,
+            1,
+            255,
+            256,
+            4095,
+            total / 3,
+            total / 2,
+            total.saturating_sub(1),
+            total,
+            total + 5,
+        ];
+        starts.extend((1..40).map(|i| total * i / 41 + i));
+        for start in starts {
+            for count in [1, 256, 2048] {
+                let end = (start + count).min(total);
+                let range = start.min(total)..end;
+                assert_eq!(
+                    ascending.page(indices, start, count),
+                    expected[range.clone()],
+                    "{:?} at {}",
+                    order,
+                    start
+                );
+                assert_eq!(
+                    descending.page(indices, start, count),
+                    reversed[range],
+                    "{:?} at {} descending",
+                    order,
+                    start
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pages_in_combined_order() {
+        let mut volumes = [
+            volume('A', &names(5, 60_000)),
+            volume('B', &names(6, 25_000)),
+            volume('C', &names(7, 3)),
+        ];
+        for (v, index) in volumes.iter_mut().enumerate() {
+            for (i, size) in index.records.size.iter_mut().enumerate() {
+                *size = (i as u64 * 31 + v as u64) % 50;
+            }
+        }
+        let indices = volumes.iter().collect::<Vec<_>>();
+        let sorted = |v: usize, step: usize| -> Vec<u32> {
+            indices[v].sorted.iter().copied().step_by(step).collect()
+        };
+
+        // Name order, with a volume without hits in between
+        let name_lists = || {
+            vec![
+                List {
+                    volume: 0,
+                    ids: Arc::new(sorted(0, 1)),
+                    groups: Vec::new(),
+                },
+                List {
+                    volume: 2,
+                    ids: Arc::new(sorted(2, 1)),
+                    groups: Vec::new(),
+                },
+                List {
+                    volume: 1,
+                    ids: Arc::new(sorted(1, 3)),
+                    groups: Vec::new(),
+                },
+            ]
+        };
+        check_pages(&indices, name_lists(), Order::Name, |_, _, _| 0);
+
+        // Grouped by score
+        let score = |v: usize, id: u32| ((id as usize * 7 + v) % 5) as u8;
+        let mut lists = Vec::new();
+        for (v, step) in [(0, 2), (1, 1), (2, 1)] {
+            let ids = sorted(v, step);
+            let scores = ids.iter().map(|&id| score(v, id)).collect::<Vec<_>>();
+            let (ids, groups) = group_by_score(&ids, &scores);
+            lists.push(List {
+                volume: v,
+                ids: Arc::new(ids),
+                groups,
+            });
+        }
+        let volume_of = lists.iter().map(|l| l.volume).collect::<Vec<_>>();
+        check_pages(&indices, lists, Order::Score, |l, _, id| {
+            255 - score(volume_of[l], id) as u64
+        });
+
+        // By size, stable within a volume
+        let mut lists = name_lists();
+        for list in &mut lists {
+            let index = indices[list.volume];
+            Arc::make_mut(&mut list.ids).sort_by_key(|&id| index.size(id));
+        }
+        let volume_of = lists.iter().map(|l| l.volume).collect::<Vec<_>>();
+        check_pages(&indices, lists, Order::Size, |l, _, id| {
+            indices[volume_of[l]].size(id)
+        });
+
+        assert!(Results::default().page(&indices, 0, 256).is_empty());
     }
 }

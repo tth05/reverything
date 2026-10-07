@@ -24,7 +24,8 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 use reverything_core::index::build::ScanStats;
 use reverything_core::index::search::{FolderExclusion, Matcher, Query};
 use reverything_core::index::{ATTRIBUTE_MASK, FLAG_DIRECTORY};
-use reverything_core::search::{exclusions, hit_parts, search_all, Hit};
+use reverything_core::results::Results;
+use reverything_core::search::{exclusions, hit_parts, read_all, search_all};
 use reverything_core::service::{self as core_service, BatchStats, IndexSet, SaveStats};
 use reverything_protocol::{
     read_message, write_message, BatchTimings, Request, Response, Row, SaveTimings, SavedIndex,
@@ -148,19 +149,19 @@ impl Server {
                 query.folders.truncate(MAX_EXCLUDED_FOLDERS);
                 query.skip_files = !files;
                 query.skip_folders = !folders;
-                let hits = {
+                let results = {
                     let excluded =
                         session.exclusions(&self.set, std::mem::take(&mut query.folders));
                     search_all(&self.set, &query, core_sort(sort), excluded)
                 };
-                session.hits = hits;
+                session.results = results;
                 session.search += 1;
                 let took_us = t.elapsed().as_micros() as u64;
                 self.searches.fetch_add(1, Ordering::Relaxed);
                 self.last_search_us.store(took_us, Ordering::Relaxed);
                 Response::Search {
                     search: session.search,
-                    total: session.hits.len() as u64,
+                    total: session.results.len() as u64,
                     took_us,
                 }
             }
@@ -172,14 +173,11 @@ impl Server {
                 if search != session.search {
                     return Response::Error(format!("Search {} is no longer current", search));
                 }
-                let start_ix = (start as usize).min(session.hits.len());
-                let end = start_ix
-                    .saturating_add(count.min(MAX_ROWS_PER_REQUEST) as usize)
-                    .min(session.hits.len());
+                let count = count.min(MAX_ROWS_PER_REQUEST) as usize;
                 Response::Rows {
                     search,
                     start,
-                    rows: self.rows(&session.hits[start_ix..end], session),
+                    rows: self.rows(session, start as usize, count),
                 }
             }
             Request::Status => Response::Status(self.status()),
@@ -217,13 +215,9 @@ impl Server {
         }
     }
 
-    fn rows(&self, hits: &[Hit], session: &Session) -> Vec<Row> {
-        let indices = self
-            .set
-            .volumes
-            .iter()
-            .map(|v| v.index.read().unwrap())
-            .collect::<Vec<_>>();
+    fn rows(&self, session: &Session, start: usize, count: usize) -> Vec<Row> {
+        let indices = read_all(&self.set);
+        let hits = session.results.page(&indices, start, count);
 
         hits.iter()
             .map(|&hit| {
@@ -347,7 +341,7 @@ struct Session {
     /// Whether the client's window is active, `None` until it says
     active: Option<bool>,
     search: u64,
-    hits: Vec<Hit>,
+    results: Results,
     /// Name parts of the search, to highlight them in the rows
     names: Vec<Matcher>,
     /// Folder parts of the search (`system32\`), to highlight them in the folder column

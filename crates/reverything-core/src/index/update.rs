@@ -1,6 +1,7 @@
 //! Applying journal changes to a [`VolumeIndex`].
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use crate::index::build::flags_and_size;
 use crate::index::{
@@ -261,14 +262,22 @@ impl VolumeIndex {
             };
             set[i / 64] |= 1 << (i % 64);
         }
-        self.sorted.retain(|&id| {
+        let untouched = |id: u32| {
             let (set, i) = if is_link(id) {
                 (&links, link_index(id))
             } else {
                 (&records, id as usize)
             };
             set[i / 64] & (1 << (i % 64)) == 0
-        });
+        };
+        // Search results may still hold the current list
+        match Arc::get_mut(&mut self.sorted) {
+            Some(sorted) => sorted.retain(|&id| untouched(id)),
+            None => {
+                let kept = self.sorted.iter().copied().filter(|&id| untouched(id));
+                self.sorted = Arc::new(kept.collect());
+            }
+        }
 
         let mut new = touched
             .into_iter()
@@ -291,7 +300,7 @@ impl VolumeIndex {
             start = pos;
         }
         out.extend_from_slice(&self.sorted[start..]);
-        self.sorted = out;
+        self.sorted = Arc::new(out);
     }
 }
 

@@ -177,12 +177,12 @@ fn bench_search(set: &reverything_core::service::IndexSet) {
         let t = Instant::now();
         let query = reverything_core::index::search::Query::parse(q);
         let excluded = reverything_core::search::exclusions(set, &query.folders);
-        let hits = search_all(set, &query, sort, &excluded);
+        let results = search_all(set, &query, sort, &excluded);
         println!(
             "  search {:?} by {:?}: {} hits in {:?}",
             q,
             column,
-            hits.len(),
+            results.len(),
             t.elapsed()
         );
     }

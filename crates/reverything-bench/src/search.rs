@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use reverything_core::index::persist::load_offline;
 use reverything_core::index::search::Query;
 use reverything_core::ntfs::volume::Volume;
-use reverything_core::search::{exclusions, search_all, Sort, SortColumn};
+use reverything_core::results::Results;
+use reverything_core::search::{exclusions, read_all, search_all, Sort, SortColumn};
 use reverything_core::service::IndexSet;
 
 use crate::phases;
@@ -77,7 +78,7 @@ pub fn run(dir: &Path, runs: usize, filter: Option<&str>, save: Option<&Path>) -
 
     let mut samples = Vec::new();
     // The service keeps the last result per session and drops it when the next one arrives
-    let mut previous = Vec::new();
+    let mut previous = Results::default();
     println!(
         "{:<28} {:>9} {:>10} {:>9} {:>9}  phases (median ms)",
         "query", "sort", "hits", "median", "max"
@@ -99,6 +100,10 @@ pub fn run(dir: &Path, runs: usize, filter: Option<&str>, save: Option<&Path>) -
             let excluded = exclusions(&set, &query.folders);
             let result = search_all(&set, &query, sort, &excluded);
             hits = result.len();
+            // The first two pages of rows, which the app reads right away
+            for page in 0..2 {
+                result.page(&read_all(&set), page * 256, 256);
+            }
             {
                 let _span = tracing::info_span!("search.drop_previous").entered();
                 previous = result;

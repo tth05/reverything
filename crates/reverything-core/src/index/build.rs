@@ -229,7 +229,7 @@ pub fn scan_volume(volume: Volume, opts: &ScanOptions) -> Result<(VolumeIndex, S
         records,
         links,
         names,
-        sorted: Vec::new(),
+        sorted: Default::default(),
         garbage: 0,
         locations: Default::default(),
     };

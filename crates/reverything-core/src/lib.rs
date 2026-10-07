@@ -2,5 +2,6 @@
 
 pub mod index;
 pub mod ntfs;
+pub mod results;
 pub mod search;
 pub mod service;

@@ -15,9 +15,10 @@
 use std::sync::Arc;
 
 use memchr::memmem;
+use rayon::prelude::*;
 
 use crate::index::search::{Matcher, Query};
-use crate::index::{VolumeIndex, FLAG_DIRECTORY, FLAG_IN_USE, MAX_DEPTH};
+use crate::index::{SyncPtr, VolumeIndex, FLAG_DIRECTORY, FLAG_IN_USE, MAX_DEPTH};
 use crate::ntfs::ROOT_RECORD;
 
 const DIR_IN_USE: u32 = FLAG_IN_USE | FLAG_DIRECTORY;
@@ -278,26 +279,52 @@ impl Ranker {
     }
 }
 
-/// Orders `hits` by descending score, keeping the current order for equal scores. Linear time,
-/// so ranking millions of hits costs about as much as finding them.
-pub fn order_by_score<T: Copy + Default>(hits: &mut Vec<T>, scores: &[u8]) {
-    let mut counts = [0usize; 256];
-    for &s in scores {
-        counts[s as usize] += 1;
-    }
-    // Start of every score's run, highest score first
-    let mut start = [0usize; 256];
+/// Groups `ids` by descending score, keeping their order within each score. Linear time and
+/// parallel, so ranking millions of hits costs about as much as finding them. Returns the grouped
+/// ids, and the end of every group with its score, best first.
+pub fn group_by_score(ids: &[u32], scores: &[u8]) -> (Vec<u32>, Vec<(usize, u8)>) {
+    const CHUNK: usize = 1 << 16;
+    let counts = scores
+        .par_chunks(CHUNK)
+        .map(|chunk| {
+            let mut counts = [0usize; 256];
+            for &s in chunk {
+                counts[s as usize] += 1;
+            }
+            counts
+        })
+        .collect::<Vec<_>>();
+
+    // Where every chunk writes its hits of every score: best score first, chunks in order
+    let mut starts = vec![[0usize; 256]; counts.len()];
+    let mut groups = Vec::new();
     let mut next = 0;
     for s in (0..256).rev() {
-        start[s] = next;
-        next += counts[s];
+        let begin = next;
+        for (chunk, counts) in counts.iter().enumerate() {
+            starts[chunk][s] = next;
+            next += counts[s];
+        }
+        if next > begin {
+            groups.push((next, s as u8));
+        }
     }
-    let mut ordered = vec![T::default(); hits.len()];
-    for (&hit, &s) in hits.iter().zip(scores) {
-        ordered[start[s as usize]] = hit;
-        start[s as usize] += 1;
-    }
-    *hits = ordered;
+
+    let mut grouped = Vec::<u32>::with_capacity(ids.len());
+    let out = SyncPtr(grouped.as_mut_ptr());
+    ids.par_chunks(CHUNK)
+        .zip(scores.par_chunks(CHUNK))
+        .zip(starts)
+        .for_each(|((ids, scores), mut start)| {
+            for (&id, &s) in ids.iter().zip(scores) {
+                // SAFETY: the start positions give every hit its own slot below ids.len()
+                unsafe { out.get().add(start[s as usize]).write(id) };
+                start[s as usize] += 1;
+            }
+        });
+    // SAFETY: every slot was written above
+    unsafe { grouped.set_len(ids.len()) };
+    (grouped, groups)
 }
 
 #[cfg(test)]
@@ -331,9 +358,16 @@ mod tests {
     }
 
     #[test]
-    fn stable_descending_order() {
-        let mut hits = vec![10, 11, 12, 13, 14];
-        order_by_score(&mut hits, &[1, 5, 1, 5, 0]);
-        assert_eq!(hits, vec![11, 13, 10, 12, 14]);
+    fn stable_descending_groups() {
+        let (ids, groups) = group_by_score(&[10, 11, 12, 13, 14], &[1, 5, 1, 5, 0]);
+        assert_eq!(ids, vec![11, 13, 10, 12, 14]);
+        assert_eq!(groups, vec![(2, 5), (4, 1), (5, 0)]);
+
+        // Across parallel chunks
+        let ids = (0..300_000).collect::<Vec<u32>>();
+        let scores = ids.iter().map(|&i| (i * 7 % 13) as u8).collect::<Vec<_>>();
+        let mut expected = ids.clone();
+        expected.sort_by_key(|&i| std::cmp::Reverse(scores[i as usize]));
+        assert_eq!(group_by_score(&ids, &scores).0, expected);
     }
 }

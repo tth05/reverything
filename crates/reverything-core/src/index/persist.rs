@@ -157,7 +157,7 @@ impl VolumeIndex {
             array(&l.parent),
             array(&l.name_len),
             self.name_chunks(&order),
-            array(&self.sorted),
+            array(self.sorted.as_slice()),
         ];
         let compressed = sections
             .iter()
@@ -255,7 +255,7 @@ impl VolumeIndex {
             records,
             links,
             names,
-            sorted,
+            sorted: sorted.into(),
             garbage: 0,
             locations: Default::default(),
         };

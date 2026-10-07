@@ -189,8 +189,9 @@ pub struct VolumeIndex {
     pub links: Links,
     /// UTF-8 names of all entries back to back
     pub names: Vec<u8>,
-    /// In-use entries (except the root) ordered by name
-    pub sorted: Vec<u32>,
+    /// In-use entries (except the root) ordered by name. Shared, so search results can hold on
+    /// to it; updates replace it.
+    pub sorted: Arc<Vec<u32>>,
     /// Bytes in `names` that are no longer referenced
     pub garbage: usize,
     /// Location of every directory for ranking, see [`VolumeIndex::locations`]. Dropped when
@@ -209,7 +210,7 @@ impl VolumeIndex {
             records: Records::default(),
             links: Links::default(),
             names: Vec::new(),
-            sorted: Vec::new(),
+            sorted: Arc::default(),
             garbage: 0,
             locations: Mutex::default(),
         }
@@ -235,6 +236,27 @@ impl VolumeIndex {
             (self.records.name_off[i], self.records.name_len[i])
         };
         &self.names[off as usize..off as usize + len as usize]
+    }
+
+    /// Like [`VolumeIndex::name`], but empty for ids this index does not have, e.g. hits of a
+    /// search from before the volume was loaded again.
+    pub fn name_checked(&self, id: u32) -> &[u8] {
+        let (off, len) = if is_link(id) {
+            let l = link_index(id);
+            match (self.links.name_off.get(l), self.links.name_len.get(l)) {
+                (Some(&off), Some(&len)) => (off, len),
+                _ => return &[],
+            }
+        } else {
+            let i = id as usize;
+            match (self.records.name_off.get(i), self.records.name_len.get(i)) {
+                (Some(&off), Some(&len)) => (off, len),
+                _ => return &[],
+            }
+        };
+        self.names
+            .get(off as usize..off as usize + len as usize)
+            .unwrap_or(&[])
     }
 
     pub fn name_str(&self, id: u32) -> &str {

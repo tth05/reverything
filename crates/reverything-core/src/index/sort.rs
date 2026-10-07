@@ -61,7 +61,7 @@ impl VolumeIndex {
         // Sorting by the integer prefix first avoids touching the names for most comparisons
         keyed.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| self.cmp_entries(a.1, b.1)));
 
-        self.sorted = keyed.into_par_iter().map(|(_, id)| id).collect();
+        self.sorted = std::sync::Arc::new(keyed.into_par_iter().map(|(_, id)| id).collect());
         self.compact_names();
     }
 
