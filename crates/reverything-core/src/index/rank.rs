@@ -219,8 +219,8 @@ fn quality_ascii(name: &[u8], needle: &[u8]) -> u8 {
 
 /// Computes the relevance of hits for one query.
 pub struct Ranker {
-    /// Lowercase matchers and the text as typed, of every term with a name part
-    terms: Vec<(Matcher, Vec<u8>)>,
+    /// Lowercase matchers, and searchers for the text as typed, of every term with a name part
+    terms: Vec<(Matcher, memmem::Finder<'static>)>,
     now: u32,
 }
 
@@ -231,7 +231,7 @@ impl Ranker {
             .include
             .iter()
             .filter_map(|t| t.name_text.as_ref())
-            .map(|text| (Matcher::new(text), text.as_bytes().to_vec()))
+            .map(|text| (Matcher::new(text), memmem::Finder::new(text).into_owned()))
             .collect::<Vec<_>>();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -265,7 +265,7 @@ impl Ranker {
         let same_case = self
             .terms
             .iter()
-            .all(|(_, typed)| memmem::find(name, typed).is_some()) as u8;
+            .all(|(_, typed)| typed.find(name).is_some()) as u8;
 
         let age = self.now.saturating_sub(index.modified(id));
         let recency = match age {
