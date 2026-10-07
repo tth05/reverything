@@ -40,8 +40,11 @@ pub fn db_path(dir: &Path, volume: Volume) -> PathBuf {
 }
 
 /// Directory for indices saved by development tools (benchmarks, offline mode), so they never
-/// touch the ones of the installed service.
+/// touch the ones of the installed service. `REVERYTHING_DEV_DIR` overrides it.
 pub fn dev_db_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("REVERYTHING_DEV_DIR") {
+        return PathBuf::from(dir);
+    }
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)

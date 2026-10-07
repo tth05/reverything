@@ -1,0 +1,21 @@
+[package]
+name = "reverything-bench"
+description = "Development tool: synthetic indices and search benchmarks, never shipped"
+version.workspace = true
+edition.workspace = true
+license-file = "../../LICENSE"
+publish = false
+
+[dependencies]
+reverything-core.workspace = true
+eyre.workspace = true
+mimalloc.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
+windows = { workspace = true, features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

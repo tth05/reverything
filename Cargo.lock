@@ -6113,6 +6113,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "reverything-bench"
+version = "1.0.1"
+dependencies = [
+ "eyre",
+ "mimalloc",
+ "rayon",
+ "reverything-core",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "reverything-core"
 version = "1.0.1"
 dependencies = [
@@ -6121,6 +6136,7 @@ dependencies = [
  "log",
  "memchr",
  "rayon",
+ "tracing",
  "windows 0.62.2",
  "zstd",
 ]

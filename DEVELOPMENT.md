@@ -70,6 +70,9 @@ GPUI_FXC_PATH = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.20348.0\x64\fxc
 - Or run it in the foreground (admin): `reverything-service --console`.
 - UI development without admin rights: `reverything-service --console --offline` serves the indices saved in
   `%LOCALAPPDATA%\reverything-dev` (written by the benchmarks and `RV_SERVE_SECS`) without updating them.
+  `REVERYTHING_DEV_DIR` points the benchmarks and the offline service at another directory. Processes started
+  from a packaged app (e.g. the Claude desktop app) see a virtualized `%LOCALAPPDATA%`, so tools running there
+  should use a directory in the repository, e.g. `target\dev-db`.
 - `REVERYTHING_PIPE=\\.\pipe\reverything-dev` makes the window, `query` and the console/bench service use another
   pipe, so a development service can run next to the installed one. The installed service ignores it.
 - `reverything-service query <text>` searches through a running service from the command line.
@@ -182,7 +185,20 @@ Variations are read from `target/bench.env` (`KEY=VALUE` lines):
 | `RV_JOURNAL=1` | Creates, renames, links and deletes files in `%TEMP%` and checks the index follows |
 | `RV_SERVE_SECS=90` | Runs the live service for that long, to test clients against it (volumes are turned on through a client, e.g. `RV_QUERY_VOLUMES`) |
 | `REVERYTHING_PIPE=\\.\pipe\reverything-bench` | Serves on another pipe, next to the installed service |
+| `REVERYTHING_DEV_DIR=C:\...\target\dev-db` | Saves and loads the indices there instead of `%LOCALAPPDATA%\reverything-dev` |
 | `RV_IDLE_CHECK_SECS=5`, `RV_UNLOAD_SECS=25` | Shorter idle timings for `RV_SERVE_SECS` (default 5 and 60 minutes) |
+
+### Search at scale
+`reverything-bench` (no admin needed) measures searches on indices larger than the development machine's drives:
+
+1. Save real indices with the bench task, with `REVERYTHING_DEV_DIR=C:\...\target\dev-db` in `target/bench.env`.
+2. `reverything-bench synth --from target/dev-db --to target/synth` copies them into about 22 million entries on
+   four volumes (`--spec` changes the layout, see `synth.rs`). The result is the same for the same input and seed.
+3. `reverything-bench search --dir target/synth --save target/bench-results/<name>.json` runs the query suite in
+   process and prints the median and slowest run and the time of each search phase (`search.*` tracing spans).
+4. `reverything-bench compare before.json after.json` compares two saved runs.
+
+`reverything-service --console --offline` with `REVERYTHING_DEV_DIR=target\synth` serves the synthetic indices.
 
 ## Resources
 - https://flatcap.github.io/linux-ntfs

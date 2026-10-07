@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::sync::RwLockReadGuard;
 
 use rayon::prelude::*;
+use tracing::info_span;
 
 use crate::index::rank::{order_by_score, Ranker};
 use crate::index::search::{FolderExclusion, Query};
@@ -67,18 +68,25 @@ pub fn exclusions(set: &IndexSet, folders: &[FolderExclusion]) -> Vec<Option<Vec
 
 /// Searches all volumes. `excluded` holds the resolved folder exclusions of the query per
 /// volume, see [`exclusions`].
+///
+/// Each phase runs in a `tracing` span named `search.*`, so benchmarks and traces can tell
+/// where the time goes.
 pub fn search_all(
     set: &IndexSet,
     query: &Query,
     sort: Sort,
     excluded: &[Option<Vec<u64>>],
 ) -> Vec<Hit> {
+    let _span = info_span!("search").entered();
+    let lock = info_span!("search.lock").entered();
     let indices = set
         .volumes
         .iter()
         .map(|v| v.index.read().unwrap())
         .collect::<Vec<_>>();
+    drop(lock);
 
+    let matching = info_span!("search.match").entered();
     let per_volume = indices
         .par_iter()
         .enumerate()
@@ -91,16 +99,21 @@ pub fn search_all(
             }
         })
         .collect::<Vec<_>>();
+    drop(matching);
 
-    let mut hits = merge_by_name(&indices, per_volume);
+    let mut hits = info_span!("search.merge").in_scope(|| merge_by_name(&indices, per_volume));
 
+    let sorting = info_span!("search.sort").entered();
     match sort.column {
         SortColumn::Relevance => {
             if let Some(ranker) = Ranker::new(query) {
-                let locations = indices
-                    .par_iter()
-                    .map(|i| i.locations())
-                    .collect::<Vec<_>>();
+                let locations = info_span!("search.locations").in_scope(|| {
+                    indices
+                        .par_iter()
+                        .map(|i| i.locations())
+                        .collect::<Vec<_>>()
+                });
+                let score = info_span!("search.score").entered();
                 let scores = hits
                     .par_iter()
                     .with_min_len(4096)
@@ -109,7 +122,8 @@ pub fn search_all(
                         ranker.score(&indices[v], &locations[v], id)
                     })
                     .collect::<Vec<_>>();
-                order_by_score(&mut hits, &scores);
+                drop(score);
+                info_span!("search.reorder").in_scope(|| order_by_score(&mut hits, &scores));
             }
         }
         SortColumn::Name => {}
@@ -131,6 +145,7 @@ pub fn search_all(
     if !sort.ascending {
         hits.reverse();
     }
+    drop(sorting);
     hits
 }
 
