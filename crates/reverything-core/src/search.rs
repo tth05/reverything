@@ -11,7 +11,7 @@ use tracing::info_span;
 use crate::index::rank::{group_by_score, Ranker};
 use crate::index::search::{FolderExclusion, Query};
 use crate::index::sort::{cmp_names, sort_key};
-use crate::index::VolumeIndex;
+use crate::index::{prefetched, VolumeIndex};
 use crate::results::{List, Order, Results};
 use crate::service::IndexSet;
 
@@ -140,9 +140,17 @@ pub fn search_all(
                         let locations =
                             info_span!("search.locations").in_scope(|| index.locations());
                         let scores = info_span!("search.score").in_scope(|| {
-                            ids.par_iter()
-                                .with_min_len(4096)
-                                .map(|&id| ranker.score(index, &locations, id))
+                            ids.par_chunks(4096)
+                                .flat_map_iter(|chunk| {
+                                    let mut scores = Vec::with_capacity(chunk.len());
+                                    prefetched(
+                                        chunk,
+                                        |id| ranker.prefetch_record(index, id),
+                                        |id| ranker.prefetch_name(index, &locations, id),
+                                        |id| scores.push(ranker.score(index, &locations, id)),
+                                    );
+                                    scores.into_iter()
+                                })
                                 .collect::<Vec<_>>()
                         });
                         let (ids, groups) =

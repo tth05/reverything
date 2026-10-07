@@ -18,7 +18,7 @@ use memchr::{memchr2_iter, memchr_iter};
 use rayon::prelude::*;
 
 use crate::index::filter::{Field, Filter};
-use crate::index::{VolumeIndex, FLAG_DIRECTORY, FLAG_IN_USE};
+use crate::index::{prefetch, prefetched, VolumeIndex, FLAG_DIRECTORY, FLAG_IN_USE};
 use crate::ntfs::ROOT_RECORD;
 
 const DIR_IN_USE: u32 = FLAG_IN_USE | FLAG_DIRECTORY;
@@ -426,22 +426,54 @@ impl VolumeIndex {
             0
         });
 
-        self.sorted
-            .par_iter()
-            .with_min_len(4096)
-            .copied()
-            .filter(|&id| {
-                skip_kind.is_none_or(|skip| self.flags(id) & FLAG_DIRECTORY != skip)
-                    && query.filters.iter().all(|f| {
-                        f.matches(match f.field {
-                            Field::Size => self.size(id),
-                            Field::Modified => self.modified(id) as u64,
-                            Field::Created => self.created(id) as u64,
-                        })
+        let keep = |id: u32| {
+            skip_kind.is_none_or(|skip| self.flags(id) & FLAG_DIRECTORY != skip)
+                && query.filters.iter().all(|f| {
+                    f.matches(match f.field {
+                        Field::Size => self.size(id),
+                        Field::Modified => self.modified(id) as u64,
+                        Field::Created => self.created(id) as u64,
                     })
-                    && excluded.is_none_or(|set| !bit(set, self.parent(id)) && !bit(set, id))
-                    && include.iter().all(|t| t.matches(self, id))
-                    && !exclude.iter().any(|t| t.matches(self, id))
+                })
+                && excluded.is_none_or(|set| !bit(set, self.parent(id)) && !bit(set, id))
+                && include.iter().all(|t| t.matches(self, id))
+                && !exclude.iter().any(|t| t.matches(self, id))
+        };
+        let needs_names = include
+            .iter()
+            .chain(&exclude)
+            .any(|t| t.term.name.is_some());
+        let needs_parent =
+            excluded.is_some() || include.iter().chain(&exclude).any(|t| t.parents.is_some());
+        let records = &self.records;
+        let far = |id: u32| {
+            let i = id as usize;
+            if needs_names {
+                self.prefetch_name_position(id);
+            }
+            if let Some(parent) = records.parent.get(i).filter(|_| needs_parent) {
+                prefetch(parent);
+            }
+            if let Some(flags) = records.flags.get(i).filter(|_| skip_kind.is_some()) {
+                prefetch(flags);
+            }
+        };
+        let near = |id: u32| {
+            if needs_names {
+                self.prefetch_name(id);
+            }
+        };
+
+        self.sorted
+            .par_chunks(4096)
+            .flat_map_iter(|chunk| {
+                let mut hits = Vec::new();
+                prefetched(chunk, far, near, |id| {
+                    if keep(id) {
+                        hits.push(id);
+                    }
+                });
+                hits.into_iter()
             })
             .collect()
     }

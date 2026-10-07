@@ -18,7 +18,7 @@ use memchr::memmem;
 use rayon::prelude::*;
 
 use crate::index::search::{Matcher, Query};
-use crate::index::{SyncPtr, VolumeIndex, FLAG_DIRECTORY, FLAG_IN_USE, MAX_DEPTH};
+use crate::index::{prefetch, SyncPtr, VolumeIndex, FLAG_DIRECTORY, FLAG_IN_USE, MAX_DEPTH};
 use crate::ntfs::ROOT_RECORD;
 
 const DIR_IN_USE: u32 = FLAG_IN_USE | FLAG_DIRECTORY;
@@ -237,6 +237,34 @@ impl Ranker {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as u32);
         (!terms.is_empty()).then_some(Self { terms, now })
+    }
+
+    /// Prefetches the record data [`Ranker::score`] reads, see [`crate::index::prefetched`].
+    #[inline]
+    pub(crate) fn prefetch_record(&self, index: &VolumeIndex, id: u32) {
+        let (r, i) = (&index.records, id as usize);
+        index.prefetch_name_position(id);
+        if let (Some(flags), Some(parent), Some(modified)) =
+            (r.flags.get(i), r.parent.get(i), r.modified.get(i))
+        {
+            prefetch(flags);
+            prefetch(parent);
+            prefetch(modified);
+        }
+    }
+
+    /// Prefetches the name and the folder location, once the record data arrived.
+    #[inline]
+    pub(crate) fn prefetch_name(&self, index: &VolumeIndex, locations: &[u8], id: u32) {
+        index.prefetch_name(id);
+        if let Some(location) = index
+            .records
+            .parent
+            .get(id as usize)
+            .and_then(|&p| locations.get(p as usize))
+        {
+            prefetch(location);
+        }
     }
 
     /// Score of entry `id`, higher is better. `locations` comes from
