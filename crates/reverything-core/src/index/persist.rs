@@ -262,6 +262,7 @@ impl VolumeIndex {
             sorted: sorted.into(),
             garbage: 0,
             locations: Default::default(),
+            folder_ranks: Default::default(),
         };
         info_span!("load.names").in_scope(|| index.place_names())?;
         info_span!("load.validate").in_scope(|| index.validate())?;

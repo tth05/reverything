@@ -7,6 +7,7 @@
 pub mod build;
 pub mod exclude;
 pub mod filter;
+pub mod folders;
 pub mod persist;
 pub mod rank;
 pub mod search;
@@ -281,6 +282,9 @@ pub struct VolumeIndex {
     /// Location of every directory for ranking, see [`VolumeIndex::locations`]. Dropped when
     /// directories change.
     pub locations: Mutex<Option<Arc<Vec<u8>>>>,
+    /// Folder order for sorting by folder, see [`VolumeIndex::folder_ranks`]. Dropped when
+    /// directories change.
+    pub folder_ranks: Mutex<Option<Arc<Vec<u32>>>>,
 }
 
 impl VolumeIndex {
@@ -297,6 +301,7 @@ impl VolumeIndex {
             sorted: Arc::default(),
             garbage: 0,
             locations: Mutex::default(),
+            folder_ranks: Mutex::default(),
         }
     }
 

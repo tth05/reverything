@@ -226,6 +226,9 @@ impl VolumeIndex {
         drop(records);
 
         info_span!("update.locations").in_scope(|| self.update_locations(&directories));
+        if !directories.is_empty() {
+            *self.folder_ranks.get_mut().unwrap() = None;
+        }
         self.next_usn = next_usn;
         if !touched.is_empty() {
             info_span!("update.resort").in_scope(|| self.resort(touched, before));

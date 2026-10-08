@@ -232,6 +232,7 @@ pub fn scan_volume(volume: Volume, opts: &ScanOptions) -> Result<(VolumeIndex, S
         sorted: Default::default(),
         garbage: 0,
         locations: Default::default(),
+        folder_ranks: Default::default(),
     };
     index.sort_and_compact();
     stats.sort = t.elapsed();

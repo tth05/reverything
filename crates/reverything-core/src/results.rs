@@ -29,6 +29,8 @@ pub(crate) enum Order {
     Modified,
     Created,
     Attributes,
+    /// Folder order within a volume, see [`crate::index::folders`]; across volumes by volume
+    Path,
 }
 
 /// The hits of one volume, in their final order.
@@ -45,8 +47,6 @@ pub struct Results {
     descending: bool,
     total: usize,
     lists: Vec<List>,
-    /// All hits in their final order, for orders too expensive to compare lazily (paths)
-    flat: Option<Vec<Hit>>,
 }
 
 impl Default for Results {
@@ -56,7 +56,6 @@ impl Default for Results {
             descending: false,
             total: 0,
             lists: Vec::new(),
-            flat: None,
         }
     }
 }
@@ -69,18 +68,6 @@ impl Results {
             descending,
             total: lists.iter().map(|l| l.ids.len()).sum(),
             lists,
-            flat: None,
-        }
-    }
-
-    pub(crate) fn flat(mut hits: Vec<Hit>, descending: bool) -> Self {
-        if descending {
-            hits.reverse();
-        }
-        Self {
-            total: hits.len(),
-            flat: Some(hits),
-            ..Self::default()
         }
     }
 
@@ -103,9 +90,6 @@ impl Results {
         let _span = info_span!("search.page").entered();
         let start = start.min(self.total);
         let end = start.saturating_add(count).min(self.total);
-        if let Some(flat) = &self.flat {
-            return flat[start..end].to_vec();
-        }
         if self.descending {
             let mut hits = self.ascending(indices, self.total - end, self.total - start);
             hits.reverse();
@@ -258,6 +242,8 @@ impl Results {
             Order::Size => record().map_or(0, |i| r.size[i]),
             Order::Modified => record().map_or(0, |i| r.modified[i] as u64),
             Order::Created => record().map_or(0, |i| r.created[i] as u64),
+            // The lists are in folder order, only volumes need comparing
+            Order::Path => list.volume as u64,
             Order::Attributes => {
                 record().map_or(0, |i| (r.flags[i] & crate::index::ATTRIBUTE_MASK) as u64)
             }

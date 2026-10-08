@@ -1,16 +1,13 @@
 //! Searching all volumes and ordering the combined results.
 
-use std::cmp::Ordering;
-use std::mem::MaybeUninit;
-use std::ops::Deref;
 use std::sync::{Arc, RwLockReadGuard};
 
 use rayon::prelude::*;
 use tracing::info_span;
 
+use crate::index::folders::NO_RANK;
 use crate::index::rank::{group_by_score, Ranker};
 use crate::index::search::{FolderExclusion, Query};
-use crate::index::sort::{cmp_names, sort_key};
 use crate::index::{prefetch, prefetched, VolumeIndex};
 use crate::results::{List, Order, Results};
 use crate::service::IndexSet;
@@ -55,10 +52,6 @@ impl Default for Sort {
         }
     }
 }
-
-/// Building full paths for millions of results is too slow and memory hungry, so sorting by
-/// path is limited to result sets below this size.
-pub const MAX_PATH_SORT: usize = 1_000_000;
 
 /// Per volume bitsets of the directories a query's folder exclusions leave out, for
 /// [`search_all`]. Resolving them walks every directory, so callers may cache the result.
@@ -125,7 +118,6 @@ pub fn search_all_cancellable(
     }
 
     let descending = !sort.ascending;
-    let total = per_volume.iter().map(|(_, ids)| ids.len()).sum::<usize>();
     let list = |volume, ids| List {
         volume,
         ids,
@@ -221,19 +213,30 @@ pub fn search_all_cancellable(
             |i, id| (i.flags(id) & crate::index::ATTRIBUTE_MASK) as u64,
             |i, id| prefetch_at(&i.records.flags, id),
         ),
-        SortColumn::Path if total <= MAX_PATH_SORT => {
-            let mut lists = vec![&[][..]; indices.len()];
-            for (v, ids) in &per_volume {
-                lists[*v] = ids.as_slice();
-            }
-            let mut hits = info_span!("search.merge").in_scope(|| merge_by_name(&indices, &lists));
-            hits.par_sort_by_cached_key(|&h| {
-                let (v, id) = hit_parts(h);
-                indices[v].folder_path(id).to_lowercase()
+        SortColumn::Path => {
+            // Cached until directories change, built for all volumes at once otherwise
+            let all_ranks = info_span!("search.folders").in_scope(|| {
+                per_volume
+                    .par_iter()
+                    .map(|(v, _)| indices[*v].folder_ranks())
+                    .collect::<Vec<_>>()
             });
-            Results::flat(hits, descending)
+            let lists = per_volume
+                .into_iter()
+                .zip(all_ranks)
+                .map(|((v, ids), ranks)| {
+                    let index = &*indices[v];
+                    let folder = |id: u32| {
+                        let rank = ranks.get(index.parent(id) as usize).copied();
+                        rank.unwrap_or(NO_RANK) as u64
+                    };
+                    let parent = |id| prefetch_at(&index.records.parent, id);
+                    list(v, Arc::new(sort_by_key(&ids, folder, parent)))
+                })
+                .collect();
+            Results::lazy(Order::Path, descending, lists)
         }
-        SortColumn::Name | SortColumn::Path => Results::lazy(
+        SortColumn::Name => Results::lazy(
             Order::Name,
             descending,
             per_volume
@@ -304,190 +307,11 @@ fn sort_by_key(
         .collect()
 }
 
-/// Merges the per volume results, which are each in name order, into one list ordered by name,
-/// then volume, then position in the volume's list. `lists` is indexed by volume slot.
-///
-/// The lists are cut into ranges of about equal size at common split keys, and each range is
-/// merged on its own thread straight into its part of the output.
-fn merge_by_name<I>(indices: &[I], lists: &[&[u32]]) -> Vec<Hit>
-where
-    I: Deref<Target = VolumeIndex> + Sync,
-{
-    let lists = lists
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| !l.is_empty())
-        .map(|(v, &l)| (v, l))
-        .collect::<Vec<_>>();
-    let total = lists.iter().map(|(_, l)| l.len()).sum::<usize>();
-    match lists.as_slice() {
-        [] => return Vec::new(),
-        &[(v, list)] => return list.par_iter().map(|&id| hit(v, id)).collect(),
-        _ => {}
-    }
-
-    // Split keys taken evenly from the largest list
-    let ranges = (total / MIN_MERGE_RANGE).clamp(1, rayon::current_num_threads() * 8);
-    let &(big_v, big) = lists.iter().max_by_key(|(_, l)| l.len()).unwrap();
-    let mut cuts = vec![vec![0usize; lists.len()]];
-    for r in 1..ranges {
-        let split = (big_v, big[big.len() * r / ranges]);
-        cuts.push(
-            lists
-                .iter()
-                .map(|&(v, list)| {
-                    list.partition_point(|&id| cmp_hits(indices, (v, id), split) == Ordering::Less)
-                })
-                .collect(),
-        );
-    }
-    cuts.push(lists.iter().map(|(_, l)| l.len()).collect());
-
-    let mut out = Vec::<Hit>::with_capacity(total);
-    let mut rest = &mut out.spare_capacity_mut()[..total];
-    let mut jobs = Vec::with_capacity(ranges);
-    for w in cuts.windows(2) {
-        let parts = lists
-            .iter()
-            .enumerate()
-            .map(|(i, &(v, list))| (v, &list[w[0][i]..w[1][i]]))
-            .collect::<Vec<_>>();
-        let len = parts.iter().map(|(_, p)| p.len()).sum::<usize>();
-        let (dst, tail) = std::mem::take(&mut rest).split_at_mut(len);
-        rest = tail;
-        jobs.push((parts, dst));
-    }
-    jobs.into_par_iter()
-        .for_each(|(parts, dst)| merge_into(indices, &parts, dst));
-    // SAFETY: every range wrote exactly as many hits as its parts hold, and the ranges cover
-    // the whole output
-    unsafe { out.set_len(total) };
-    out
-}
-
-/// Ranges smaller than this are not worth a task of their own
-const MIN_MERGE_RANGE: usize = 1 << 16;
-
-/// Order of [`merge_by_name`] for entries of different lists.
-#[inline]
-fn cmp_hits<I: Deref<Target = VolumeIndex>>(
-    indices: &[I],
-    (va, a): (usize, u32),
-    (vb, b): (usize, u32),
-) -> Ordering {
-    if va == vb {
-        return indices[va].cmp_entries(a, b);
-    }
-    cmp_names(indices[va].name(a), indices[vb].name(b)).then(va.cmp(&vb))
-}
-
-/// The next entry of a list in [`merge_into`], with its name and sort key at hand.
-struct Head<'a> {
-    key: u64,
-    name: &'a [u8],
-    volume: usize,
-    list: &'a [u32],
-}
-
-impl<'a> Head<'a> {
-    fn new(index: &'a VolumeIndex, volume: usize, list: &'a [u32]) -> Self {
-        let name = index.name(list[0]);
-        Self {
-            key: sort_key(name),
-            name,
-            volume,
-            list,
-        }
-    }
-
-    /// Whether this entry comes before `other`'s, which is in another list.
-    #[inline]
-    fn before(&self, other: &Head) -> bool {
-        self.key
-            .cmp(&other.key)
-            .then_with(|| cmp_names(self.name, other.name))
-            .then(self.volume.cmp(&other.volume))
-            == Ordering::Less
-    }
-}
-
-/// k-way merge of `parts` into `dst`, which has room for exactly all of them.
-fn merge_into<I: Deref<Target = VolumeIndex>>(
-    indices: &[I],
-    parts: &[(usize, &[u32])],
-    dst: &mut [MaybeUninit<Hit>],
-) {
-    let mut heads = parts
-        .iter()
-        .filter(|(_, p)| !p.is_empty())
-        .map(|&(v, p)| Head::new(&indices[v], v, p))
-        .collect::<Vec<_>>();
-    let mut out = 0;
-    while heads.len() > 1 {
-        // The smallest head, and the runner-up it is emitted against
-        let (mut first, mut second) = if heads[1].before(&heads[0]) {
-            (1, 0)
-        } else {
-            (0, 1)
-        };
-        for h in 2..heads.len() {
-            if heads[h].before(&heads[first]) {
-                (first, second) = (h, first);
-            } else if heads[h].before(&heads[second]) {
-                second = h;
-            }
-        }
-        let (head, limit) = if first < second {
-            let (a, b) = heads.split_at_mut(second);
-            (&mut a[first], &b[0])
-        } else {
-            let (a, b) = heads.split_at_mut(first);
-            (&mut b[0], &a[second])
-        };
-        // Emit from the smallest list while it stays ahead of the runner-up
-        let index = &indices[head.volume];
-        loop {
-            dst[out].write(hit(head.volume, head.list[0]));
-            out += 1;
-            head.list = &head.list[1..];
-            let Some(&id) = head.list.first() else {
-                break;
-            };
-            head.name = index.name(id);
-            head.key = sort_key(head.name);
-            if !head.before(limit) {
-                break;
-            }
-        }
-        if head.list.is_empty() {
-            heads.swap_remove(first);
-        }
-    }
-    if let Some(last) = heads.first() {
-        for (d, &id) in dst[out..].iter_mut().zip(last.list) {
-            d.write(hit(last.volume, id));
-        }
-        out += last.list.len();
-    }
-    // set_len in merge_by_name relies on this
-    assert_eq!(out, dst.len());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::sort::cmp_names;
     use crate::index::testing::{names, volume};
-
-    /// The order merge_by_name promises, by sorting everything
-    fn reference(indices: &[&VolumeIndex], lists: &[&[u32]]) -> Vec<Hit> {
-        let mut all = lists
-            .iter()
-            .enumerate()
-            .flat_map(|(v, l)| l.iter().map(move |&id| (v, id)))
-            .collect::<Vec<_>>();
-        all.sort_by(|&a, &b| cmp_hits(indices, a, b));
-        all.into_iter().map(|(v, id)| hit(v, id)).collect()
-    }
 
     /// Same as a stable sort, also with keys too large to pack whole and with many equal keys
     #[test]
@@ -515,41 +339,6 @@ mod tests {
             assert_eq!(sort_by_key(&ids, key, |_| {}), expected);
         }
         assert!(sort_by_key(&[], |_| 0, |_| {}).is_empty());
-    }
-
-    #[test]
-    fn merge_matches_sorting() {
-        let volumes = [
-            volume('A', &names(1, 70_000)),
-            volume('B', &names(2, 130_000)),
-            volume('C', &[]),
-            volume('D', &names(3, 900)),
-            volume('E', &names(4, 1)),
-        ];
-        let indices = volumes.iter().collect::<Vec<_>>();
-        let all = indices
-            .iter()
-            .map(|i| i.sorted.as_slice())
-            .collect::<Vec<_>>();
-        assert_eq!(merge_by_name(&indices, &all), reference(&indices, &all));
-
-        // Subsets, as a search returns them
-        let every = |k: usize| {
-            indices
-                .iter()
-                .map(|i| i.sorted.iter().copied().step_by(k).collect::<Vec<_>>())
-                .collect::<Vec<_>>()
-        };
-        for k in [2, 7, 1000] {
-            let owned = every(k);
-            let lists = owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
-            assert_eq!(merge_by_name(&indices, &lists), reference(&indices, &lists));
-        }
-
-        // A single list and no lists
-        let only = [&[][..], &indices[1].sorted[..]];
-        assert_eq!(merge_by_name(&indices, &only), reference(&indices, &only));
-        assert!(merge_by_name(&indices, &[&[][..]; 3]).is_empty());
     }
 
     /// Checks pages at many positions, in both directions, against sorting everything by
