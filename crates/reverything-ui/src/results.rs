@@ -22,6 +22,9 @@ use crate::view::{
 
 /// Rows fetched per request
 const PAGE: usize = 256;
+/// How long the shown results have to be unchanged before an answer for input that was typed
+/// over is shown anyway
+const SHOW_OUTDATED_AFTER: Duration = Duration::from_millis(250);
 /// Compact rows, smaller than the table's smallest preset (26px)
 pub const ROW_SIZE: gpui_kit::component::Size = gpui_kit::component::Size::Size(px(24.));
 /// Cells get 4px vertical padding at custom sizes, the text has to fit in the rest. 16px is
@@ -158,9 +161,13 @@ pub struct Results {
     pub folders: bool,
     /// Incremented for every search we start
     seq: u64,
-    /// `seq` of the search whose results are shown. While typing, a response is shown if it is
-    /// newer than that, even if an even newer search is on its way.
+    /// `seq` of the search whose results are shown
     shown_seq: u64,
+    /// When the shown results changed
+    shown_at: Instant,
+    /// What the newest search asked for: an answer for the same input is current, even if it
+    /// comes from an earlier search
+    input: (String, Sort, bool, bool),
     /// The newest search has not been answered yet
     searching: bool,
     /// Id of the result set on the service side
@@ -196,6 +203,8 @@ impl Results {
             folders: true,
             seq: 0,
             shown_seq: 0,
+            shown_at: Instant::now(),
+            input: (String::new(), Sort::default(), true, true),
             searching: false,
             search: 0,
             total: 0,
@@ -259,6 +268,8 @@ impl Results {
             folders: self.folders,
             rows: PAGE as u32,
         };
+        let input = (self.query.clone(), self.sort(), self.files, self.folders);
+        self.input = input.clone();
 
         let t = Instant::now();
         let response = self.client.send(request);
@@ -274,7 +285,14 @@ impl Results {
                 if seq < results.shown_seq {
                     return;
                 }
+                // Results for text that was typed over flash up for a frame before the current
+                // ones replace them. They are only shown if nothing changed for a while, as a
+                // sign of progress while a slow search keeps being replaced.
+                if input != results.input && results.shown_at.elapsed() < SHOW_OUTDATED_AFTER {
+                    return;
+                }
                 results.shown_seq = seq;
+                results.shown_at = Instant::now();
                 results.searching = seq != results.seq;
                 match response {
                     Ok(Response::Search {
