@@ -122,6 +122,7 @@ impl Server {
                 sort,
                 files,
                 folders,
+                rows,
             } => {
                 // Clients that never say whether they are active (the command line) are active
                 // while connected
@@ -163,6 +164,7 @@ impl Server {
                     search: session.search,
                     total: session.results.len() as u64,
                     took_us,
+                    rows: self.rows(session, 0, rows.min(MAX_ROWS_PER_REQUEST) as usize),
                 }
             }
             Request::Rows {

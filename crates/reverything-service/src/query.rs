@@ -50,11 +50,13 @@ pub fn run(query: &str) -> Result<()> {
         },
         files: std::env::var_os("RV_QUERY_NO_FILES").is_none(),
         folders: std::env::var_os("RV_QUERY_NO_FOLDERS").is_none(),
+        rows: 0,
     })? {
         Response::Search {
             search,
             total,
             took_us,
+            ..
         } => (search, total, took_us),
         other => bail!("Unexpected response {:?}", other),
     };

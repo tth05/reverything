@@ -14,7 +14,7 @@ use reverything_protocol::{Request, Response, Row, Sort, SortColumn};
 
 use crate::client::ServiceClient;
 use crate::format;
-use crate::icons::FileIcons;
+use crate::icons::{FileIcons, Loaded};
 use crate::settings::{ColumnSetting, Settings};
 use crate::view::{
     CopyFile, CopyName, CopyPath, DeleteSelected, OpenSelected, RevealSelected, ShowProperties,
@@ -156,8 +156,13 @@ pub struct Results {
     /// Include files and folders in the results
     pub files: bool,
     pub folders: bool,
-    /// Incremented for every search we start, to drop responses of outdated ones
+    /// Incremented for every search we start
     seq: u64,
+    /// `seq` of the search whose results are shown. While typing, a response is shown if it is
+    /// newer than that, even if an even newer search is on its way.
+    shown_seq: u64,
+    /// The newest search has not been answered yet
+    searching: bool,
     /// Id of the result set on the service side
     search: u64,
     total: usize,
@@ -168,6 +173,8 @@ pub struct Results {
     pending: HashSet<usize>,
     visible: Range<usize>,
     icons: FileIcons,
+    /// Icons loaded in the background, until the table listens for them
+    loaded_icons: Option<async_channel::Receiver<Loaded>>,
     /// Row the context menu was opened for
     pub menu_row: Option<usize>,
     /// Row and position of a left button press that may turn into dragging the entry out
@@ -179,6 +186,7 @@ pub struct Results {
 
 impl Results {
     pub fn new(client: Arc<ServiceClient>, columns: &[ColumnSetting]) -> Self {
+        let (icons, loaded_icons) = FileIcons::new();
         Self {
             client,
             columns: columns_from_settings(columns),
@@ -187,13 +195,16 @@ impl Results {
             files: true,
             folders: true,
             seq: 0,
+            shown_seq: 0,
+            searching: false,
             search: 0,
             total: 0,
             pages: HashMap::new(),
             stale: HashMap::new(),
             pending: HashSet::new(),
             visible: 0..0,
-            icons: FileIcons::default(),
+            icons,
+            loaded_icons: Some(loaded_icons),
             menu_row: None,
             drag_start: None,
             last_search: None,
@@ -204,6 +215,11 @@ impl Results {
 
     pub fn total(&self) -> usize {
         self.total
+    }
+
+    /// Whether the newest search or rows of it are still on their way
+    pub fn busy(&self) -> bool {
+        self.searching || !self.pending.is_empty()
     }
 
     pub fn row(&self, ix: usize) -> Option<&Row> {
@@ -234,33 +250,38 @@ impl Results {
     ) {
         self.query = query.clone();
         self.seq += 1;
+        self.searching = true;
         let seq = self.seq;
         let request = Request::Search {
             query,
             sort: self.sort(),
             files: self.files,
             folders: self.folders,
+            rows: PAGE as u32,
         };
 
-        let client = self.client.clone();
-        let task = cx.background_executor().spawn(async move {
-            let t = Instant::now();
-            let response = client.request(&request);
-            (response, t.elapsed())
-        });
+        let t = Instant::now();
+        let response = self.client.send(request);
 
         cx.spawn(async move |table, cx| {
-            let (response, round_trip) = task.await;
+            // A newer search replaced this one before it was sent
+            let Some(response) = response.await else {
+                return;
+            };
+            let round_trip = t.elapsed();
             let _ = table.update(cx, |table, cx| {
                 let results = table.delegate_mut();
-                if results.seq != seq {
+                if seq < results.shown_seq {
                     return;
                 }
+                results.shown_seq = seq;
+                results.searching = seq != results.seq;
                 match response {
                     Ok(Response::Search {
                         search,
                         total,
                         took_us,
+                        rows,
                     }) => {
                         results.search = search;
                         results.total = total as usize;
@@ -273,6 +294,11 @@ impl Results {
                             results.stale.extend(pages);
                         }
                         results.pending.clear();
+                        // The first page comes with the answer
+                        if !rows.is_empty() {
+                            results.stale.remove(&0);
+                            results.pages.insert(0, rows);
+                        }
                         results.error = None;
                         results.last_search = Some(SearchTiming {
                             service: Duration::from_micros(took_us),
@@ -322,27 +348,25 @@ impl Results {
 
     fn fetch_page(&mut self, page: usize, cx: &mut Context<TableState<Self>>) {
         let search = self.search;
-        let client = self.client.clone();
         let request = Request::Rows {
             search,
             start: (page * PAGE) as u64,
             count: PAGE as u32,
         };
-        let task = cx.background_executor().spawn(async move {
-            let t = Instant::now();
-            let response = client.request(&request);
-            (response, t.elapsed())
-        });
+        let t = Instant::now();
+        let response = self.client.send(request);
 
         cx.spawn(async move |table, cx| {
-            let (response, took) = task.await;
+            // Dropped when a newer result set arrived first, `None` like an error then
+            let response = response.await;
+            let took = t.elapsed();
             let _ = table.update(cx, |table, cx| {
                 let results = table.delegate_mut();
                 if results.search != search {
                     return;
                 }
                 results.pending.remove(&page);
-                if let Ok(Response::Rows { rows, .. }) = response {
+                if let Some(Ok(Response::Rows { rows, .. })) = response {
                     results.stale.remove(&page);
                     results.pages.insert(page, rows);
                     results.last_page = Some(took);
@@ -510,6 +534,21 @@ impl TableDelegate for Results {
         }
 
         let (name, directory, matched) = (row.name.clone(), row.directory, row.highlights.clone());
+        if let Some(loaded) = self.loaded_icons.take() {
+            // Repaints with each icon that arrives
+            cx.spawn(async move |table, cx| {
+                while let Ok(icon) = loaded.recv().await {
+                    let updated = table.update(cx, |table, cx| {
+                        table.delegate_mut().icons.insert(icon);
+                        cx.notify();
+                    });
+                    if updated.is_err() {
+                        return;
+                    }
+                }
+            })
+            .detach();
+        }
         let icon = match self.icons.get(&name, directory) {
             Some(image) => img(image).size_4().flex_shrink_0().into_any_element(),
             None => Icon::new(if directory {

@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 reverything-core.workspace = true
+reverything-protocol.workspace = true
 eyre.workspace = true
 mimalloc.workspace = true
 rayon.workspace = true

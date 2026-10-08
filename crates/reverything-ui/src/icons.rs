@@ -1,8 +1,11 @@
 //! The icons Explorer shows for files, looked up by extension so no file has to be touched.
+//!
+//! The shell can take tens of milliseconds per lookup, so they run on a thread of their own and
+//! the table shows a generic icon until the real one arrived.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 use gpui_kit::RenderImage;
 use image::{Frame, RgbaImage};
@@ -12,6 +15,7 @@ use windows::Win32::Graphics::Gdi::{
     BI_RGB, DIB_RGB_COLORS, HBITMAP, HGDIOBJ,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Shell::{
     SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
 };
@@ -21,37 +25,81 @@ use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, I
 /// generic icon for now.
 const PER_FILE: [&str; 5] = ["exe", "ico", "lnk", "url", "cur"];
 
-#[derive(Default)]
+/// Cache key of the folder icon, which no extension can collide with
+const FOLDER: &str = "/";
+
+/// A loaded icon for a cache key, `None` if the shell had none
+pub type Loaded = (String, Option<Arc<RenderImage>>);
+
 pub struct FileIcons {
-    by_extension: HashMap<String, Option<Arc<RenderImage>>>,
-    folder: Option<Option<Arc<RenderImage>>>,
+    /// By lowercase extension or [`FOLDER`]. `None` while the lookup runs.
+    cache: HashMap<String, Option<Option<Arc<RenderImage>>>>,
+    /// Cache key, name and attributes to look up
+    loader: mpsc::Sender<(String, String, u32)>,
 }
 
 impl FileIcons {
+    /// Starts the loader thread. Loaded icons arrive on the returned channel and go to
+    /// [`FileIcons::insert`].
+    pub fn new() -> (Self, async_channel::Receiver<Loaded>) {
+        let (loader, requests) = mpsc::channel::<(String, String, u32)>();
+        let (loaded, receiver) = async_channel::unbounded();
+        std::thread::Builder::new()
+            .name("icons".into())
+            .spawn(move || {
+                // SHGetFileInfoW needs COM
+                unsafe {
+                    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                }
+                for (key, name, attributes) in requests {
+                    if loaded
+                        .send_blocking((key, load(&name, attributes)))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            })
+            .expect("Failed to start the icon thread");
+        let mut icons = Self {
+            cache: HashMap::new(),
+            loader,
+        };
+        // Most rows need one of these
+        icons.request(FOLDER.into(), "folder".into(), FILE_ATTRIBUTE_DIRECTORY.0);
+        icons.request(String::new(), "file".into(), FILE_ATTRIBUTE_NORMAL.0);
+        (icons, receiver)
+    }
+
+    /// The icon for an entry, `None` until it is loaded or if there is none.
     pub fn get(&mut self, name: &str, directory: bool) -> Option<Arc<RenderImage>> {
         if directory {
-            return self
-                .folder
-                .get_or_insert_with(|| load("folder", FILE_ATTRIBUTE_DIRECTORY.0))
-                .clone();
+            return self.cache.get(FOLDER).cloned().flatten().flatten();
         }
-
         let extension = name
             .rsplit_once('.')
             .map(|(_, ext)| ext.to_ascii_lowercase())
             .filter(|ext| !ext.is_empty() && ext.len() <= 16)
             .unwrap_or_default();
-        if let Some(icon) = self.by_extension.get(&extension) {
-            return icon.clone();
+        if let Some(icon) = self.cache.get(&extension) {
+            return icon.clone().flatten();
         }
         let lookup = if PER_FILE.contains(&extension.as_str()) || extension.is_empty() {
             "file".to_string()
         } else {
             format!("file.{}", extension)
         };
-        let icon = load(&lookup, FILE_ATTRIBUTE_NORMAL.0);
-        self.by_extension.insert(extension, icon.clone());
-        icon
+        self.request(extension, lookup, FILE_ATTRIBUTE_NORMAL.0);
+        None
+    }
+
+    fn request(&mut self, key: String, name: String, attributes: u32) {
+        self.cache.insert(key.clone(), None);
+        let _ = self.loader.send((key, name, attributes));
+    }
+
+    pub fn insert(&mut self, (key, icon): Loaded) {
+        self.cache.insert(key, Some(icon));
     }
 }
 

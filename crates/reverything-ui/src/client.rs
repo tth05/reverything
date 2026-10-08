@@ -1,27 +1,36 @@
-//! Shared connection to the service. Requests block, so they run on GPUI's background
-//! executor; the mutex keeps them in order on the single pipe.
+//! Shared connection to the service. One worker thread owns the pipe and decides what to send
+//! next, so the newest search does not wait behind outdated ones, see
+//! [`reverything_protocol::pipeline`].
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
+use reverything_protocol::pipeline::{Pipeline, Reply, Transport};
 use reverything_protocol::{Client, Request, Response};
 
 pub struct ServiceClient {
-    client: Mutex<Option<Client>>,
-    connect_time: Mutex<Option<Duration>>,
+    pipeline: Pipeline,
     /// Whether the window is active. The service only keeps the index loaded and live while a
     /// client is active, so this is sent on every new connection.
-    active: AtomicBool,
+    active: Arc<AtomicBool>,
 }
 
 impl ServiceClient {
     pub fn new(active: bool) -> Self {
-        Self {
-            client: Mutex::new(None),
-            connect_time: Mutex::new(None),
-            active: AtomicBool::new(active),
-        }
+        let active = Arc::new(AtomicBool::new(active));
+        let greeting = active.clone();
+        let pipeline = Pipeline::new(
+            || Ok(Box::new(Client::connect()?) as Box<dyn Transport>),
+            // Sent before anything else, a search would otherwise count as active
+            move || {
+                Some(Request::SetActive {
+                    active: greeting.load(Ordering::SeqCst),
+                })
+            },
+        );
+        Self { pipeline, active }
     }
 
     /// Tells the service whether the window is active.
@@ -30,37 +39,34 @@ impl ServiceClient {
         self.request(&Request::SetActive { active }).map(|_| ())
     }
 
-    /// Sends a request, connecting first if needed. A failed request drops the connection so the
-    /// next one reconnects, e.g. after the service restarted.
+    /// Sends a request and waits for the answer, for requests that are never replaced
+    /// (everything but searches, rows and status).
     pub fn request(&self, request: &Request) -> Result<Response, String> {
-        let mut client = self.client.lock().unwrap();
-        if client.is_none() {
-            let t = Instant::now();
-            let mut connected = Client::connect().map_err(describe)?;
-            *self.connect_time.lock().unwrap() = Some(t.elapsed());
-            // Sent before anything else, a search would otherwise count as active
-            if !matches!(request, Request::SetActive { .. }) {
-                let active = self.active.load(Ordering::SeqCst);
-                connected
-                    .request(&Request::SetActive { active })
-                    .map_err(describe)?;
-            }
-            *client = Some(connected);
+        let receiver = self.pipeline.send(request.clone());
+        match receiver.recv_blocking() {
+            Ok(reply) => convert(reply),
+            Err(_) => Err("The request was dropped".into()),
         }
+    }
 
-        match client.as_mut().unwrap().request(request) {
-            Ok(Response::Error(e)) => Err(e),
-            Ok(response) => Ok(response),
-            Err(e) => {
-                *client = None;
-                Err(describe(e))
-            }
-        }
+    /// Queues a request. Resolves to `None` if a newer request made it obsolete before it was
+    /// sent: a newer search, or for rows, a newer result set.
+    pub fn send(&self, request: Request) -> impl Future<Output = Option<Result<Response, String>>> {
+        let receiver = self.pipeline.send(request);
+        async move { receiver.recv().await.ok().map(convert) }
     }
 
     /// How long establishing the last connection took
     pub fn connect_time(&self) -> Option<Duration> {
-        *self.connect_time.lock().unwrap()
+        self.pipeline.connect_time()
+    }
+}
+
+fn convert(reply: Reply) -> Result<Response, String> {
+    match reply {
+        Ok(Response::Error(e)) => Err(e),
+        Ok(response) => Ok(response),
+        Err(e) => Err(describe(e)),
     }
 }
 

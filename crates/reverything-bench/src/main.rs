@@ -9,6 +9,8 @@
 //!     compares two saved runs
 //! reverything-bench journal [--dir DIR] [--volume C] [--runs N]
 //!     times applying batches of journal changes to one volume
+//! reverything-bench replay serial|pipeline [--interval MS]
+//!     types queries against a running service (REVERYTHING_PIPE), see replay.rs
 //! ```
 //!
 //! The saved indices come from the elevated `reverything-service --bench`, which writes them
@@ -26,6 +28,7 @@ use reverything_core::index::persist::dev_db_dir;
 
 mod journal;
 mod phases;
+mod replay;
 mod search;
 mod synth;
 
@@ -70,6 +73,10 @@ fn main() -> Result<()> {
                 value("--runs").map_or(Ok(5), str::parse)?,
             )
         }
+        Some("replay") if args.len() >= 2 => replay::run(
+            &args[1],
+            std::time::Duration::from_millis(value("--interval").map_or(Ok(80), str::parse)?),
+        ),
         Some("compare") if args.len() == 3 => search::compare(args[1].as_ref(), args[2].as_ref()),
         _ => bail!("Usage: see the top of crates/reverything-bench/src/main.rs"),
     }

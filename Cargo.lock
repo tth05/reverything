@@ -6120,6 +6120,7 @@ dependencies = [
  "mimalloc",
  "rayon",
  "reverything-core",
+ "reverything-protocol",
  "serde",
  "serde_json",
  "tracing",
@@ -6145,6 +6146,7 @@ dependencies = [
 name = "reverything-protocol"
 version = "1.0.1"
 dependencies = [
+ "async-channel",
  "postcard",
  "serde",
 ]

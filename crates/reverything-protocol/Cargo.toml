@@ -9,3 +9,4 @@ publish = false
 [dependencies]
 serde.workspace = true
 postcard.workspace = true
+async-channel = "2.5.0"

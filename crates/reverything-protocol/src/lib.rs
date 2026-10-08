@@ -6,6 +6,8 @@
 
 use std::io::{self, Read, Write};
 
+pub mod pipeline;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +26,7 @@ pub fn pipe_name() -> String {
 }
 
 /// Bumped on incompatible changes. Clients and the service have to agree on it.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Upper bound for requests, which come from less privileged processes
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -47,6 +49,9 @@ pub enum Request {
         files: bool,
         /// Include folders
         folders: bool,
+        /// How many rows from the top to send with the answer, so they can be shown without
+        /// asking for them (at most [`MAX_ROWS_PER_REQUEST`])
+        rows: u32,
     },
     /// Rows `start..start + count` of the result set with id `search`
     Rows {
@@ -79,6 +84,8 @@ pub enum Response {
         search: u64,
         total: u64,
         took_us: u64,
+        /// The first rows, as many as asked for
+        rows: Vec<Row>,
     },
     Rows {
         search: u64,
@@ -310,6 +317,7 @@ mod tests {
             sort: Sort::default(),
             files: true,
             folders: false,
+            rows: 256,
         };
         write_message(&mut buf, &request).unwrap();
         let decoded: Request = read_message(&mut buf.as_slice(), MAX_REQUEST_BYTES).unwrap();

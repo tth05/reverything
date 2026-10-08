@@ -547,17 +547,13 @@ impl MainView {
         self.polling = true;
         let client = self.client.clone();
         cx.spawn_in(window, async move |view, cx| loop {
-            let task = cx.background_executor().spawn({
-                let client = client.clone();
-                async move {
-                    let t = Instant::now();
-                    (client.request(&Request::Status), t.elapsed())
-                }
-            });
-            let (response, round_trip) = task.await;
+            let t = Instant::now();
+            // Only this loop asks for the status, so nothing replaces the request
+            let response = client.send(Request::Status).await;
+            let round_trip = t.elapsed();
 
             let alive = view.update_in(cx, |view, window, cx| {
-                match response {
+                match response.unwrap_or_else(|| Err("The status request was dropped".into())) {
                     Ok(Response::Status(status)) => {
                         let reconnected = view.status.is_none() && view.status_error.is_some();
                         let changed = view
@@ -569,8 +565,12 @@ impl MainView {
                         view.status_error = None;
                         view.status_round_trip = Some(round_trip);
 
-                        // After reconnecting the results may be empty or stale
+                        // After reconnecting the results may be empty or stale. A refresh
+                        // waits until the current search and its rows arrived: it would
+                        // replace the result set they come from.
+                        let busy = view.table.read(cx).delegate().busy();
                         let refresh = changed
+                            && !busy
                             && (new_volumes
                                 || view.activated_at.elapsed() < ACTIVATION_REFRESH
                                 || view.last_search.elapsed() >= REFRESH_INTERVAL);
