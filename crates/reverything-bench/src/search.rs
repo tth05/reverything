@@ -51,6 +51,15 @@ const QUERIES: &[(&str, SortColumn)] = &[
     (r"!C:\Windows !C:\Users", SortColumn::Relevance),
     ("size:>100mb", SortColumn::Relevance),
     ("dm:today", SortColumn::Relevance),
+    // Sorting by a column instead of relevance
+    ("", SortColumn::Size),
+    ("", SortColumn::Modified),
+    ("", SortColumn::Created),
+    ("", SortColumn::Attributes),
+    ("", SortColumn::Path),
+    ("e", SortColumn::Size),
+    ("e", SortColumn::Modified),
+    (".dll", SortColumn::Path),
 ];
 
 #[derive(Serialize, Deserialize)]

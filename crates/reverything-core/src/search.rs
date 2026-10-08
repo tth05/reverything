@@ -11,7 +11,7 @@ use tracing::info_span;
 use crate::index::rank::{group_by_score, Ranker};
 use crate::index::search::{FolderExclusion, Query};
 use crate::index::sort::{cmp_names, sort_key};
-use crate::index::{prefetched, VolumeIndex};
+use crate::index::{prefetch, prefetched, VolumeIndex};
 use crate::results::{List, Order, Results};
 use crate::service::IndexSet;
 
@@ -131,19 +131,17 @@ pub fn search_all_cancellable(
         ids,
         groups: Vec::new(),
     };
-    let by_key =
-        |per_volume: Vec<(usize, Arc<Vec<u32>>)>, order, key: fn(&VolumeIndex, u32) -> u64| {
-            let lists = per_volume
-                .into_iter()
-                .map(|(v, ids)| {
-                    let mut ids = Arc::unwrap_or_clone(ids);
-                    // Stable, so equal keys stay in name order
-                    ids.par_sort_by_key(|&id| key(&indices[v], id));
-                    list(v, Arc::new(ids))
-                })
-                .collect();
-            Results::lazy(order, descending, lists)
-        };
+    let by_key = |per_volume: Vec<(usize, Arc<Vec<u32>>)>, order, key: KeyFn, ahead: PrefetchFn| {
+        let lists = per_volume
+            .into_iter()
+            .map(|(v, ids)| {
+                let index = &*indices[v];
+                let sorted = sort_by_key(&ids, |id| key(index, id), |id| ahead(index, id));
+                list(v, Arc::new(sorted))
+            })
+            .collect();
+        Results::lazy(order, descending, lists)
+    };
     let _sorting = info_span!("search.sort").entered();
     let results = match sort.column {
         SortColumn::Relevance => match Ranker::new(query) {
@@ -199,12 +197,30 @@ pub fn search_all_cancellable(
                     .collect(),
             ),
         },
-        SortColumn::Size => by_key(per_volume, Order::Size, |i, id| i.size(id)),
-        SortColumn::Modified => by_key(per_volume, Order::Modified, |i, id| i.modified(id) as u64),
-        SortColumn::Created => by_key(per_volume, Order::Created, |i, id| i.created(id) as u64),
-        SortColumn::Attributes => by_key(per_volume, Order::Attributes, |i, id| {
-            (i.flags(id) & crate::index::ATTRIBUTE_MASK) as u64
-        }),
+        SortColumn::Size => by_key(
+            per_volume,
+            Order::Size,
+            |i, id| i.size(id),
+            |i, id| prefetch_at(&i.records.size, id),
+        ),
+        SortColumn::Modified => by_key(
+            per_volume,
+            Order::Modified,
+            |i, id| i.modified(id) as u64,
+            |i, id| prefetch_at(&i.records.modified, id),
+        ),
+        SortColumn::Created => by_key(
+            per_volume,
+            Order::Created,
+            |i, id| i.created(id) as u64,
+            |i, id| prefetch_at(&i.records.created, id),
+        ),
+        SortColumn::Attributes => by_key(
+            per_volume,
+            Order::Attributes,
+            |i, id| (i.flags(id) & crate::index::ATTRIBUTE_MASK) as u64,
+            |i, id| prefetch_at(&i.records.flags, id),
+        ),
         SortColumn::Path if total <= MAX_PATH_SORT => {
             let mut lists = vec![&[][..]; indices.len()];
             for (v, ids) in &per_volume {
@@ -227,6 +243,65 @@ pub fn search_all_cancellable(
         ),
     };
     (!cancelled()).then_some(results)
+}
+
+/// The sort key of an entry
+type KeyFn = fn(&VolumeIndex, u32) -> u64;
+/// Prefetches what [`KeyFn`] reads
+type PrefetchFn = fn(&VolumeIndex, u32);
+
+/// Prefetches the element of a record array for entry `id`. Links are rare and left out.
+fn prefetch_at<T>(array: &[T], id: u32) {
+    if let Some(value) = array.get(id as usize) {
+        prefetch(value);
+    }
+}
+
+/// `ids` ordered by `key`, keeping their order for equal keys. `prefetch` asks for the memory
+/// `key` reads.
+///
+/// Every key is read once and packed into a `u64` with the position of its entry, which makes
+/// the order stable, so plain integers are sorted instead of looking up keys in every
+/// comparison. Keys that do not fit next to the position are cut to their high bits; entries
+/// whose cut keys are equal are ordered by their full keys afterwards.
+fn sort_by_key(
+    ids: &[u32],
+    key: impl Fn(u32) -> u64 + Sync,
+    prefetch: impl Fn(u32) + Sync + Copy,
+) -> Vec<u32> {
+    let n = ids.len();
+    let pos_bits = (usize::BITS - n.leading_zeros()).max(1);
+    let pos_mask = (1u64 << pos_bits) - 1;
+    let keys = info_span!("search.sort.keys").entered();
+    let mut packed = ids
+        .par_chunks(4096)
+        .flat_map_iter(|chunk| {
+            let mut keys = Vec::with_capacity(chunk.len());
+            prefetched(chunk, prefetch, |_| {}, |id| keys.push(key(id)));
+            keys.into_iter()
+        })
+        .collect::<Vec<_>>();
+    let max = packed.par_iter().copied().max().unwrap_or(0);
+    let shift = (u64::BITS - max.leading_zeros()).saturating_sub(u64::BITS - pos_bits);
+    packed
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(pos, k)| *k = (*k >> shift) << pos_bits | pos as u64);
+    drop(keys);
+    let sorting = info_span!("search.sort.integers").entered();
+    packed.par_sort_unstable();
+    drop(sorting);
+    if shift > 0 {
+        packed
+            .par_chunk_by_mut(|a, b| a >> pos_bits == b >> pos_bits)
+            .filter(|run| run.len() > 1)
+            .for_each(|run| run.sort_by_key(|&p| key(ids[(p & pos_mask) as usize])));
+    }
+    let _ids = info_span!("search.sort.ids").entered();
+    packed
+        .par_iter()
+        .map(|&p| ids[(p & pos_mask) as usize])
+        .collect()
 }
 
 /// Merges the per volume results, which are each in name order, into one list ordered by name,
@@ -412,6 +487,34 @@ mod tests {
             .collect::<Vec<_>>();
         all.sort_by(|&a, &b| cmp_hits(indices, a, b));
         all.into_iter().map(|(v, id)| hit(v, id)).collect()
+    }
+
+    /// Same as a stable sort, also with keys too large to pack whole and with many equal keys
+    #[test]
+    fn key_sort_is_stable() {
+        let mut x = 0x2545f4914f6cdd1d_u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let ids = (0..100_000u32).map(|i| i * 7 + 3).collect::<Vec<_>>();
+        let sets: [Vec<u64>; 4] = [
+            (0..ids.len()).map(|_| next() % 50).collect(),
+            (0..ids.len()).map(|_| next() % 1_000_000).collect(),
+            // Full 64 bit keys, cut to fit the positions
+            (0..ids.len()).map(|_| next()).collect(),
+            // Cut keys that are equal but full keys that differ
+            (0..ids.len()).map(|_| (1 << 60) + next() % 64).collect(),
+        ];
+        for keys in sets {
+            let key = |id: u32| keys[((id - 3) / 7) as usize];
+            let mut expected = ids.clone();
+            expected.sort_by_key(|&id| key(id));
+            assert_eq!(sort_by_key(&ids, key, |_| {}), expected);
+        }
+        assert!(sort_by_key(&[], |_| 0, |_| {}).is_empty());
     }
 
     #[test]
