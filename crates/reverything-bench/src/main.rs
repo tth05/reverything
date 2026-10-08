@@ -9,6 +9,8 @@
 //!     compares two saved runs
 //! reverything-bench journal [--dir DIR] [--volume C] [--runs N]
 //!     times applying batches of journal changes to one volume
+//! reverything-bench load [--dir DIR] [--runs N]
+//!     times loading saved indices like waking up, per phase
 //! reverything-bench replay serial|pipeline|cancel [--interval MS]
 //!     types queries against a running service (REVERYTHING_PIPE), see replay.rs
 //! ```
@@ -27,6 +29,7 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 use reverything_core::index::persist::dev_db_dir;
 
 mod journal;
+mod load;
 mod phases;
 mod replay;
 mod search;
@@ -71,6 +74,13 @@ fn main() -> Result<()> {
                     .and_then(|v| v.chars().next())
                     .unwrap_or('C'),
                 value("--runs").map_or(Ok(5), str::parse)?,
+            )
+        }
+        Some("load") => {
+            phases::install();
+            load::run(
+                &value("--dir").map_or_else(synth_dir, PathBuf::from),
+                value("--runs").map_or(Ok(3), str::parse)?,
             )
         }
         Some("replay") if args.len() >= 2 => replay::run(

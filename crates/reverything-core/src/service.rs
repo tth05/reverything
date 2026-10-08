@@ -657,6 +657,7 @@ impl IndexSet {
         let t = Instant::now();
         match load_offline(slot.volume, &self.db_dir) {
             Ok(index) => {
+                index.locations();
                 self.install(i, run, index, VolumeState::Offline);
                 self.update_stats(i, run, |s| {
                     s.load = Some(t.elapsed());
@@ -778,6 +779,8 @@ impl IndexSet {
                     return self.full_scan(i, run, rt);
                 }
             };
+            // What ranking needs, so the first search does not wait for it
+            index.locations();
             let load = t.elapsed();
             let records = rt.since_save.to_vec();
             let batch = apply(&mut index, follower, &records, usn);
@@ -840,6 +843,7 @@ impl IndexSet {
         self.update_stats(i, run, |s| s.state = VolumeState::Indexing);
         let (index, scan) =
             scan_volume(slot.volume, &ScanOptions::default()).map_err(|e| format!("{:#}", e))?;
+        index.locations();
         log::info!("Indexed {} in {:?}", slot.volume.id, scan.total());
         let follower = JournalFollower::new(&index).map_err(|e| format!("{:#}", e))?;
         rt.serial = index.volume_serial;
@@ -953,6 +957,13 @@ impl IndexSet {
     /// saved bring it back.
     fn unload(&self, i: usize, run: u64, rt: &mut Runtime) {
         let slot = &self.volumes[i];
+        // Waking up replays every record changed since the index was saved, so save it now:
+        // otherwise that grows with every hour the service runs. Changes read but not applied
+        // yet are still to replay.
+        self.save(i);
+        if !slot.dirty.load(Ordering::Acquire) {
+            rt.since_save = std::mem::take(&mut rt.since_index);
+        }
         {
             let mut index = slot.index.write().unwrap();
             if !self.is_current(i, run) {

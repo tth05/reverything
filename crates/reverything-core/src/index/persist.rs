@@ -11,9 +11,11 @@
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use eyre::{bail, ensure, eyre, Context, Result};
 use rayon::prelude::*;
+use tracing::info_span;
 
 use crate::index::{
     is_link, link_index, Links, Records, SyncPtr, VolumeIndex, FLAG_IN_USE, NO_RECORD,
@@ -116,7 +118,7 @@ fn read_header_from(file: &mut File, volume: Volume) -> Result<SavedHeader> {
 /// journal. The caller brings it up to date.
 pub fn load_saved(volume: Volume, dir: &Path, volume_serial: u64) -> Result<VolumeIndex> {
     let mut index = VolumeIndex::load(volume, dir, Some(volume_serial))?;
-    index.compute_folder_sizes();
+    info_span!("load.sizes").in_scope(|| index.compute_folder_sizes());
     Ok(index)
 }
 
@@ -124,7 +126,7 @@ pub fn load_saved(volume: Volume, dir: &Path, volume_serial: u64) -> Result<Volu
 /// The index can not be kept up to date then.
 pub fn load_offline(volume: Volume, dir: &Path) -> Result<VolumeIndex> {
     let mut index = VolumeIndex::load(volume, dir, None)?;
-    index.compute_folder_sizes();
+    info_span!("load.sizes").in_scope(|| index.compute_folder_sizes());
     Ok(index)
 }
 
@@ -210,8 +212,10 @@ impl VolumeIndex {
         );
         let volume_serial = serial;
 
+        let reading = info_span!("load.read").entered();
         let mut data = Vec::with_capacity(file.metadata()?.len() as usize);
         file.read_to_end(&mut data)?;
+        drop(reading);
         let mut reader = Reader {
             data: &data,
             pos: 0,
@@ -240,7 +244,7 @@ impl VolumeIndex {
         let names = reader.array()?;
         let sorted = reader.array()?;
         ensure!(reader.pos == data.len(), "Index file has trailing data");
-        reader.decompress()?;
+        info_span!("load.decompress").in_scope(|| reader.decompress())?;
 
         links.free = (0..links.record.len() as u32)
             .filter(|&l| links.record[l as usize] == NO_RECORD)
@@ -259,8 +263,8 @@ impl VolumeIndex {
             garbage: 0,
             locations: Default::default(),
         };
-        index.place_names()?;
-        index.validate()?;
+        info_span!("load.names").in_scope(|| index.place_names())?;
+        info_span!("load.validate").in_scope(|| index.validate())?;
         Ok(index)
     }
 
@@ -297,34 +301,52 @@ impl VolumeIndex {
 
     /// Sets the name offsets of a loaded index from the order the names were saved in.
     fn place_names(&mut self) -> Result<()> {
-        let mut off = 0usize;
-        for id in self.name_order() {
-            let (slot, len) = if is_link(id) {
-                let l = link_index(id);
-                ensure!(
-                    l < self.links.len(),
-                    "Sorted list references unknown entries"
-                );
-                (&mut self.links.name_off[l], self.links.name_len[l])
+        let order = self.name_order();
+        let (records, links) = (self.records.len(), self.links.len());
+        ensure!(
+            order.par_iter().all(|&id| if is_link(id) {
+                link_index(id) < links
             } else {
-                let i = id as usize;
-                ensure!(
-                    i < self.records.len(),
-                    "Sorted list references unknown entries"
-                );
-                (&mut self.records.name_off[i], self.records.name_len[i])
-            };
-            *slot = off as u32;
-            off += len as usize;
-            ensure!(
-                off <= self.names.len(),
-                "Names are shorter than their lengths"
-            );
+                (id as usize) < records
+            }),
+            "Sorted list references unknown entries"
+        );
+        let len = |id: u32| {
+            if is_link(id) {
+                self.links.name_len[link_index(id)]
+            } else {
+                self.records.name_len[id as usize]
+            }
+        };
+        let mut offsets = order
+            .par_iter()
+            .map(|&id| len(id) as u32)
+            .collect::<Vec<_>>();
+        let mut total = 0u64;
+        for off in offsets.iter_mut() {
+            let len = *off as u64;
+            *off = total as u32;
+            total += len;
         }
         ensure!(
-            off == self.names.len(),
+            total <= self.names.len() as u64,
+            "Names are shorter than their lengths"
+        );
+        ensure!(
+            total == self.names.len() as u64,
             "Names are longer than their lengths"
         );
+        // Atomic, so a corrupt file listing an entry twice cannot cause a data race
+        let record_off = atomics(&mut self.records.name_off);
+        let link_off = atomics(&mut self.links.name_off);
+        order.par_iter().zip(&offsets).for_each(|(&id, &off)| {
+            let slot = if is_link(id) {
+                &link_off[link_index(id)]
+            } else {
+                &record_off[id as usize]
+            };
+            slot.store(off, Ordering::Relaxed);
+        });
         // Entries that were not saved with a name, e.g. free link slots
         let r = &mut self.records;
         let l = &mut self.links;
@@ -359,12 +381,12 @@ impl VolumeIndex {
             .all(|&len| len == n),
             "Record arrays have different lengths"
         );
-        for i in 0..n {
-            if r.flags[i] & FLAG_IN_USE != 0
+        let out_of_bounds = (0..n).into_par_iter().with_min_len(4096).find_any(|&i| {
+            r.flags[i] & FLAG_IN_USE != 0
                 && r.name_off[i] as usize + r.name_len[i] as usize > self.names.len()
-            {
-                bail!("Name of record {} is out of bounds", i);
-            }
+        });
+        if let Some(i) = out_of_bounds {
+            bail!("Name of record {} is out of bounds", i);
         }
         let l = &self.links;
         let links = l.record.len();
@@ -383,7 +405,7 @@ impl VolumeIndex {
             }
         }
         ensure!(
-            self.sorted.iter().all(|&id| if is_link(id) {
+            self.sorted.par_iter().all(|&id| if is_link(id) {
                 link_index(id) < links
             } else {
                 (id as usize) < n
@@ -480,6 +502,13 @@ impl<'a> Reader<'a> {
             Ok(())
         })
     }
+}
+
+/// The same memory as atomics, for writing to elements from several threads.
+fn atomics(values: &mut [u32]) -> &[AtomicU32] {
+    const _: () = assert!(align_of::<AtomicU32>() == align_of::<u32>());
+    // SAFETY: same size and alignment, and the exclusive borrow rules out other accesses
+    unsafe { &*(values as *mut [u32] as *const [AtomicU32]) }
 }
 
 fn read_u32(r: &mut impl Read) -> Result<u32> {
