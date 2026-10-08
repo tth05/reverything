@@ -6114,7 +6114,7 @@ dependencies = [
 
 [[package]]
 name = "reverything-bench"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "eyre",
  "mimalloc",
@@ -6130,7 +6130,7 @@ dependencies = [
 
 [[package]]
 name = "reverything-core"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "eyre",
@@ -6145,7 +6145,7 @@ dependencies = [
 
 [[package]]
 name = "reverything-protocol"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "async-channel",
  "postcard",
@@ -6154,7 +6154,7 @@ dependencies = [
 
 [[package]]
 name = "reverything-service"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "embed-resource",
  "eyre",
@@ -6172,7 +6172,7 @@ dependencies = [
 
 [[package]]
 name = "reverything-ui"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "async-channel",
  "embed-resource",
