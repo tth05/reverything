@@ -63,7 +63,12 @@ pub fn run(dir: &Path, letter: char, runs: usize) -> Result<()> {
                     // A search result sharing the sorted list
                     let result = held.then(|| index.sorted.clone());
                     usn += 1;
+                    // Like the service: grown with read access, before the timed write access
+                    let grown = index.grown_names(&updates);
                     let t = Instant::now();
+                    if let Some(grown) = grown {
+                        index.use_names(grown);
+                    }
                     index.apply_updates(&updates, usn);
                     times.push(t.elapsed());
                     drop(result);

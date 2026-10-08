@@ -238,15 +238,43 @@ impl VolumeIndex {
     fn push_name(&mut self, name: &[u8]) -> (u32, u16) {
         let off = self.names.len() as u32;
         let len = name.len().min(u16::MAX as usize);
-        // Grow in small steps; doubling would add ~100 MB for a few new names. Compaction
-        // removes the garbage that accumulates here.
         if self.names.len() + len > self.names.capacity() {
             let _span = info_span!("update.grow_names").entered();
-            self.names
-                .reserve_exact(len.max(self.names.capacity() / 64).max(4096));
+            self.names.reserve_exact(name_growth(&self.names, len));
         }
         self.names.extend_from_slice(&name[..len]);
         (off, len as u16)
+    }
+
+    /// The names with room for everything `updates` may add, if there is not enough room.
+    ///
+    /// Growing copies all names, which takes tens of milliseconds for large volumes. Called with
+    /// read access before applying the updates, searches can go on meanwhile; the result goes to
+    /// [`VolumeIndex::use_names`].
+    pub fn grown_names(&self, updates: &[RecordUpdate]) -> Option<GrownNames> {
+        let adds = updates
+            .iter()
+            .filter_map(|u| u.state.as_ref())
+            .flat_map(|s| &s.names)
+            .map(|(_, name)| name.len().min(u16::MAX as usize))
+            .sum::<usize>();
+        if self.names.len() + adds <= self.names.capacity() {
+            return None;
+        }
+        let _span = info_span!("update.grow_names_ahead").entered();
+        let mut names = Vec::with_capacity(self.names.len() + name_growth(&self.names, adds));
+        names.extend_from_slice(&self.names);
+        Some(GrownNames {
+            names,
+            from: (self.names.as_ptr() as usize, self.names.len()),
+        })
+    }
+
+    /// Takes names from [`VolumeIndex::grown_names`], unless the names changed since.
+    pub fn use_names(&mut self, grown: GrownNames) {
+        if grown.from == (self.names.as_ptr() as usize, self.names.len()) {
+            self.names = grown.names;
+        }
     }
 
     fn remove_links(&mut self, record: u32, touched: &mut Vec<u32>) {
@@ -424,6 +452,19 @@ impl VolumeIndex {
         out.extend_from_slice(&self.sorted[start..]);
         self.sorted = Arc::new(out);
     }
+}
+
+/// A copy of the names with more room, from [`VolumeIndex::grown_names`].
+pub struct GrownNames {
+    names: Vec<u8>,
+    /// Address and length of the names it was copied from
+    from: (usize, usize),
+}
+
+/// How much to grow the names by to fit `len` more bytes. Small steps: doubling would add ~100
+/// MB for a few new names. Compaction removes the garbage that accumulates.
+fn name_growth(names: &[u8], len: usize) -> usize {
+    len.max(names.len() / 64).max(4096)
 }
 
 /// Batches of up to this many updates move their entries without going through the whole sorted

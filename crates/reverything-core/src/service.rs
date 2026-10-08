@@ -763,12 +763,29 @@ impl IndexSet {
             self.trim();
         } else {
             let records = rt.since_index.to_vec();
+            // Reading the records and growing the names happen before taking the write lock,
+            // so searches go on meanwhile. Only this thread changes the index.
+            let t = Instant::now();
+            let updates = follower.fetch(&records);
+            let fetch = t.elapsed();
+            let grown = slot.index.read().unwrap().grown_names(&updates);
             let (batch, entries, bytes) = {
                 let mut index = slot.index.write().unwrap();
                 if !self.is_current(i, run) {
                     return Ok(());
                 }
-                let batch = apply(&mut index, follower, &records, usn);
+                let t = Instant::now();
+                if let Some(grown) = grown {
+                    index.use_names(grown);
+                }
+                index.apply_updates(&updates, usn);
+                let batch = BatchStats {
+                    records: records.len(),
+                    updates: updates.len(),
+                    fetch,
+                    apply: t.elapsed(),
+                    at: SystemTime::now(),
+                };
                 (batch, index.file_count(), index.heap_bytes())
             };
             if !records.is_empty() {
@@ -843,12 +860,18 @@ impl IndexSet {
             let t = Instant::now();
             let updates = follower.fetch(&changed);
             let fetch = t.elapsed();
+            // This thread is the only one changing the index, so it can grow the names while
+            // searches go on
+            let grown = slot.index.read().unwrap().grown_names(&updates);
 
             let t = Instant::now();
             let (entries, bytes) = {
                 let mut index = slot.index.write().unwrap();
                 if !self.is_current(i, run) {
                     return Ok(());
+                }
+                if let Some(grown) = grown {
+                    index.use_names(grown);
                 }
                 index.apply_updates(&updates, follower.reader.next_usn());
                 (index.file_count(), index.heap_bytes())
