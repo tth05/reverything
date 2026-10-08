@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WINDOWPLACEMENT,
 };
 
-use crate::settings::{HotkeyChoice, Settings, WindowPlacement};
+use crate::settings::{Settings, WindowPlacement};
 use crate::view::{FocusSearch, OpenSettings};
 
 /// Signalled when Reverything is started a second time
@@ -90,9 +90,7 @@ pub struct Desktop {
     hotkey: Option<HotKey>,
     /// Id of the registered hotkey, read by the hotkey callback
     hotkey_id: Arc<AtomicU32>,
-    /// The shortcut that is registered right now
-    pub active_hotkey: Option<HotkeyChoice>,
-    /// Why the chosen shortcut could not be registered
+    /// Why the saved shortcut could not be registered at startup
     pub hotkey_error: Option<String>,
 }
 
@@ -195,10 +193,12 @@ impl Desktop {
             hotkeys,
             hotkey: None,
             hotkey_id,
-            active_hotkey: None,
             hotkey_error: None,
         };
-        desktop.apply_hotkey(cx.global::<Settings>().hotkey);
+        let shortcut = cx.global::<Settings>().shortcut.clone();
+        if let Err(e) = desktop.set_shortcut(shortcut.as_deref()) {
+            desktop.hotkey_error = Some(e);
+        }
         cx.set_global(desktop);
 
         cx.spawn(async move |cx| {
@@ -209,42 +209,34 @@ impl Desktop {
         .detach();
     }
 
-    /// Registers the chosen shortcut instead of the current one. Without a choice, the first
-    /// one that no other program uses.
-    pub fn apply_hotkey(&mut self, choice: Option<HotkeyChoice>) {
-        let Some(manager) = &self.hotkeys else { return };
-        if let Some(old) = self.hotkey.take() {
-            let _ = manager.unregister(old);
-        }
-        self.hotkey_id.store(0, Ordering::Relaxed);
-        self.active_hotkey = None;
-        self.hotkey_error = None;
-
-        let candidates = match choice {
-            Some(choice) => vec![choice],
-            None => HotkeyChoice::ALL
-                .into_iter()
-                .filter(|c| *c != HotkeyChoice::None)
-                .collect(),
+    /// Registers `shortcut` instead of the current one, or none. If it can not be registered
+    /// the current one stays, and the error says why.
+    pub fn set_shortcut(&mut self, shortcut: Option<&str>) -> Result<(), String> {
+        let Some(manager) = &self.hotkeys else {
+            return Err("Global shortcuts are not available".into());
         };
-        for candidate in candidates {
-            let Some(hotkey) = candidate.hotkey() else {
-                return;
-            };
-            match manager.register(hotkey) {
-                Ok(()) => {
-                    self.hotkey = Some(hotkey);
-                    self.hotkey_id.store(hotkey.id(), Ordering::Relaxed);
-                    self.active_hotkey = Some(candidate);
-                    return;
-                }
-                Err(e) => crate::log::write(&format!("Failed to register {}: {}", hotkey, e)),
+        let new = match shortcut {
+            Some(text) => {
+                Some(crate::shortcut::hotkey(text).ok_or("This shortcut can not be used")?)
             }
+            None => None,
+        };
+        if new != self.hotkey {
+            if let (Some(new), Some(text)) = (new, shortcut) {
+                manager.register(new).map_err(|e| {
+                    crate::log::write(&format!("Failed to register {}: {}", text, e));
+                    format!("{} is already used by another program", text)
+                })?;
+            }
+            if let Some(old) = self.hotkey.take() {
+                let _ = manager.unregister(old);
+            }
+            self.hotkey = new;
+            self.hotkey_id
+                .store(new.map_or(0, |h| h.id()), Ordering::Relaxed);
         }
-        self.hotkey_error = Some(match choice {
-            Some(_) => "Another program already uses this shortcut".into(),
-            None => "All shortcuts are used by other programs".into(),
-        });
+        self.hotkey_error = None;
+        Ok(())
     }
 
     fn handle(event: Event, cx: &mut App) {

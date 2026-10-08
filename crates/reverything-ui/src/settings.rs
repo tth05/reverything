@@ -3,7 +3,6 @@
 
 use std::path::PathBuf;
 
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use gpui_kit::{App, Global};
 use serde::{Deserialize, Serialize};
 use windows::core::{w, HSTRING};
@@ -34,61 +33,50 @@ impl ThemeChoice {
     }
 }
 
-/// Global shortcut that shows the window from anywhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HotkeyChoice {
-    None,
-    CtrlAltSpace,
-    WinAltF,
-    WinShiftF,
-    CtrlAltF,
-    CtrlShiftSpace,
+/// Where Explorer's context menu entries (including those of installed programs) show up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ExplorerMenu {
+    Off,
+    /// Behind a "More options" entry of the app's menu, like in Windows 11
+    #[default]
+    MoreOptions,
+    /// Instead of the app's menu
+    Replace,
 }
 
-impl HotkeyChoice {
-    pub const ALL: [HotkeyChoice; 6] = [
-        HotkeyChoice::CtrlAltSpace,
-        HotkeyChoice::WinShiftF,
-        HotkeyChoice::WinAltF,
-        HotkeyChoice::CtrlAltF,
-        HotkeyChoice::CtrlShiftSpace,
-        HotkeyChoice::None,
+impl ExplorerMenu {
+    pub const ALL: [ExplorerMenu; 3] = [
+        ExplorerMenu::Off,
+        ExplorerMenu::MoreOptions,
+        ExplorerMenu::Replace,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            HotkeyChoice::None => "None",
-            HotkeyChoice::CtrlAltSpace => "Ctrl+Alt+Space",
-            HotkeyChoice::WinAltF => "Win+Alt+F",
-            HotkeyChoice::WinShiftF => "Win+Shift+F",
-            HotkeyChoice::CtrlAltF => "Ctrl+Alt+F",
-            HotkeyChoice::CtrlShiftSpace => "Ctrl+Shift+Space",
+            ExplorerMenu::Off => "Off",
+            ExplorerMenu::MoreOptions => "Under \"More options\"",
+            ExplorerMenu::Replace => "Instead of this menu",
         }
     }
+}
 
-    pub fn hotkey(self) -> Option<HotKey> {
+/// How Explorer's context menu looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MenuStyle {
+    /// Its entries in the app's own menu
+    #[default]
+    App,
+    /// Windows' own menu, which tools like Nilesoft Shell restyle
+    Windows,
+}
+
+impl MenuStyle {
+    pub const ALL: [MenuStyle; 2] = [MenuStyle::App, MenuStyle::Windows];
+
+    pub fn label(self) -> &'static str {
         match self {
-            HotkeyChoice::None => None,
-            HotkeyChoice::CtrlAltSpace => Some(HotKey::new(
-                Some(Modifiers::CONTROL | Modifiers::ALT),
-                Code::Space,
-            )),
-            HotkeyChoice::WinAltF => Some(HotKey::new(
-                Some(Modifiers::SUPER | Modifiers::ALT),
-                Code::KeyF,
-            )),
-            HotkeyChoice::WinShiftF => Some(HotKey::new(
-                Some(Modifiers::SUPER | Modifiers::SHIFT),
-                Code::KeyF,
-            )),
-            HotkeyChoice::CtrlAltF => Some(HotKey::new(
-                Some(Modifiers::CONTROL | Modifiers::ALT),
-                Code::KeyF,
-            )),
-            HotkeyChoice::CtrlShiftSpace => Some(HotKey::new(
-                Some(Modifiers::CONTROL | Modifiers::SHIFT),
-                Code::Space,
-            )),
+            MenuStyle::App => "Reverything's style",
+            MenuStyle::Windows => "Windows' style",
         }
     }
 }
@@ -115,8 +103,9 @@ pub struct ColumnSetting {
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeChoice,
-    /// `None` picks the first shortcut that no other program uses
-    pub hotkey: Option<HotkeyChoice>,
+    /// The global shortcut that shows the window, like `Ctrl+Alt+Space`, see
+    /// [`crate::shortcut`]
+    pub shortcut: Option<String>,
     /// Closing the window keeps the app running in the tray
     pub close_to_tray: bool,
     #[serde(skip)]
@@ -135,13 +124,15 @@ pub struct Settings {
     pub close_hidden_after_mins: u64,
     /// Index changes refresh the results at most this often
     pub refresh_secs: u64,
+    pub explorer_menu: ExplorerMenu,
+    pub explorer_menu_style: MenuStyle,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: ThemeChoice::System,
-            hotkey: None,
+            shortcut: None,
             close_to_tray: true,
             start_with_windows: false,
             columns: Vec::new(),
@@ -151,6 +142,8 @@ impl Default for Settings {
             last_update_check: 0,
             close_hidden_after_mins: 10,
             refresh_secs: 10,
+            explorer_menu: ExplorerMenu::default(),
+            explorer_menu_style: MenuStyle::default(),
         }
     }
 }

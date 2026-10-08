@@ -156,7 +156,7 @@ to the release):
 7. Tray: close the window (it keeps running in the tray), bring it back with the tray icon, the global shortcut
    (Settings shows which one is active) or by starting Reverything again. "Quit" in the tray menu exits. After 10
    minutes in the tray the window is closed (the process drops to ~115 MB or less); the shortcut opens it again.
-8. Settings (gear in the title bar or Ctrl+,): switch light/dark, change the shortcut, toggle "Start with Windows".
+8. Settings (gear in the title bar or Ctrl+,): switch light/dark, record a shortcut (one another program uses is refused), toggle "Start with Windows".
    Turn a drive off: after closing the settings its results are gone and
    `%ProgramData%\Reverything\<letter>.db` is deleted. Turning it on again scans it again.
 9. Restart the service (`services.msc`, "Reverything Index", or reboot): it saves the index while stopping and

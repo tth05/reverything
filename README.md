@@ -9,7 +9,7 @@ are indexed in seconds, and results appear as you type.
   (`!node_modules\`) and size or date filters (`size:>1gb`, `dm:today`). Hover the `?` next to the search box for a short overview.
 - Open files and folders, copy them with Ctrl+C, show them in Explorer (or the file manager that replaced it), several
   at once.
-- Lives in the tray and comes up with a global shortcut (Settings shows which one).
+- Lives in the tray and comes up with a global shortcut you record in the settings (none by default).
 - Uses almost no resources while you do not use it: the index is only kept up to date while the window has the
   focus, and is dropped from memory after an hour without it (adjustable in the settings).
 

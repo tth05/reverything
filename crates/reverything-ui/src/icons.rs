@@ -153,7 +153,7 @@ fn icon_to_image(icon: HICON) -> Option<Arc<RenderImage>> {
 }
 
 /// Reads a bitmap as top-down 32 bit pixels.
-unsafe fn read_bitmap(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
+pub(crate) unsafe fn read_bitmap(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
     if bitmap.is_invalid() {
         return None;
     }

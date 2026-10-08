@@ -26,9 +26,11 @@ use crate::client::ServiceClient;
 use crate::desktop::{self, Desktop};
 use crate::drives::{Drive, DriveChoice};
 use crate::format;
-use crate::results::{NameHighlight, Results, Show};
-use crate::settings::{HotkeyChoice, Settings, ThemeChoice};
+use crate::menu::{Entry, Menu, MenuIcon};
+use crate::results::{MenuTarget, NameHighlight, Results, Show};
+use crate::settings::{ExplorerMenu, MenuStyle, Settings, ThemeChoice};
 use crate::shell;
+use crate::shell_menu::{ShellItem, ShellMenu};
 use crate::update;
 
 gpui_kit::actions!(
@@ -43,6 +45,7 @@ gpui_kit::actions!(
         DeleteSelected,
         DeletePermanently,
         SearchInFolder,
+        ShowContextMenu,
         SelectAll,
         FocusSearch,
         HideWindow,
@@ -160,6 +163,10 @@ pub struct MainView {
     drive_error: Option<String>,
     /// Changing a setting of the service failed
     settings_error: Option<String>,
+    /// Takes the keys while the global shortcut is being recorded
+    recording_shortcut: Option<Subscription>,
+    /// Why the recorded shortcut was not taken
+    shortcut_error: Option<String>,
     time_fields: TimeFields,
     /// Where the results area is, for drawing the selection rectangle
     results_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -167,6 +174,8 @@ pub struct MainView {
     marquee_pointer: Option<Point<Pixels>>,
     /// Scrolls while the selection rectangle is dragged past the top or bottom of the list
     autoscroll: Option<Task<()>>,
+    /// The context menu while it is open, where it opened, and its closing subscription
+    context_menu: Option<(Entity<Menu>, Point<Pixels>, Subscription)>,
     /// A newer release, offered at the bottom left
     update: Option<update::Update>,
     /// What the update is doing, shown at the bottom left
@@ -289,10 +298,13 @@ impl MainView {
             polling: false,
             drive_error: None,
             settings_error: None,
+            recording_shortcut: None,
+            shortcut_error: None,
             time_fields,
             results_bounds: Rc::default(),
             marquee_pointer: None,
             autoscroll: None,
+            context_menu: None,
             update: None,
             update_state: UpdateState::Idle,
             started,
@@ -520,6 +532,8 @@ impl MainView {
     fn on_hide(&mut self, _: &HideWindow, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             window.close_dialog(cx);
+        } else if self.context_menu.is_some() {
+            self.close_context_menu(window, cx);
         } else if self.settings_open {
             self.close_settings(window, cx);
         } else if cx.global::<Settings>().close_to_tray {
@@ -550,6 +564,8 @@ impl MainView {
     /// Back to the results, applying the drive selection.
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = false;
+        self.recording_shortcut = None;
+        self.shortcut_error = None;
         self.apply_drive_choice(cx);
         self.input.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
@@ -1478,13 +1494,6 @@ fn search_help(cx: &App) -> impl IntoElement {
         ))
 }
 
-fn hint_owned(theme: &gpui_kit::component::Theme, text: String) -> Div {
-    div()
-        .text_xs()
-        .text_color(theme.muted_foreground)
-        .child(text)
-}
-
 const REPOSITORY: &str = "https://github.com/tth05/reverything";
 
 /// About dialog content: version, links, logs and checking for updates.
@@ -1632,6 +1641,7 @@ impl Render for MainView {
             .on_action(cx.listener(Self::on_search_in_folder))
             .on_action(cx.listener(Self::on_select_all))
             .on_action(cx.listener(Self::on_cycle_show))
+            .on_action(cx.listener(Self::on_show_context_menu))
             .on_action(cx.listener(Self::on_focus_search))
             .on_action(cx.listener(Self::on_hide))
             .on_action(cx.listener(Self::on_open_settings))
@@ -1641,6 +1651,15 @@ impl Render for MainView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
             .child(self.render_title_bar(cx))
             .map(|this| {
                 if self.settings_open {
@@ -1691,6 +1710,187 @@ impl MainView {
 }
 
 impl MainView {
+    /// Opens Explorer's context menu for the entries of the last context menu, where that
+    /// opened.
+    /// Opens the context menu for the row the table was right clicked on: the app's entries,
+    /// or Explorer's if they replace them.
+    fn on_show_context_menu(
+        &mut self,
+        _: &ShowContextMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.table.read(cx).delegate().menu_target.clone();
+        let Some(target) = target.filter(|t| !t.paths.is_empty()) else {
+            return;
+        };
+        if cx.global::<Settings>().explorer_menu == ExplorerMenu::Replace {
+            self.show_explorer_menu(target, window, cx);
+            return;
+        }
+        let entries = self.app_entries(&target, cx);
+        self.open_menu(entries, target.position, window, cx);
+    }
+
+    /// The app's entries for the entries the menu is for.
+    fn app_entries(&self, target: &MenuTarget, cx: &mut Context<Self>) -> Vec<Entry> {
+        let action = |icon: MenuIcon, label: &'static str, action: Box<dyn Action>| {
+            Entry::item(icon, label, move |window, cx| {
+                window.dispatch_action(action.boxed_clone(), cx)
+            })
+        };
+        // Opening folders and properties are for one entry
+        let single = target.paths.len() == 1;
+        let mut entries = vec![action(
+            MenuIcon::Svg(IconName::ExternalLink),
+            "Open",
+            Box::new(OpenSelected),
+        )];
+        if single {
+            entries.push(
+                action(
+                    MenuIcon::Svg(IconName::FolderOpen),
+                    "Open containing folder",
+                    Box::new(RevealSelected),
+                )
+                .shortcut("Ctrl+Enter"),
+            );
+        }
+        entries.push(action(
+            MenuIcon::Svg(IconName::Search),
+            if target.directory {
+                "Search in this folder"
+            } else {
+                "Search in the containing folder"
+            },
+            Box::new(SearchInFolder),
+        ));
+        entries.push(Entry::Separator);
+        entries.push(
+            action(MenuIcon::Svg(IconName::Copy), "Copy", Box::new(CopyFile)).shortcut("Ctrl+C"),
+        );
+        entries.push(
+            action(MenuIcon::None, "Copy full path", Box::new(CopyPath)).shortcut("Ctrl+Shift+C"),
+        );
+        entries.push(action(MenuIcon::None, "Copy name", Box::new(CopyName)));
+        entries.push(Entry::Separator);
+        entries.push(
+            action(
+                MenuIcon::Svg(IconName::Delete),
+                "Delete",
+                Box::new(DeleteSelected),
+            )
+            .shortcut("Delete"),
+        );
+        entries.push(
+            action(
+                MenuIcon::None,
+                "Delete permanently",
+                Box::new(DeletePermanently),
+            )
+            .shortcut("Shift+Delete"),
+        );
+        if single {
+            entries.push(
+                action(
+                    MenuIcon::Svg(IconName::Info),
+                    "Properties",
+                    Box::new(ShowProperties),
+                )
+                .shortcut("Alt+Enter"),
+            );
+        }
+        if cx.global::<Settings>().explorer_menu == ExplorerMenu::MoreOptions {
+            let view = cx.entity().downgrade();
+            let target = target.clone();
+            entries.push(Entry::Separator);
+            entries.push(Entry::item(
+                MenuIcon::Svg(IconName::Ellipsis),
+                "More options",
+                move |window, cx| {
+                    let target = target.clone();
+                    let _ = view.update(cx, |view, cx| view.show_explorer_menu(target, window, cx));
+                },
+            ));
+        }
+        entries
+    }
+
+    /// Opens `entries` as the context menu at `position`.
+    fn open_menu(
+        &mut self,
+        entries: Vec<Entry>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let menu = cx.new(|cx| Menu::new(entries, cx));
+        let closed = cx.subscribe_in(&menu, window, |view, _, _: &DismissEvent, window, cx| {
+            view.close_context_menu(window, cx)
+        });
+        menu.read(cx).focus_handle(cx).focus(window, cx);
+        self.context_menu = Some((menu, position, closed));
+        cx.notify();
+    }
+
+    /// Closes the context menu, the focus goes back to the results it was opened from.
+    fn close_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        self.table.update(cx, |table, cx| {
+            table.set_right_clicked_row(None, cx);
+            table.focus_handle(cx).focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Opens Explorer's context menu for `target`, in the app's menu or as Windows' own.
+    fn show_explorer_menu(
+        &mut self,
+        target: MenuTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(hwnd) = desktop::hwnd(window) else {
+            return;
+        };
+        let MenuTarget {
+            paths,
+            position,
+            extended,
+            ..
+        } = target;
+        if cx.global::<Settings>().explorer_menu_style == MenuStyle::Windows {
+            let scale = window.scale_factor();
+            let mut point = windows::Win32::Foundation::POINT {
+                x: (f32::from(position.x) * scale) as i32,
+                y: (f32::from(position.y) * scale) as i32,
+            };
+            // Windows' menu runs a message loop of its own until it closes, the window keeps
+            // drawing meanwhile. So it runs as a task of its own, not while this view is being
+            // updated.
+            cx.spawn(async move |_, _| {
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point);
+                }
+                match ShellMenu::new(&paths, extended, false) {
+                    Ok(shell) => shell.show_native(hwnd, point),
+                    Err(e) => crate::log::write(&format!("Explorer's context menu failed: {}", e)),
+                }
+            })
+            .detach();
+            return;
+        }
+        let shell = match ShellMenu::new(&paths, extended, true) {
+            Ok(shell) => Rc::new(shell),
+            Err(e) => {
+                crate::log::write(&format!("Explorer's context menu failed: {}", e));
+                return;
+            }
+        };
+        let entries = explorer_entries(&shell, Vec::new(), hwnd.0 as usize);
+        self.open_menu(entries, position, window, cx);
+    }
+
     /// The selection rectangle while it is dragged, and mouse tracking for it anywhere in the
     /// window.
     fn render_marquee(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1830,6 +2030,55 @@ impl MainView {
     }
 }
 
+/// The entries of Explorer's menu at `path` (indices of submenus), for the app's menu.
+fn explorer_entries(shell: &Rc<ShellMenu>, path: Vec<usize>, hwnd: usize) -> Vec<Entry> {
+    shell
+        .items_at(&path)
+        .iter()
+        .enumerate()
+        .map(|(index, item)| match item {
+            ShellItem::Separator => Entry::Separator,
+            ShellItem::Submenu { label, .. } => {
+                let shell = shell.clone();
+                let mut path = path.clone();
+                path.push(index);
+                Entry::Submenu {
+                    icon: MenuIcon::None,
+                    label: label.clone().into(),
+                    entries: Rc::new(move || explorer_entries(&shell, path.clone(), hwnd)),
+                }
+            }
+            ShellItem::Command {
+                id,
+                label,
+                icon,
+                disabled,
+                checked,
+                default,
+            } => {
+                let (id, shell) = (*id, shell.clone());
+                Entry::Item {
+                    icon: icon.clone().map_or(MenuIcon::None, MenuIcon::Image),
+                    label: label.clone().into(),
+                    shortcut: None,
+                    disabled: *disabled,
+                    checked: *checked,
+                    bold: *default,
+                    run: Rc::new(move |_, cx| {
+                        let shell = shell.clone();
+                        // Entries can open dialogs with message loops of their own, which must
+                        // not run while the app is being updated
+                        cx.spawn(async move |_| {
+                            shell.invoke(id, Some(windows::Win32::Foundation::HWND(hwnd as *mut _)))
+                        })
+                        .detach();
+                    }),
+                }
+            }
+        })
+        .collect()
+}
+
 /// `query` with `+"folder"\` in front, instead of one put there before.
 fn with_folder(query: &str, folder: &str) -> String {
     let rest = query
@@ -1938,6 +2187,43 @@ impl MainView {
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    /// Takes the next key combination as the global shortcut, instead of what it would do.
+    fn record_shortcut(&mut self, cx: &mut Context<Self>) {
+        self.shortcut_error = None;
+        let view = cx.entity().downgrade();
+        self.recording_shortcut = Some(cx.intercept_keystrokes(move |event, _, cx| {
+            cx.stop_propagation();
+            let keystroke = event.keystroke.clone();
+            let _ = view.update(cx, |view, cx| view.recorded(&keystroke, cx));
+        }));
+    }
+
+    fn recorded(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
+        let m = &keystroke.modifiers;
+        if keystroke.key == "escape" && !(m.control || m.alt || m.shift || m.platform) {
+            self.recording_shortcut = None;
+            cx.notify();
+            return;
+        }
+        match crate::shortcut::from_keystroke(keystroke) {
+            // A modifier alone, the key is still to come
+            Ok(None) => return,
+            Err(e) => self.shortcut_error = Some(e.into()),
+            Ok(Some(shortcut)) => {
+                self.recording_shortcut = None;
+                // A shortcut another program uses is not taken, the current one stays
+                match cx.global_mut::<Desktop>().set_shortcut(Some(&shortcut)) {
+                    Ok(()) => {
+                        self.shortcut_error = None;
+                        Settings::update(cx, |s| s.shortcut = Some(shortcut));
+                    }
+                    Err(e) => self.shortcut_error = Some(e),
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -2066,33 +2352,57 @@ impl MainView {
                 v_flex()
                     .gap_2()
                     .child(heading("Shortcut to show Reverything"))
-                    .child(choice_buttons(
-                        "hotkey",
-                        &std::iter::once((None, "Automatic"))
-                            .chain(HotkeyChoice::ALL.iter().map(|&c| (Some(c), c.label())))
-                            .collect::<Vec<_>>(),
-                        Some(settings.hotkey),
-                        false,
-                        |choice, _, cx| {
-                            Settings::update(cx, |s| s.hotkey = choice);
-                            if cx.has_global::<Desktop>() {
-                                cx.global_mut::<Desktop>().apply_hotkey(choice);
-                            }
-                        },
-                    ))
-                    .child(hint(
-                        "Works from anywhere, also while the window is hidden in the tray. \
-                         Automatic uses the first shortcut no other program uses.",
-                    ))
-                    .children(
-                        cx.try_global::<Desktop>()
-                            .and_then(|d| d.active_hotkey)
-                            .filter(|c| *c != HotkeyChoice::None)
-                            .map(|c| hint_owned(theme, format!("Active: {}", c.label()))),
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("shortcut")
+                                    .small()
+                                    .label(match (&self.recording_shortcut, &settings.shortcut) {
+                                        (Some(_), _) => "Press the shortcut...".to_string(),
+                                        (None, Some(shortcut)) => shortcut.clone(),
+                                        (None, None) => "None, click to record one".to_string(),
+                                    })
+                                    .selected(self.recording_shortcut.is_some())
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        if view.recording_shortcut.is_some() {
+                                            view.recording_shortcut = None;
+                                        } else {
+                                            view.record_shortcut(cx);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(
+                                settings.shortcut.is_some() && self.recording_shortcut.is_none(),
+                                |row| {
+                                    row.child(
+                                        Button::new("shortcut-remove")
+                                            .small()
+                                            .ghost()
+                                            .label("Remove")
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.shortcut_error = cx
+                                                    .global_mut::<Desktop>()
+                                                    .set_shortcut(None)
+                                                    .err();
+                                                Settings::update(cx, |s| s.shortcut = None);
+                                            })),
+                                    )
+                                },
+                            ),
                     )
+                    .child(hint(
+                        "Works from anywhere, also while the window is hidden in the tray. Click \
+                         and press a combination with Ctrl, Alt or Win, Escape cancels.",
+                    ))
                     .children(
-                        cx.try_global::<Desktop>()
-                            .and_then(|d| d.hotkey_error.clone())
+                        self.shortcut_error
+                            .clone()
+                            .or_else(|| {
+                                cx.try_global::<Desktop>()
+                                    .and_then(|d| d.hotkey_error.clone())
+                            })
                             .map(|e| div().text_xs().text_color(theme.danger).child(e)),
                     ),
             )
@@ -2133,6 +2443,31 @@ impl MainView {
                             .clone()
                             .map(|e| div().text_xs().text_color(theme.danger).child(e)),
                     ),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(heading("Explorer's context menu"))
+                    .child(choice_buttons(
+                        "explorer-menu",
+                        &ExplorerMenu::ALL.map(|m| (m, m.label())),
+                        Some(settings.explorer_menu),
+                        false,
+                        |menu, _, cx| Settings::update(cx, |s| s.explorer_menu = menu),
+                    ))
+                    .child(choice_buttons(
+                        "explorer-menu-style",
+                        &MenuStyle::ALL.map(|m| (m, m.label())),
+                        Some(settings.explorer_menu_style),
+                        settings.explorer_menu == ExplorerMenu::Off,
+                        |style, _, cx| Settings::update(cx, |s| s.explorer_menu_style = style),
+                    ))
+                    .child(hint(
+                        "Explorer's entries for the selected results, including the ones \
+                         installed programs add, like 7-Zip. Shift+right click shows the \
+                         extended ones. Windows' style is the classic Windows menu, restyled by \
+                         tools like Nilesoft Shell.",
+                    )),
             )
             .child(
                 v_flex().gap_3().child(heading("Updates")).child(

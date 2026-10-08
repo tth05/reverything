@@ -21,10 +21,7 @@ use crate::icons::{FileIcons, Loaded};
 use crate::selection::Selection;
 use crate::settings::{ColumnSetting, Settings};
 use crate::shell::full_path;
-use crate::view::{
-    CopyFile, CopyName, CopyPath, DeletePermanently, DeleteSelected, OpenSelected, RevealSelected,
-    SearchInFolder, ShowProperties,
-};
+use crate::view::ShowContextMenu;
 
 /// Rows fetched per request
 const PAGE: usize = 256;
@@ -78,6 +75,19 @@ impl Marquee {
             point(self.start.x.max(self.end.x), self.start.y.max(self.end.y)),
         )
     }
+}
+
+/// The entries a context menu is for and where it opens.
+#[derive(Clone)]
+pub struct MenuTarget {
+    /// The selection, or just the right clicked entry if it is not selected
+    pub paths: Vec<String>,
+    /// In window coordinates
+    pub position: Point<Pixels>,
+    /// Shift was down, for Explorer's extended entries
+    pub extended: bool,
+    /// The right clicked entry is a folder
+    pub directory: bool,
 }
 
 /// Which kinds of entries the results show.
@@ -291,6 +301,8 @@ pub struct Results {
     pub pressed_empty: Option<usize>,
     pub empty_select: Option<usize>,
     pub marquee: Option<Marquee>,
+    /// What the last right click on a row was for
+    pub menu_target: Option<MenuTarget>,
     pub last_search: Option<SearchTiming>,
     pub last_page: Option<Duration>,
     pub error: Option<String>,
@@ -331,6 +343,7 @@ impl Results {
             pressed_empty: None,
             empty_select: None,
             marquee: None,
+            menu_target: None,
             last_search: None,
             last_page: None,
             error: None,
@@ -604,12 +617,6 @@ impl Results {
     /// has seen.
     pub fn select_visible(&mut self, visible: Range<usize>) {
         self.selection.paths = visible.filter_map(|r| self.row(r).map(full_path)).collect();
-    }
-
-    /// Whether the selection has more than one entry and an action on `row` applies to all of
-    /// them.
-    fn acts_on_many(&self, row: usize) -> bool {
-        self.selection.paths.len() > 1 && self.is_selected(row)
     }
 
     fn cell_text(row: &Row, kind: ColumnKind) -> String {
@@ -962,11 +969,13 @@ impl TableDelegate for Results {
             )
     }
 
+    /// The table's own menu stays empty, so it does not show; the view opens its compact one,
+    /// see [`crate::menu`].
     fn context_menu(
         &mut self,
         row_ix: usize,
         menu: PopupMenu,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
         self.menu_row = Some(row_ix);
@@ -978,36 +987,19 @@ impl TableDelegate for Results {
             })
             .detach();
         }
-        let directory = self.row(row_ix).is_some_and(|r| r.directory);
-        // Opening folders and properties are for one entry
-        let single = !self.acts_on_many(row_ix);
-        menu.menu_with_icon("Open", IconName::ExternalLink, Box::new(OpenSelected))
-            .when(single, |menu| {
-                menu.menu_with_icon(
-                    "Open containing folder",
-                    IconName::FolderOpen,
-                    Box::new(RevealSelected),
-                )
-            })
-            .menu_with_icon(
-                if directory {
-                    "Search in this folder"
-                } else {
-                    "Search in the containing folder"
-                },
-                IconName::Search,
-                Box::new(SearchInFolder),
-            )
-            .separator()
-            .menu_with_icon("Copy", IconName::Copy, Box::new(CopyFile))
-            .menu("Copy full path", Box::new(CopyPath))
-            .menu("Copy name", Box::new(CopyName))
-            .separator()
-            .menu_with_icon("Delete", IconName::Delete, Box::new(DeleteSelected))
-            .menu("Delete permanently", Box::new(DeletePermanently))
-            .when(single, |menu| {
-                menu.menu_with_icon("Properties", IconName::Info, Box::new(ShowProperties))
-            })
+        let paths = match self.row(row_ix).map(full_path) {
+            Some(path) if self.selection.contains(&path) => self.selection.paths.clone(),
+            Some(path) => vec![path],
+            None => Vec::new(),
+        };
+        self.menu_target = Some(MenuTarget {
+            paths,
+            position: window.mouse_position(),
+            extended: window.modifiers().shift,
+            directory: self.row(row_ix).is_some_and(|r| r.directory),
+        });
+        window.dispatch_action(Box::new(ShowContextMenu), cx);
+        menu
     }
 
     fn visible_rows_changed(

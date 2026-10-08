@@ -15,10 +15,13 @@ mod drives;
 mod format;
 mod icons;
 mod log;
+mod menu;
 mod results;
 mod selection;
 mod settings;
 mod shell;
+mod shell_menu;
+mod shortcut;
 mod update;
 mod view;
 
