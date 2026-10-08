@@ -12,6 +12,8 @@ pub mod rank;
 pub mod search;
 pub mod sizes;
 pub mod sort;
+#[cfg(test)]
+pub mod testing;
 pub mod update;
 
 use std::sync::{Arc, Mutex};

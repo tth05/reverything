@@ -374,58 +374,7 @@ fn merge_into<I: Deref<Target = VolumeIndex>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{Records, FLAG_DIRECTORY, FLAG_IN_USE};
-    use crate::ntfs::volume::Volume;
-    use crate::ntfs::ROOT_RECORD;
-
-    /// A volume with the given names directly below the root, record numbers from 16 up.
-    fn volume(letter: char, names: &[String]) -> VolumeIndex {
-        let mut index = VolumeIndex::empty(Volume { id: letter });
-        index.records = Records::with_len(16 + names.len());
-        let r = &mut index.records;
-        r.flags[ROOT_RECORD as usize] = FLAG_IN_USE | FLAG_DIRECTORY;
-        r.parent[ROOT_RECORD as usize] = ROOT_RECORD;
-        for (i, name) in names.iter().enumerate() {
-            let id = 16 + i;
-            r.flags[id] = FLAG_IN_USE;
-            r.parent[id] = ROOT_RECORD;
-            r.name_off[id] = index.names.len() as u32;
-            r.name_len[id] = name.len() as u16;
-            index.names.extend_from_slice(name.as_bytes());
-        }
-        index.sort_and_compact();
-        index
-    }
-
-    /// Names that share prefixes longer than the 8 byte sort key, differ in case, and repeat
-    /// within and across volumes
-    fn names(seed: u64, n: usize) -> Vec<String> {
-        const PARTS: &[&str] = &[
-            "a",
-            "A",
-            "b",
-            "Readme",
-            "readme",
-            "README.md",
-            "longprefix",
-            "x.",
-            "ä",
-            "Z",
-        ];
-        let mut x = seed;
-        (0..n)
-            .map(|_| {
-                let mut name = String::new();
-                for _ in 0..1 + x % 3 {
-                    x = x
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1442695040888963407);
-                    name.push_str(PARTS[(x >> 33) as usize % PARTS.len()]);
-                }
-                name
-            })
-            .collect()
-    }
+    use crate::index::testing::{names, volume};
 
     /// The order merge_by_name promises, by sorting everything
     fn reference(indices: &[&VolumeIndex], lists: &[&[u32]]) -> Vec<Hit> {

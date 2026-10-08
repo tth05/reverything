@@ -1,8 +1,10 @@
 //! Applying journal changes to a [`VolumeIndex`].
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use tracing::info_span;
 
 use crate::index::build::flags_and_size;
@@ -141,6 +143,9 @@ impl VolumeIndex {
             })
             .collect::<Vec<_>>();
 
+        // Where the affected entries are, while the order is still intact
+        let before = info_span!("update.locate").in_scope(|| self.locate(updates));
+
         for i in order {
             let update = &updates[i];
             let id = update.record;
@@ -177,12 +182,15 @@ impl VolumeIndex {
             let Some(state) = state else { continue };
 
             let mut flags = state.flags;
+            // The order is by name, so only new entries and new names move
+            let mut moved = !was_in_use;
             if let Some(((parent, name), links)) = state.names.split_first() {
                 if !was_in_use || self.name(id) != &name[..] {
                     if was_in_use {
                         self.garbage += self.records.name_len[r] as usize;
                     }
                     (self.records.name_off[r], self.records.name_len[r]) = self.push_name(name);
+                    moved = true;
                 }
                 self.records.parent[r] = *parent;
 
@@ -208,7 +216,9 @@ impl VolumeIndex {
             self.records.created[r] = state.created;
             self.records.modified[r] = state.modified;
             self.records.sequence[r] = state.sequence;
-            touched.push(id);
+            if moved {
+                touched.push(id);
+            }
 
             self.add_to_ancestors(id, self.records.size[r] as i64);
         }
@@ -218,7 +228,7 @@ impl VolumeIndex {
         info_span!("update.locations").in_scope(|| self.update_locations(&directories));
         self.next_usn = next_usn;
         if !touched.is_empty() {
-            info_span!("update.resort").in_scope(|| self.resort(touched));
+            info_span!("update.resort").in_scope(|| self.resort(touched, before));
         }
         if self.garbage > (1 << 20) && self.garbage > self.names.len() / 4 {
             info_span!("update.compact").in_scope(|| self.compact_names());
@@ -231,6 +241,7 @@ impl VolumeIndex {
         // Grow in small steps; doubling would add ~100 MB for a few new names. Compaction
         // removes the garbage that accumulates here.
         if self.names.len() + len > self.names.capacity() {
+            let _span = info_span!("update.grow_names").entered();
             self.names
                 .reserve_exact(len.max(self.names.capacity() / 64).max(4096));
         }
@@ -254,14 +265,124 @@ impl VolumeIndex {
         self.records.flags[r] &= !FLAG_HAS_LINKS;
     }
 
-    /// Moves the touched entries to their new position in [`VolumeIndex::sorted`].
-    fn resort(&mut self, mut touched: Vec<u32>) {
+    /// The positions in [`VolumeIndex::sorted`] of the entries `updates` may move: the records
+    /// and their hard links. `None` for batches large enough that going through the whole list
+    /// is cheaper, or if an entry is not where the order says it is.
+    fn locate(&self, updates: &[RecordUpdate]) -> Option<Vec<(u32, usize)>> {
+        if updates.len() > LOCATE_MAX.min(self.sorted.len() / 8) {
+            return None;
+        }
+        let mut ids = updates
+            .iter()
+            .map(|u| u.record)
+            .filter(|&id| id != ROOT_RECORD && self.is_in_use(id))
+            .collect::<Vec<_>>();
+        let with_links = ids
+            .iter()
+            .copied()
+            .filter(|&id| self.records.flags[id as usize] & FLAG_HAS_LINKS != 0)
+            .collect::<HashSet<_>>();
+        if !with_links.is_empty() {
+            ids.extend(
+                (0..self.links.len() as u32)
+                    .filter(|&l| with_links.contains(&self.links.record[l as usize]))
+                    .map(link_id),
+            );
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_par_iter()
+            .map(|id| {
+                let pos = self
+                    .sorted
+                    .partition_point(|&x| self.cmp_entries(x, id) == Ordering::Less);
+                (self.sorted.get(pos) == Some(&id)).then_some((id, pos))
+            })
+            .collect()
+    }
+
+    /// Moves the touched entries to their new position in [`VolumeIndex::sorted`]. `before`
+    /// holds the positions [`VolumeIndex::locate`] found before the update.
+    fn resort(&mut self, mut touched: Vec<u32>, before: Option<Vec<(u32, usize)>>) {
         touched.sort_unstable();
         touched.dedup();
+        let mut new = touched
+            .iter()
+            .copied()
+            .filter(|&id| id != ROOT_RECORD && self.is_in_use(id))
+            .collect::<Vec<_>>();
+        new.sort_unstable_by(|&a, &b| self.cmp_entries(a, b));
 
+        let Some(before) = before else {
+            self.resort_all(&touched, &new);
+            return;
+        };
+        // Every touched entry that was in the list is one of the located ones
+        let mut removed = touched
+            .iter()
+            .filter_map(|id| {
+                let i = before.binary_search_by_key(id, |&(id, _)| id).ok()?;
+                Some(before[i].1)
+            })
+            .collect::<Vec<_>>();
+        removed.sort_unstable();
+
+        let old = &self.sorted;
+        // Whether the entry at `p` comes before `id`. Removed entries may have a new name, so
+        // they count as the closest kept entry before them.
+        let comes_before = |p: usize, id: u32| {
+            let (mut q, mut r) = (p, removed.partition_point(|&x| x <= p));
+            while r > 0 && removed[r - 1] == q {
+                if q == 0 {
+                    return true;
+                }
+                (q, r) = (q - 1, r - 1);
+            }
+            self.cmp_entries(old[q], id) == Ordering::Less
+        };
+
+        // Independent binary searches, in order since `new` is
+        let at = new
+            .par_iter()
+            .map(|&id| {
+                let (mut lo, mut hi) = (0, old.len());
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if comes_before(mid, id) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            })
+            .collect::<Vec<_>>();
+
+        let mut out = Vec::with_capacity(old.len() - removed.len() + new.len());
+        let mut start = 0;
+        let mut skip = removed.iter().copied().peekable();
+        // Copies old[from..to] without the removed entries
+        let mut copy = |out: &mut Vec<u32>, mut from: usize, to: usize| {
+            while let Some(r) = skip.next_if(|&r| r < to) {
+                out.extend_from_slice(&old[from..r]);
+                from = r + 1;
+            }
+            out.extend_from_slice(&old[from..to]);
+        };
+        for (id, at) in new.into_iter().zip(at) {
+            copy(&mut out, start, at);
+            out.push(id);
+            start = at;
+        }
+        copy(&mut out, start, old.len());
+        self.sorted = Arc::new(out);
+    }
+
+    /// [`VolumeIndex::resort`] for large batches: filters the whole list, then inserts `new`.
+    fn resort_all(&mut self, touched: &[u32], new: &[u32]) {
         let mut records = vec![0u64; self.records.len().div_ceil(64)];
         let mut links = vec![0u64; self.links.len().div_ceil(64)];
-        for &id in &touched {
+        for &id in touched {
             let (set, i) = if is_link(id) {
                 (&mut links, link_index(id))
             } else {
@@ -285,20 +406,14 @@ impl VolumeIndex {
                 self.sorted = Arc::new(kept.collect());
             }
         }
-
-        let mut new = touched
-            .into_iter()
-            .filter(|&id| id != ROOT_RECORD && self.is_in_use(id))
-            .collect::<Vec<_>>();
         if new.is_empty() {
             return;
         }
-        new.sort_unstable_by(|&a, &b| self.cmp_entries(a, b));
 
         // Binary search the insertion points and copy the runs in between
         let mut out = Vec::with_capacity(self.sorted.len() + new.len());
         let mut start = 0;
-        for id in new {
+        for &id in new {
             let pos = start
                 + self.sorted[start..]
                     .partition_point(|&x| self.cmp_entries(x, id) == Ordering::Less);
@@ -310,6 +425,10 @@ impl VolumeIndex {
         self.sorted = Arc::new(out);
     }
 }
+
+/// Batches of up to this many updates move their entries without going through the whole sorted
+/// list, see [`VolumeIndex::locate`]
+const LOCATE_MAX: usize = 1 << 16;
 
 /// Orders updates so that a directory is applied before the entries inside it. A new directory
 /// starts with size 0, so entries applied before it would be missing from its folder size.
@@ -358,4 +477,121 @@ fn parents_first(updates: &[RecordUpdate]) -> Vec<usize> {
         }
     }
     order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::testing::{names, volume};
+
+    fn next(x: &mut u64) -> u64 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
+    }
+
+    /// A random file record that is in use
+    fn random_file(index: &VolumeIndex, x: &mut u64) -> u32 {
+        loop {
+            let id = (next(x) % index.records.len() as u64) as u32;
+            if id != ROOT_RECORD && index.is_in_use(id) {
+                return id;
+            }
+        }
+    }
+
+    fn state(names: Vec<Vec<u8>>, sequence: u16, size: u64) -> RecordState {
+        RecordState {
+            names: names.into_iter().map(|n| (ROOT_RECORD, n)).collect(),
+            flags: FLAG_IN_USE,
+            size: Some(size),
+            created: 1,
+            modified: 2,
+            sequence,
+        }
+    }
+
+    /// Random batches of every kind of change, small ones that move entries by their located
+    /// positions and large ones that go through the whole list, with and without a search
+    /// result holding the list. The order has to match sorting from scratch after each.
+    #[test]
+    fn updates_keep_the_order() {
+        let mut index = volume('A', &names(11, 4000));
+        let pool = names(12, 500);
+        let mut x = 0x9e3779b97f4a7c15;
+        let mut next_record = index.records.len() as u32;
+        for round in 0..80 {
+            let batch = [1, 3, 20, 90, 700][round % 5];
+            let updates = (0..batch)
+                .map(|_| {
+                    let name =
+                        |x: &mut u64| pool[next(x) as usize % pool.len()].clone().into_bytes();
+                    let kind = next(&mut x) % 7;
+                    let id = random_file(&index, &mut x);
+                    let r = id as usize;
+                    let (sequence, current) = (index.records.sequence[r], index.name(id).to_vec());
+                    match kind {
+                        // New size and date only
+                        0 => RecordUpdate {
+                            record: id,
+                            state: Some(state(vec![current], sequence, next(&mut x) % 100)),
+                        },
+                        1 => RecordUpdate {
+                            record: id,
+                            state: Some(state(vec![name(&mut x)], sequence, 1)),
+                        },
+                        2 => RecordUpdate {
+                            record: id,
+                            state: None,
+                        },
+                        // Deleted and reused for another file
+                        3 => RecordUpdate {
+                            record: id,
+                            state: Some(state(vec![name(&mut x)], sequence.wrapping_add(1), 1)),
+                        },
+                        // Hard links, added or kept
+                        4 => RecordUpdate {
+                            record: id,
+                            state: Some(state(
+                                vec![current, name(&mut x), name(&mut x)],
+                                sequence,
+                                1,
+                            )),
+                        },
+                        _ => {
+                            next_record += 1;
+                            let names = if kind == 5 {
+                                vec![name(&mut x)]
+                            } else {
+                                vec![name(&mut x), name(&mut x)]
+                            };
+                            RecordUpdate {
+                                record: next_record,
+                                state: Some(state(names, 1, 1)),
+                            }
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            // Records appear once per batch, like in the journal
+            let mut seen = HashSet::new();
+            let updates = updates
+                .into_iter()
+                .filter(|u| seen.insert(u.record))
+                .collect::<Vec<_>>();
+
+            let held = (round % 2 == 0).then(|| index.sorted.clone());
+            index.apply_updates(&updates, round as i64);
+            drop(held);
+
+            let mut expected = index.searchable_entries();
+            expected.sort_by(|&a, &b| index.cmp_entries(a, b));
+            assert_eq!(
+                *index.sorted, expected,
+                "round {} with {} updates",
+                round, batch
+            );
+        }
+    }
 }

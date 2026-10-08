@@ -35,7 +35,7 @@ impl VolumeIndex {
     }
 
     /// Every entry that should be searchable: in-use records except the root, and their links.
-    fn searchable_entries(&self) -> Vec<u32> {
+    pub(crate) fn searchable_entries(&self) -> Vec<u32> {
         let flags = &self.records.flags;
         let mut ids = (0..flags.len() as u32)
             .into_par_iter()
