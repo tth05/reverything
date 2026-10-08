@@ -217,10 +217,74 @@ fn quality_ascii(name: &[u8], needle: &[u8]) -> u8 {
     }
 }
 
+/// [`quality_ascii`], and whether `name` contains the term as typed, in one pass over the
+/// occurrences of `needle` (lowercase). `cased` tells whether `typed` has letters; without
+/// them every occurrence is as typed.
+fn ascii_match(name: &[u8], needle: &[u8], typed: &[u8], cased: bool) -> (u8, bool) {
+    let n = needle.len();
+    if n == 0 {
+        return (0, true);
+    }
+    if name.len() < n {
+        return (0, false);
+    }
+    let (first, rest) = (needle[0], &needle[1..]);
+    let (mut quality, mut as_typed) = (0, false);
+    for i in 0..=name.len() - n {
+        if name[i].to_ascii_lowercase() != first || !name[i + 1..i + n].eq_ignore_ascii_case(rest) {
+            continue;
+        }
+        let q = if i == 0 {
+            if name.len() == n {
+                4
+            } else if name[n] == b'.' && !name[n + 1..].contains(&b'.') {
+                // "notepad" for notepad.exe: the needle is everything before the last dot
+                3
+            } else {
+                2
+            }
+        } else {
+            // Start of a word: after a separator or at a lower to upper case change (camelCase)
+            let (before, here) = (name[i - 1], name[i]);
+            (!before.is_ascii_alphanumeric()
+                || (before.is_ascii_lowercase() && here.is_ascii_uppercase())) as u8
+        };
+        quality = quality.max(q);
+        as_typed = as_typed || !cased || &name[i..i + n] == typed;
+        // Later occurrences are word starts at best
+        if as_typed && quality >= 1 {
+            break;
+        }
+    }
+    (quality, as_typed)
+}
+
+/// A term of a ranked query with a name part.
+struct RankTerm {
+    /// Lowercase
+    matcher: Matcher,
+    /// The text as typed
+    typed: Vec<u8>,
+    /// Whether the typed text has ASCII letters, which a match can differ in
+    cased: bool,
+    /// Finds the text as typed, for matchers other than [`Matcher::Ascii`]
+    finder: memmem::Finder<'static>,
+}
+
+impl RankTerm {
+    /// How well `name` matches, and whether it contains the term as typed.
+    #[inline]
+    fn evaluate(&self, name: &[u8]) -> (u8, bool) {
+        match &self.matcher {
+            Matcher::Ascii(needle) => ascii_match(name, needle, &self.typed, self.cased),
+            other => (match_quality(name, other), self.finder.find(name).is_some()),
+        }
+    }
+}
+
 /// Computes the relevance of hits for one query.
 pub struct Ranker {
-    /// Lowercase matchers, and searchers for the text as typed, of every term with a name part
-    terms: Vec<(Matcher, memmem::Finder<'static>)>,
+    terms: Vec<RankTerm>,
     now: u32,
 }
 
@@ -231,7 +295,12 @@ impl Ranker {
             .include
             .iter()
             .filter_map(|t| t.name_text.as_ref())
-            .map(|text| (Matcher::new(text), memmem::Finder::new(text).into_owned()))
+            .map(|text| RankTerm {
+                matcher: Matcher::new(text),
+                typed: text.as_bytes().to_vec(),
+                cased: text.bytes().any(|b| b.is_ascii_alphabetic()),
+                finder: memmem::Finder::new(text).into_owned(),
+            })
             .collect::<Vec<_>>();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -271,12 +340,13 @@ impl Ranker {
     /// [`VolumeIndex::locations`].
     pub fn score(&self, index: &VolumeIndex, locations: &[u8], id: u32) -> u8 {
         let name = index.name(id);
-        let quality = self
-            .terms
-            .iter()
-            .map(|(matcher, _)| match_quality(name, matcher))
-            .max()
-            .unwrap_or(0);
+        // The best match quality of any term, and whether all terms are there as typed
+        let (mut quality, mut same_case) = (0, true);
+        for term in &self.terms {
+            let (q, as_typed) = term.evaluate(name);
+            quality = quality.max(q);
+            same_case &= as_typed;
+        }
 
         // A directory is ranked by its own location, a file by the one of its folder
         let dir = if index.flags(id) & FLAG_DIRECTORY != 0 {
@@ -290,11 +360,7 @@ impl Ranker {
             _ => 1,
         };
 
-        let same_case = self
-            .terms
-            .iter()
-            .all(|(_, typed)| typed.find(name).is_some()) as u8;
-
+        let same_case = same_case as u8;
         let age = self.now.saturating_sub(index.modified(id));
         let recency = match age {
             a if a < 7 * DAY => 3,
@@ -358,6 +424,96 @@ pub fn group_by_score(ids: &[u32], scores: &[u8]) -> (Vec<u32>, Vec<(usize, u8)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One pass gives the same as checking each level and searching the typed text separately
+    #[test]
+    fn ascii_match_agrees_with_separate_checks() {
+        let names = [
+            "notepad.exe",
+            "Notepad",
+            "notepad",
+            "notepad++.exe",
+            "my-notepad.txt",
+            "MyNotepad.txt",
+            "mynotepad.txt",
+            "notepad.tar.gz",
+            "note.pad",
+            ".gitignore",
+            "gitignore",
+            "a.b.c",
+            "NOTEPAD.EXE",
+            "noteNotepad",
+            "x_notepad_notepad",
+            "notepa",
+            "",
+            "e",
+            "E.e",
+            "ee",
+            "readme.md",
+            "README",
+            "Read Me",
+            "über_readme",
+            "a.notepad",
+            "notepad.",
+            "..",
+        ];
+        let typed = [
+            "notepad",
+            "Notepad",
+            "NOTEPAD",
+            "e",
+            "E",
+            ".",
+            "a.b",
+            "me",
+            "Me",
+            ".gitignore",
+            "note.pad",
+            "pad",
+            "_",
+            "read me",
+            "x",
+            "notepad.exe",
+            "..",
+        ];
+        for typed in typed {
+            let needle = typed.to_ascii_lowercase();
+            let cased = typed.bytes().any(|b| b.is_ascii_alphabetic());
+            for name in names {
+                let expected = (
+                    quality_ascii(name.as_bytes(), needle.as_bytes()),
+                    memmem::find(name.as_bytes(), typed.as_bytes()).is_some(),
+                );
+                let got = ascii_match(name.as_bytes(), needle.as_bytes(), typed.as_bytes(), cased);
+                assert_eq!(got, expected, "{:?} for {:?}", name, typed);
+            }
+        }
+
+        // Random names and terms from few characters, so they overlap a lot
+        let mut x = 0x2545f4914f6cdd1d_u64;
+        let mut random = |max: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let len = x % max;
+            (0..len)
+                .map(|i| b"aAbB.-eE"[((x >> (8 + i * 3)) % 8) as usize])
+                .collect::<Vec<_>>()
+        };
+        for _ in 0..200_000 {
+            let (name, typed) = (random(12), random(5));
+            if typed.is_empty() {
+                continue;
+            }
+            let needle = typed.to_ascii_lowercase();
+            let cased = typed.iter().any(|b| b.is_ascii_alphabetic());
+            let expected = (
+                quality_ascii(&name, &needle),
+                memmem::find(&name, &typed).is_some(),
+            );
+            assert_eq!(ascii_match(&name, &needle, &typed, cased), expected);
+        }
+    }
 
     #[test]
     fn quality_levels() {
