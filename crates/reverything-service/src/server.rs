@@ -241,13 +241,12 @@ impl Server {
                     })
                     .collect::<Vec<_>>();
                 self.set.set_enabled(&volumes);
-                let config = Config {
-                    volumes: self.set.enabled(),
-                };
-                match config.save(self.set.db_dir()) {
-                    Ok(()) => Response::Done,
-                    Err(e) => Response::Error(format!("Failed to save the settings: {}", e)),
-                }
+                self.save_config()
+            }
+            Request::SetUnloadAfter { secs } => {
+                self.set
+                    .set_unload_after((secs > 0).then(|| Duration::from_secs(secs)));
+                self.save_config()
             }
         }
     }
@@ -293,6 +292,13 @@ impl Server {
             .collect()
     }
 
+    fn save_config(&self) -> Response {
+        match Config::of(&self.set).save(self.set.db_dir()) {
+            Ok(()) => Response::Done,
+            Err(e) => Response::Error(format!("Failed to save the settings: {}", e)),
+        }
+    }
+
     fn status(&self) -> Status {
         let mut memory = PROCESS_MEMORY_COUNTERS::default();
         unsafe {
@@ -312,6 +318,7 @@ impl Server {
             private_bytes: memory.PagefileUsage as u64,
             searches: self.searches.load(Ordering::Relaxed),
             last_search_us: (last_search != u64::MAX).then_some(last_search),
+            unload_after_secs: self.set.unload_after().map_or(0, |d| d.as_secs()),
             // Drives that exist, and enabled ones even while they are gone
             volumes: (0..self.set.volumes.len())
                 .filter(|&i| self.set.volumes[i].present() || self.set.volumes[i].enabled())

@@ -24,7 +24,7 @@ use crate::client::ServiceClient;
 use crate::desktop::{self, Desktop};
 use crate::drives::{Drive, DriveChoice};
 use crate::format;
-use crate::results::Results;
+use crate::results::{Results, Show};
 use crate::settings::{HotkeyChoice, Settings, ThemeChoice};
 use crate::shell;
 use crate::update;
@@ -39,10 +39,14 @@ gpui_kit::actions!(
         CopyName,
         ShowProperties,
         DeleteSelected,
+        DeletePermanently,
+        SearchInFolder,
+        SelectAll,
         FocusSearch,
         HideWindow,
         OpenSettings,
         OpenAbout,
+        CycleShow,
         ToggleFiles,
         ToggleFolders,
     ]
@@ -59,6 +63,10 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-c", CopyFile, Some("Reverything > Input")),
         KeyBinding::new("ctrl-shift-c", CopyPath, Some(KEY_CONTEXT)),
         KeyBinding::new("alt-enter", ShowProperties, Some(KEY_CONTEXT)),
+        // The search box has its own Delete and Ctrl+A, these work in the results
+        KeyBinding::new("delete", DeleteSelected, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-delete", DeletePermanently, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-a", SelectAll, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-f", FocusSearch, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-l", FocusSearch, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-,", OpenSettings, Some(KEY_CONTEXT)),
@@ -106,9 +114,6 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 /// After the window became active, index changes refresh the results right away for this long,
 /// while the service catches up with what happened in the meantime
 const ACTIVATION_REFRESH: Duration = Duration::from_secs(5);
-/// Minimum time between the last search and a refresh caused by index changes. Typing or
-/// sorting always searches right away.
-const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// Lower than the default title bar (34px)
 const TITLE_BAR_HEIGHT: Pixels = px(30.);
 
@@ -124,8 +129,10 @@ pub struct MainView {
     /// Number of searchable volumes when the current results were searched
     searched_volumes: usize,
     last_search: Instant,
-    /// The settings dialog is open, the drive selection is applied when it closes
+    /// The settings page is shown instead of the results, the drive selection is applied when
+    /// it closes
     settings_open: bool,
+    settings_focus: FocusHandle,
     /// The window has the focus, as last told to the service
     active: bool,
     activated_at: Instant,
@@ -133,6 +140,9 @@ pub struct MainView {
     polling: bool,
     /// Changing the indexed drives failed
     drive_error: Option<String>,
+    /// Changing a setting of the service failed
+    settings_error: Option<String>,
+    time_fields: TimeFields,
     /// A newer release, offered at the bottom left
     update: Option<update::Update>,
     /// What the update is doing, shown at the bottom left
@@ -160,29 +170,67 @@ impl MainView {
                 .sortable(true)
         });
 
-        let subscriptions = vec![
+        let time_fields = TimeFields::new(window, cx);
+        let mut subscriptions = time_fields
+            .all()
+            .map(|field| {
+                cx.subscribe_in(field, window, |view, field, event, window, cx| {
+                    if let InputEvent::Change = event {
+                        // Whole numbers only, anything else typed or pasted is dropped
+                        let value = field.read(cx).value();
+                        if !value.bytes().all(|b| b.is_ascii_digit()) || value.len() > 4 {
+                            let digits = value
+                                .chars()
+                                .filter(char::is_ascii_digit)
+                                .take(4)
+                                .collect::<String>();
+                            field.update(cx, |field, cx| field.set_value(digits, window, cx));
+                        }
+                        view.apply_time_fields(cx);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        subscriptions.extend([
             cx.subscribe_in(&input, window, |view, _, event, _, cx| match event {
                 InputEvent::Change => view.search(true, cx),
                 InputEvent::PressEnter { secondary, .. } => {
-                    if let Some(path) = view.target_path(cx) {
-                        if *secondary {
-                            shell::reveal(&path);
-                        } else {
-                            shell::open(&path);
+                    let paths = view.target_paths(cx);
+                    if *secondary {
+                        if let [path] = paths.as_slice() {
+                            shell::reveal(path);
                         }
+                    } else {
+                        paths.iter().for_each(|path| shell::open(path));
                     }
                 }
                 _ => {}
             }),
             cx.subscribe_in(&table, window, |view, table, event, _, cx| match event {
                 TableEvent::DoubleClickedRow(row) => view.open_row(*row, cx),
+                // The table selects one row, the results keep the multi-selection
+                TableEvent::SelectRow(row) => table.update(cx, |table, cx| {
+                    if !table.delegate_mut().table_selected(*row) {
+                        // Ctrl+click took it out of the selection
+                        table.delegate_mut().keep_selection = true;
+                        table.clear_selection(cx);
+                    }
+                    cx.notify();
+                }),
+                TableEvent::ClearSelection => table.update(cx, |table, cx| {
+                    let results = table.delegate_mut();
+                    if !std::mem::take(&mut results.keep_selection) {
+                        results.selection.clear();
+                    }
+                    cx.notify();
+                }),
                 TableEvent::ColumnWidthsChanged(widths) => table.update(cx, |table, cx| {
                     table.delegate_mut().set_widths(widths);
                     table.delegate().save_columns(cx);
                 }),
                 _ => {}
             }),
-        ];
+        ]);
 
         input.update(cx, |input, cx| input.focus(window, cx));
 
@@ -197,10 +245,13 @@ impl MainView {
             searched_volumes: 0,
             last_search: Instant::now(),
             settings_open: false,
+            settings_focus: cx.focus_handle(),
             active: true,
             activated_at: Instant::now(),
             polling: false,
             drive_error: None,
+            settings_error: None,
+            time_fields,
             update: None,
             update_state: UpdateState::Idle,
             started,
@@ -257,35 +308,86 @@ impl MainView {
         }
     }
 
-    /// The entry actions apply to: the row of the open context menu, the selected row, or the
-    /// first result.
-    fn target_path(&mut self, cx: &mut Context<Self>) -> Option<String> {
+    /// The entries actions apply to: the selection, or the entry of the open context menu if
+    /// it is not selected, or without a selection the first result.
+    fn target_paths(&mut self, cx: &mut Context<Self>) -> Vec<String> {
         self.table.update(cx, |table, _| {
-            let row = table
-                .delegate_mut()
-                .menu_row
-                .take()
-                .or_else(|| table.selected_row())
-                .unwrap_or(0);
-            table.delegate().row(row).map(shell::full_path)
+            let first = table.selected_row().unwrap_or(0);
+            let results = table.delegate_mut();
+            if let Some(row) = results.menu_row.take() {
+                let Some(path) = results.row(row).map(shell::full_path) else {
+                    return Vec::new();
+                };
+                if results.selection.contains(&path) {
+                    return results.selection.paths.clone();
+                }
+                return vec![path];
+            }
+            if !results.selection.paths.is_empty() {
+                return results.selection.paths.clone();
+            }
+            results
+                .row(first)
+                .map(shell::full_path)
+                .into_iter()
+                .collect()
         })
     }
 
-    fn target_name(&mut self, cx: &mut Context<Self>) -> Option<String> {
-        self.target_path(cx)
-            .and_then(|path| path.rsplit('\\').next().map(str::to_string))
-    }
-
     fn on_open(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = self.target_path(cx) {
+        for path in self.target_paths(cx) {
             shell::open(&path);
         }
     }
 
+    /// Only for a single entry, like the properties.
     fn on_reveal(&mut self, _: &RevealSelected, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = self.target_path(cx) {
-            shell::reveal(&path);
+        if let [path] = self.target_paths(cx).as_slice() {
+            shell::reveal(path);
         }
+    }
+
+    /// Puts the folder of the entry in front of the search as `+"folder"\`, replacing one put
+    /// there before.
+    fn on_search_in_folder(
+        &mut self,
+        _: &SearchInFolder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = self.table.update(cx, |table, _| {
+            let row = table.delegate_mut().menu_row.take();
+            let row = row.or_else(|| table.selected_row()).unwrap_or(0);
+            let row = table.delegate().row(row)?;
+            Some((shell::full_path(row), row.directory))
+        });
+        let Some((path, directory)) = entry else {
+            return;
+        };
+        let folder = if directory {
+            Some(path)
+        } else {
+            shell::parent(&path)
+        };
+        let Some(folder) = folder else {
+            return;
+        };
+        let query = self.input.read(cx).value().to_string();
+        let query = with_folder(&query, folder.trim_end_matches('\\'));
+        // Undoable like typing, and searches through the input's change event
+        self.input.update(cx, |input, cx| {
+            input.replace_all(query, window, cx);
+            input.focus(window, cx);
+        });
+    }
+
+    fn on_select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.table.update(cx, |table, cx| {
+            // The table's own range, it is up to date also before any scrolling
+            let visible = table.visible_range().rows().clone();
+            table.delegate_mut().select_visible(visible);
+            cx.notify();
+        });
     }
 
     /// Copies the entry as a file, like Explorer. In the search box with text selected, the
@@ -298,39 +400,60 @@ impl MainView {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             return;
         }
-        if let Some(path) = self.target_path(cx) {
-            shell::copy_to_clipboard(&path);
+        let paths = self.target_paths(cx);
+        if !paths.is_empty() {
+            shell::copy_to_clipboard(&paths);
         }
     }
 
     fn on_copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = self.target_path(cx) {
-            cx.write_to_clipboard(ClipboardItem::new_string(path));
+        let paths = self.target_paths(cx);
+        if !paths.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\r\n")));
         }
     }
 
     fn on_copy_name(&mut self, _: &CopyName, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(name) = self.target_name(cx) {
-            cx.write_to_clipboard(ClipboardItem::new_string(name));
+        let names = self
+            .target_paths(cx)
+            .iter()
+            .filter_map(|path| path.rsplit('\\').next().map(str::to_string))
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(names.join("\r\n")));
         }
     }
 
     fn on_properties(&mut self, _: &ShowProperties, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = self.target_path(cx) {
-            shell::properties(&path);
+        if let [path] = self.target_paths(cx).as_slice() {
+            shell::properties(path);
         }
     }
 
-    /// Moves the entry to the Recycle Bin, then refreshes the results.
     fn on_delete(&mut self, _: &DeleteSelected, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.target_path(cx) else {
+        self.delete(false, window, cx);
+    }
+
+    fn on_delete_permanently(
+        &mut self,
+        _: &DeletePermanently,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete(true, window, cx);
+    }
+
+    /// Deletes the entries, to the Recycle Bin unless `permanently`, then refreshes the results.
+    fn delete(&mut self, permanently: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = self.target_paths(cx);
+        if paths.is_empty() {
             return;
-        };
+        }
         let hwnd = desktop::hwnd(window).map(|h| h.0 as usize);
         // The confirmation dialog is modal, the window keeps drawing meanwhile
         let task = cx.background_executor().spawn(async move {
             let hwnd = hwnd.map(|h| windows::Win32::Foundation::HWND(h as *mut _));
-            shell::delete(&path, hwnd)
+            shell::delete(&paths, permanently, hwnd)
         });
         cx.spawn(async move |view, cx| {
             if task.await {
@@ -356,29 +479,47 @@ impl MainView {
     fn on_hide(&mut self, _: &HideWindow, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             window.close_dialog(cx);
+        } else if self.settings_open {
+            self.close_settings(window, cx);
         } else if cx.global::<Settings>().close_to_tray {
             desktop::hide(window, cx);
         }
     }
 
-    fn on_toggle_files(&mut self, _: &ToggleFiles, _: &mut Window, cx: &mut Context<Self>) {
+    fn set_show(&mut self, show: impl FnOnce(Show) -> Show, cx: &mut Context<Self>) {
         self.table.update(cx, |table, _| {
             let results = table.delegate_mut();
-            results.files = !results.files;
+            results.show = show(results.show);
         });
         self.search(true, cx);
     }
 
+    fn on_cycle_show(&mut self, _: &CycleShow, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_show(Show::next, cx);
+    }
+
+    fn on_toggle_files(&mut self, _: &ToggleFiles, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_show(|show| show.toggle(Show::Files), cx);
+    }
+
     fn on_toggle_folders(&mut self, _: &ToggleFolders, _: &mut Window, cx: &mut Context<Self>) {
-        self.table.update(cx, |table, _| {
-            let results = table.delegate_mut();
-            results.folders = !results.folders;
-        });
-        self.search(true, cx);
+        self.set_show(|show| show.toggle(Show::Folders), cx);
+    }
+
+    /// Back to the results, applying the drive selection.
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.apply_drive_choice(cx);
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
     }
 
     fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
+            return;
+        }
+        if self.settings_open {
+            self.close_settings(window, cx);
             return;
         }
         let volumes = self
@@ -397,12 +538,10 @@ impl MainView {
             indexed,
         });
         self.settings_open = true;
-        window.open_dialog(cx, |dialog, _, cx| {
-            dialog
-                .title("Settings")
-                .width(px(520.))
-                .child(settings_panel(cx))
-        });
+        self.settings_error = None;
+        self.fill_time_fields(window, cx);
+        self.settings_focus.focus(window, cx);
+        cx.notify();
 
         // Drives can appear after the service started (a new disk, an unlocked BitLocker
         // drive), the service looks again and the list updates
@@ -410,12 +549,17 @@ impl MainView {
         let task = cx
             .background_executor()
             .spawn(async move { client.request(&Request::RefreshVolumes) });
-        cx.spawn(async move |view, cx| {
+        cx.spawn_in(window, async move |view, cx| {
             if let Ok(Response::Status(status)) = task.await {
                 let letters = status.volumes.iter().map(|v| v.letter).collect::<Vec<_>>();
-                let _ = view.update(cx, |view, cx| {
+                let _ = view.update_in(cx, |view, window, cx| {
+                    let unknown = view.status.is_none();
                     view.status = Some(status);
                     DriveChoice::set_drives(cx, &letters);
+                    // Until now the service's settings were not known
+                    if unknown {
+                        view.fill_time_fields(window, cx);
+                    }
                     cx.notify();
                 });
             }
@@ -436,7 +580,7 @@ impl MainView {
         });
     }
 
-    /// Sends the drive selection of the settings dialog to the service, if it changed.
+    /// Sends the drive selection of the settings page to the service, if it changed.
     fn apply_drive_choice(&mut self, cx: &mut Context<Self>) {
         let Some(choice) = cx.try_global::<DriveChoice>() else {
             return;
@@ -561,7 +705,7 @@ impl MainView {
 
     /// Fetches the service status every second while the window is active, and refreshes the
     /// results when the index changed: right after the window became active and when a drive
-    /// became searchable, otherwise at most every [`REFRESH_INTERVAL`].
+    /// became searchable, otherwise at most as often as the settings say.
     fn poll_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.polling {
             return;
@@ -595,7 +739,7 @@ impl MainView {
                             && !busy
                             && (new_volumes
                                 || view.activated_at.elapsed() < ACTIVATION_REFRESH
-                                || view.last_search.elapsed() >= REFRESH_INTERVAL);
+                                || view.last_search.elapsed() >= refresh_interval(cx));
                         if reconnected || refresh {
                             view.search(false, cx);
                         }
@@ -626,7 +770,8 @@ impl MainView {
     /// Icon, name and settings on the left, the window controls on the right.
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let icon = std::sync::Arc::new(Image::from_bytes(ImageFormat::Png, APP_ICON.to_vec()));
-        TitleBar::new().h(TITLE_BAR_HEIGHT).child(
+        // As far from the edge as the search box
+        TitleBar::new().h(TITLE_BAR_HEIGHT).pl_2().child(
             h_flex()
                 .gap_2()
                 .child(img(icon).size_4())
@@ -651,7 +796,7 @@ impl MainView {
                         .child(
                             Button::new("settings")
                                 .ghost()
-                                .xsmall()
+                                .small()
                                 .icon(IconName::Settings)
                                 .tooltip("Settings (Ctrl+,)")
                                 .on_click(cx.listener(|view, _, window, cx| {
@@ -661,7 +806,7 @@ impl MainView {
                         .child(
                             Button::new("about")
                                 .ghost()
-                                .xsmall()
+                                .small()
                                 .icon(IconName::Info)
                                 .tooltip("About")
                                 .on_click(cx.listener(|view, _, window, cx| {
@@ -672,17 +817,18 @@ impl MainView {
         )
     }
 
-    /// Search box, the file and folder filters and the syntax help.
+    /// Search box, the file and folder filter and the syntax help.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let results = self.table.read(cx).delegate();
-        let (files, folders) = (results.files, results.folders);
-        let toggle = |id: &'static str, icon: IconName, on: bool, tooltip: &'static str| {
-            Button::new(id)
-                .ghost()
-                .small()
-                .icon(icon)
-                .selected(on)
-                .tooltip(tooltip)
+        let (icon, tooltip) = match self.table.read(cx).delegate().show {
+            Show::All => (
+                IconName::Asterisk,
+                "Files and folders, click for only files (Alt+F, Alt+D)",
+            ),
+            Show::Files => (IconName::File, "Only files, click for only folders (Alt+F)"),
+            Show::Folders => (
+                IconName::Folder,
+                "Only folders, click for files and folders (Alt+D)",
+            ),
         };
 
         h_flex()
@@ -699,16 +845,14 @@ impl MainView {
                 ),
             )
             .child(
-                toggle("files", IconName::File, files, "Show files (Alt+F)").on_click(cx.listener(
-                    |view, _, window, cx| view.on_toggle_files(&ToggleFiles, window, cx),
-                )),
-            )
-            .child(
-                toggle("folders", IconName::Folder, folders, "Show folders (Alt+D)").on_click(
-                    cx.listener(|view, _, window, cx| {
-                        view.on_toggle_folders(&ToggleFolders, window, cx)
-                    }),
-                ),
+                Button::new("show")
+                    .ghost()
+                    .small()
+                    .icon(icon)
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.on_cycle_show(&CycleShow, window, cx)
+                    })),
             )
             .child(
                 HoverCard::new("search-help")
@@ -771,7 +915,14 @@ impl MainView {
             // The health indicator already says that the service is not reachable
             (None, Some(_)) if self.status.is_none() => String::new(),
             (None, Some(e)) => e.clone(),
-            (None, None) => format!("{} objects", format::group_digits(results.total() as u64)),
+            (None, None) => match results.selection.paths.len() {
+                0 | 1 => format!("{} objects", format::group_digits(results.total() as u64)),
+                selected => format!(
+                    "{} objects, {} selected",
+                    format::group_digits(results.total() as u64),
+                    selected
+                ),
+            },
         };
         let update_notice = match (&self.update_state, &self.update) {
             // Only when there is something to install; up to date needs no notice
@@ -1413,35 +1564,282 @@ fn about_panel(view: WeakEntity<MainView>, cx: &App) -> impl IntoElement {
         }))
 }
 
-/// Settings dialog content. Rebuilt on every render from the [`Settings`] and
-/// [`DriveChoice`] globals.
-fn settings_panel(cx: &App) -> impl IntoElement {
-    let settings = cx.global::<Settings>().clone();
-    let theme = cx.theme();
-    let heading = |text: &'static str| {
-        div()
-            .text_sm()
-            .font_semibold()
-            .text_color(theme.foreground)
-            .child(text)
-    };
-    let hint = |text: &'static str| {
-        div()
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child(text)
-    };
+impl Render for MainView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.first_frame.is_none() {
+            let elapsed = self.started.elapsed();
+            self.first_frame = Some(elapsed);
+            if std::env::var_os("REVERYTHING_LOG_STARTUP").is_some() {
+                crate::log::write(&format!("first frame after {:?}", elapsed));
+            }
+        }
+        let no_drives = self
+            .status
+            .as_ref()
+            .is_some_and(|s| s.volumes.iter().all(|v| v.state == VolumeState::Disabled));
 
-    let drives = cx.try_global::<DriveChoice>();
-    v_flex()
-        .gap_5()
-        .child(
-            v_flex()
-                .gap_3()
-                .child(heading("Drives"))
-                .map(|this| match drives {
-                    Some(choice) if !choice.drives.is_empty() => {
-                        this.children(choice.drives.iter().map(|drive| {
+        v_flex()
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(Self::on_open))
+            .on_action(cx.listener(Self::on_reveal))
+            .on_action(cx.listener(Self::on_copy_file))
+            .on_action(cx.listener(Self::on_copy_path))
+            .on_action(cx.listener(Self::on_copy_name))
+            .on_action(cx.listener(Self::on_properties))
+            .on_action(cx.listener(Self::on_delete))
+            .on_action(cx.listener(Self::on_delete_permanently))
+            .on_action(cx.listener(Self::on_search_in_folder))
+            .on_action(cx.listener(Self::on_select_all))
+            .on_action(cx.listener(Self::on_cycle_show))
+            .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(Self::on_hide))
+            .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_open_about))
+            .on_action(cx.listener(Self::on_toggle_files))
+            .on_action(cx.listener(Self::on_toggle_folders))
+            .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(self.render_title_bar(cx))
+            .map(|this| {
+                if self.settings_open {
+                    this.child(self.render_settings(cx))
+                } else {
+                    this.child(self.render_toolbar(cx))
+                        .map(|this| self.render_results(this, no_drives, cx))
+                        .child(self.render_status_bar(window, cx))
+                }
+            })
+    }
+}
+
+impl MainView {
+    fn render_results(&self, this: Div, no_drives: bool, cx: &mut Context<Self>) -> Div {
+        this.map(|this| {
+            if no_drives {
+                this.child(self.render_no_drives(cx))
+            } else {
+                this.child(
+                    div()
+                        .flex_1()
+                        .overflow_hidden()
+                        // The table opens its row menu for any right click inside it, for the
+                        // last right clicked row. Forget that row before a right click
+                        // reaches the table, a row sets it again, the header and empty space
+                        // do not.
+                        .capture_any_mouse_down(cx.listener(
+                            |view, event: &MouseDownEvent, _, cx| {
+                                if event.button == MouseButton::Right {
+                                    view.table.update(cx, |table, cx| {
+                                        table.set_right_clicked_row(None, cx)
+                                    });
+                                }
+                            },
+                        ))
+                        .child(
+                            DataTable::new(&self.table)
+                                .stripe(true)
+                                .with_size(crate::results::ROW_SIZE),
+                        ),
+                )
+            }
+        })
+    }
+}
+
+/// `query` with `+"folder"\` in front, instead of one put there before.
+fn with_folder(query: &str, folder: &str) -> String {
+    let rest = query
+        .strip_prefix("+\"")
+        .and_then(|q| q.split_once("\"\\"))
+        .map_or(query, |(_, rest)| rest)
+        .trim_start();
+    format!("+\"{}\"\\ {}", folder, rest)
+}
+
+/// Index changes refresh the results at most this often. Typing or sorting always searches
+/// right away.
+fn refresh_interval(cx: &App) -> Duration {
+    Duration::from_secs(cx.global::<Settings>().refresh_secs.max(1))
+}
+
+/// Number fields for the durations on the settings page, the larger unit first.
+struct TimeFields {
+    /// Hours and minutes without an active window before the service unloads the indices
+    unload: [Entity<InputState>; 2],
+    /// Hours and minutes in the tray before the window is closed
+    close_hidden: [Entity<InputState>; 2],
+    /// Minutes and seconds between refreshes
+    refresh: [Entity<InputState>; 2],
+}
+
+impl TimeFields {
+    fn new(window: &mut Window, cx: &mut Context<MainView>) -> Self {
+        let mut field = || cx.new(|cx| InputState::new(window, cx).placeholder("0"));
+        Self {
+            unload: [field(), field()],
+            close_hidden: [field(), field()],
+            refresh: [field(), field()],
+        }
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Entity<InputState>> {
+        self.unload
+            .iter()
+            .chain(&self.close_hidden)
+            .chain(&self.refresh)
+    }
+}
+
+/// The number in a time field, 0 if it is empty.
+fn field_value(field: &Entity<InputState>, cx: &App) -> u64 {
+    field.read(cx).value().parse().unwrap_or(0)
+}
+
+/// Puts `value` into the two fields of a duration, `unit` being how many of the smaller unit
+/// make one of the larger.
+fn set_fields(
+    fields: &[Entity<InputState>; 2],
+    value: u64,
+    unit: u64,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    for (field, part) in fields.iter().zip([value / unit, value % unit]) {
+        field.update(cx, |field, cx| {
+            field.set_value(part.to_string(), window, cx)
+        });
+    }
+}
+
+/// A row of buttons to pick one of `choices`.
+fn choice_buttons<T: Copy + PartialEq + 'static>(
+    id: &'static str,
+    choices: &[(T, &'static str)],
+    current: Option<T>,
+    disabled: bool,
+    pick: impl Fn(T, &mut Window, &mut App) + Clone + 'static,
+) -> impl IntoElement {
+    h_flex()
+        .gap_2()
+        .flex_wrap()
+        .children(choices.iter().enumerate().map(|(i, &(value, label))| {
+            let pick = pick.clone();
+            Button::new((id, i))
+                .label(label)
+                .small()
+                .selected(current == Some(value))
+                .disabled(disabled)
+                .on_click(move |_, window, cx| pick(value, window, cx))
+        }))
+}
+
+impl MainView {
+    /// Tells the service how long to keep the indices without an active window.
+    fn set_unload_after(&mut self, secs: u64, cx: &mut Context<Self>) {
+        if let Some(status) = &mut self.status {
+            status.unload_after_secs = secs;
+        }
+        let client = self.client.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { client.request(&Request::SetUnloadAfter { secs }) });
+        cx.spawn(async move |view, cx| {
+            let response = task.await;
+            let _ = view.update(cx, |view, cx| {
+                view.settings_error = match response {
+                    Ok(_) => None,
+                    Err(e) => Some(format!("Changing the setting failed: {}", e)),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Applies what was typed into the time fields, if it changed anything.
+    fn apply_time_fields(&mut self, cx: &mut Context<Self>) {
+        let [hours, minutes] = &self.time_fields.unload;
+        let unload = field_value(hours, cx) * 3600 + field_value(minutes, cx) * 60;
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|s| s.unload_after_secs != unload)
+        {
+            self.set_unload_after(unload, cx);
+        }
+
+        let [hours, minutes] = &self.time_fields.close_hidden;
+        let close_hidden = field_value(hours, cx) * 60 + field_value(minutes, cx);
+        let [minutes, seconds] = &self.time_fields.refresh;
+        let refresh = field_value(minutes, cx) * 60 + field_value(seconds, cx);
+        let settings = cx.global::<Settings>();
+        // Refreshing all the time is no choice, an empty field is still being typed
+        let refresh = if refresh == 0 {
+            settings.refresh_secs
+        } else {
+            refresh
+        };
+        if settings.close_hidden_after_mins != close_hidden || settings.refresh_secs != refresh {
+            Settings::update(cx, |s| {
+                s.close_hidden_after_mins = close_hidden;
+                s.refresh_secs = refresh;
+            });
+        }
+    }
+
+    /// Fills the time fields with the current settings.
+    fn fill_time_fields(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = cx.global::<Settings>().clone();
+        let fields = &self.time_fields;
+        set_fields(&fields.refresh, settings.refresh_secs, 60, window, cx);
+        set_fields(
+            &fields.close_hidden,
+            settings.close_hidden_after_mins,
+            60,
+            window,
+            cx,
+        );
+        if let Some(status) = &self.status {
+            set_fields(
+                &fields.unload,
+                status.unload_after_secs / 60,
+                60,
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// The settings, instead of the results, with a button back to them. Rebuilt on every
+    /// render from the [`Settings`] and [`DriveChoice`] globals and the service status.
+    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let settings = cx.global::<Settings>().clone();
+        let theme = cx.theme();
+        let heading = |text: &'static str| {
+            div()
+                .text_sm()
+                .font_semibold()
+                .text_color(theme.foreground)
+                .child(text)
+        };
+        let hint = |text: &'static str| {
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(text)
+        };
+
+        let drives = cx.try_global::<DriveChoice>();
+        let content = v_flex()
+            .p_4()
+            .gap_6()
+            .max_w(px(680.))
+            .child(v_flex().gap_3().child(heading("Drives")).map(|this| {
+                match drives {
+                    Some(choice) if !choice.drives.is_empty() => this
+                        .children(choice.drives.iter().map(|drive| {
                             let letter = drive.letter;
                             let mut label = format!("{}:", letter);
                             if !drive.label.is_empty() {
@@ -1458,74 +1856,103 @@ fn settings_panel(cx: &App) -> impl IntoElement {
                                 })
                         }))
                         .child(hint(
-                            "Changes apply when the settings close. Turning a drive off deletes \
-                             its index.",
-                        ))
-                    }
+                            "Changes apply when you leave the settings. Turning a drive off \
+                                 deletes its index.",
+                        )),
                     _ => this.child(hint(
                         "The drives can be chosen while the Reverything service is running.",
                     )),
-                }),
-        )
-        .child(
-            v_flex()
-                .gap_2()
-                .child(heading("Appearance"))
-                .child(h_flex().gap_2().children(ThemeChoice::ALL.iter().enumerate().map(
-                    |(i, &choice)| {
-                        Button::new(("theme", i))
-                            .label(choice.label())
-                            .small()
-                            .selected(settings.theme == choice)
-                            .on_click(move |_, window, cx| {
-                                Settings::update(cx, |s| s.theme = choice);
-                                apply_theme(Some(window), cx);
-                            })
-                    },
-                ))),
-        )
-        .child(
-            v_flex()
-                .gap_2()
-                .child(heading("Shortcut to show Reverything"))
-                .child(h_flex().gap_2().flex_wrap().children(
-                    std::iter::once(None)
-                        .chain(HotkeyChoice::ALL.iter().copied().map(Some))
-                        .enumerate()
-                        .map(|(i, choice)| {
-                            Button::new(("hotkey", i))
-                                .label(choice.map_or("Automatic", HotkeyChoice::label))
-                                .small()
-                                .selected(settings.hotkey == choice)
-                                .on_click(move |_, _, cx| {
-                                    Settings::update(cx, |s| s.hotkey = choice);
-                                    if cx.has_global::<Desktop>() {
-                                        cx.global_mut::<Desktop>().apply_hotkey(choice);
-                                    }
-                                })
-                        }),
-                ))
-                .child(hint(
-                    "Works from anywhere, also while the window is hidden in the tray. Automatic uses \
-                     the first shortcut no other program uses.",
-                ))
-                .children(
-                    cx.try_global::<Desktop>()
-                        .and_then(|d| d.active_hotkey)
-                        .filter(|c| *c != HotkeyChoice::None)
-                        .map(|c| hint_owned(theme, format!("Active: {}", c.label()))),
-                )
-                .children(
-                    cx.try_global::<Desktop>()
-                        .and_then(|d| d.hotkey_error.clone())
-                        .map(|e| div().text_xs().text_color(theme.danger).child(e)),
-                ),
-        )
-        .child(
-            v_flex()
-                .gap_3()
-                .child(heading("Updates"))
-                .child(
+                }
+            }))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(heading("Appearance"))
+                    .child(choice_buttons(
+                        "theme",
+                        &ThemeChoice::ALL.map(|c| (c, c.label())),
+                        Some(settings.theme),
+                        false,
+                        |choice, window, cx| {
+                            Settings::update(cx, |s| s.theme = choice);
+                            apply_theme(Some(window), cx);
+                        },
+                    )),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(heading("Shortcut to show Reverything"))
+                    .child(choice_buttons(
+                        "hotkey",
+                        &std::iter::once((None, "Automatic"))
+                            .chain(HotkeyChoice::ALL.iter().map(|&c| (Some(c), c.label())))
+                            .collect::<Vec<_>>(),
+                        Some(settings.hotkey),
+                        false,
+                        |choice, _, cx| {
+                            Settings::update(cx, |s| s.hotkey = choice);
+                            if cx.has_global::<Desktop>() {
+                                cx.global_mut::<Desktop>().apply_hotkey(choice);
+                            }
+                        },
+                    ))
+                    .child(hint(
+                        "Works from anywhere, also while the window is hidden in the tray. \
+                         Automatic uses the first shortcut no other program uses.",
+                    ))
+                    .children(
+                        cx.try_global::<Desktop>()
+                            .and_then(|d| d.active_hotkey)
+                            .filter(|c| *c != HotkeyChoice::None)
+                            .map(|c| hint_owned(theme, format!("Active: {}", c.label()))),
+                    )
+                    .children(
+                        cx.try_global::<Desktop>()
+                            .and_then(|d| d.hotkey_error.clone())
+                            .map(|e| div().text_xs().text_color(theme.danger).child(e)),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(heading("Timing"))
+                    .child(time_setting(
+                        "Refresh the results when files change, at most every",
+                        &self.time_fields.refresh,
+                        ["min", "s"],
+                        false,
+                        None,
+                        cx,
+                    ))
+                    .child(time_setting(
+                        "Unload the index when Reverything was not used for",
+                        &self.time_fields.unload,
+                        ["h", "min"],
+                        self.status.is_none(),
+                        Some("0 for never"),
+                        cx,
+                    ))
+                    .child(time_setting(
+                        "Close the window when it was hidden in the tray for",
+                        &self.time_fields.close_hidden,
+                        ["h", "min"],
+                        false,
+                        Some("0 for never"),
+                        cx,
+                    ))
+                    .child(hint(
+                        "An unloaded index stays saved and up to date, loading it again takes a \
+                         moment. A closed window opens again from the shortcut or the tray.",
+                    ))
+                    .children(
+                        self.settings_error
+                            .clone()
+                            .map(|e| div().text_xs().text_color(theme.danger).child(e)),
+                    ),
+            )
+            .child(
+                v_flex().gap_3().child(heading("Updates")).child(
                     // winget and Scoop installs never check, the package manager updates them
                     Switch::new("check-updates")
                         .checked(settings.check_updates && update::managed_by().is_none())
@@ -1536,101 +1963,97 @@ fn settings_panel(cx: &App) -> impl IntoElement {
                             Settings::update(cx, |s| s.check_updates = checked)
                         }),
                 ),
-        )
-        .child(
-            v_flex()
-                .gap_3()
-                .child(heading("Startup"))
-                .child(
-                    Switch::new("start-with-windows")
-                        .checked(settings.start_with_windows)
-                        .label("Start with Windows (hidden in the tray)")
-                        .on_click(|checked, _, cx| {
-                            let checked = *checked;
-                            Settings::update(cx, |s| s.start_with_windows = checked)
-                        }),
-                )
-                .child(
-                    Switch::new("close-to-tray")
-                        .checked(settings.close_to_tray)
-                        .label("Keep running in the tray when the window is closed")
-                        .on_click(|checked, _, cx| {
-                            let checked = *checked;
-                            Settings::update(cx, |s| s.close_to_tray = checked)
-                        }),
-                ),
-        )
-}
-
-impl Render for MainView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.first_frame.is_none() {
-            let elapsed = self.started.elapsed();
-            self.first_frame = Some(elapsed);
-            if std::env::var_os("REVERYTHING_LOG_STARTUP").is_some() {
-                crate::log::write(&format!("first frame after {:?}", elapsed));
-            }
-        }
-        // However the dialog was closed (button, Escape, clicking outside)
-        if self.settings_open && !window.has_active_dialog(cx) {
-            self.settings_open = false;
-            self.apply_drive_choice(cx);
-        }
-
-        let no_drives = self
-            .status
-            .as_ref()
-            .is_some_and(|s| s.volumes.iter().all(|v| v.state == VolumeState::Disabled));
+            )
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(heading("Startup"))
+                    .child(
+                        Switch::new("start-with-windows")
+                            .checked(settings.start_with_windows)
+                            .label("Start with Windows (hidden in the tray)")
+                            .on_click(|checked, _, cx| {
+                                let checked = *checked;
+                                Settings::update(cx, |s| s.start_with_windows = checked)
+                            }),
+                    )
+                    .child(
+                        Switch::new("close-to-tray")
+                            .checked(settings.close_to_tray)
+                            .label("Keep running in the tray when the window is closed")
+                            .on_click(|checked, _, cx| {
+                                let checked = *checked;
+                                Settings::update(cx, |s| s.close_to_tray = checked)
+                            }),
+                    ),
+            );
 
         v_flex()
-            .key_context(KEY_CONTEXT)
-            .on_action(cx.listener(Self::on_open))
-            .on_action(cx.listener(Self::on_reveal))
-            .on_action(cx.listener(Self::on_copy_file))
-            .on_action(cx.listener(Self::on_copy_path))
-            .on_action(cx.listener(Self::on_copy_name))
-            .on_action(cx.listener(Self::on_properties))
-            .on_action(cx.listener(Self::on_delete))
-            .on_action(cx.listener(Self::on_focus_search))
-            .on_action(cx.listener(Self::on_hide))
-            .on_action(cx.listener(Self::on_open_settings))
-            .on_action(cx.listener(Self::on_open_about))
-            .on_action(cx.listener(Self::on_toggle_files))
-            .on_action(cx.listener(Self::on_toggle_folders))
-            .size_full()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .child(self.render_title_bar(cx))
-            .child(self.render_toolbar(cx))
-            .map(|this| {
-                if no_drives {
-                    this.child(self.render_no_drives(cx))
-                } else {
-                    this.child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            // The table opens its row menu for any right click inside it, for the
-                            // last right clicked row. Forget that row before a right click
-                            // reaches the table, a row sets it again, the header and empty space
-                            // do not.
-                            .capture_any_mouse_down(cx.listener(
-                                |view, event: &MouseDownEvent, _, cx| {
-                                    if event.button == MouseButton::Right {
-                                        view.table.update(cx, |table, cx| {
-                                            table.set_right_clicked_row(None, cx)
-                                        });
-                                    }
-                                },
-                            ))
-                            .child(
-                                DataTable::new(&self.table)
-                                    .stripe(true)
-                                    .with_size(crate::results::ROW_SIZE),
+            .id("settings")
+            .track_focus(&self.settings_focus)
+            .flex_1()
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1p5()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        Button::new("settings-back")
+                            .ghost()
+                            .small()
+                            .icon(IconName::ArrowLeft)
+                            .tooltip("Back to the results (Esc)")
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.close_settings(window, cx)),
                             ),
                     )
-                }
-            })
-            .child(self.render_status_bar(window, cx))
+                    .child(div().text_sm().font_semibold().child("Settings")),
+            )
+            .child(
+                div().flex_1().overflow_hidden().child(
+                    v_flex()
+                        .id("settings-content")
+                        .size_full()
+                        .overflow_y_scrollbar()
+                        .child(content),
+                ),
+            )
     }
+}
+
+/// A duration setting on one line: the label, then the two fields with their units inside.
+fn time_setting(
+    label: &'static str,
+    fields: &[Entity<InputState>; 2],
+    units: [&'static str; 2],
+    disabled: bool,
+    note: Option<&'static str>,
+    cx: &App,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    h_flex()
+        .gap_2()
+        .text_sm()
+        .child(div().min_w(px(360.)).child(label))
+        .children(fields.iter().zip(units).map(|(field, unit)| {
+            Input::new(field)
+                .small()
+                .w(px(76.))
+                .disabled(disabled)
+                .suffix(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(unit),
+                )
+        }))
+        .children(note.map(|note| {
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(note)
+        }))
 }

@@ -62,6 +62,7 @@ impl App {
             rayon::broadcast(|_| collect());
             collect();
         });
+        set.set_unload_after(config.unload_after());
         set.set_enabled(&config.volumes);
         if !offline {
             set.delete_unused();

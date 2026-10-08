@@ -11,18 +11,14 @@ use reverything_protocol::Row;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::IDataObject;
-use windows::Win32::System::Ole::{
-    IDropSource, OleFlushClipboard, OleSetClipboard, DROPEFFECT_COPY, DROPEFFECT_LINK,
-    DROPEFFECT_MOVE,
-};
+use windows::Win32::System::Ole::{OleFlushClipboard, OleSetClipboard};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CLASSES_ROOT, RRF_RT_REG_SZ};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    BHID_DataObject, IShellItem, SHCreateItemFromParsingName, SHDoDragDrop, ShellExecuteExW,
-    ShellExecuteW, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW,
+    BHID_DataObject, ILCreateFromPathW, ILFree, SHCreateShellItemArrayFromIDLists,
+    SHFileOperationW, SHOpenFolderAndSelectItems, ShellExecuteExW, ShellExecuteW, FOF_ALLOWUNDO,
+    FO_DELETE, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, SHFILEOPSTRUCTW,
 };
-use windows::Win32::UI::Shell::{ILFree, SHOpenFolderAndSelectItems, SHParseDisplayName};
-use windows::Win32::UI::Shell::{SHFileOperationW, FOF_ALLOWUNDO, FO_DELETE, SHFILEOPSTRUCTW};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 pub fn full_path(row: &Row) -> String {
@@ -32,6 +28,16 @@ pub fn full_path(row: &Row) -> String {
     }
     path.push_str(&row.name);
     path
+}
+
+/// The folder containing `path`, `C:\` for entries at the root.
+pub fn parent(path: &str) -> Option<String> {
+    match path.trim_end_matches('\\').rsplit_once('\\') {
+        // Keep the separator of drive roots, `C:` alone means the current directory of C:
+        Some((parent, _)) if parent.len() == 2 => Some(format!("{}\\", parent)),
+        Some((parent, _)) => Some(parent.to_string()),
+        None => None,
+    }
 }
 
 /// Opens a file with its default program, or a folder with the default file manager.
@@ -55,13 +61,9 @@ pub fn reveal(path: &str) {
     if explorer_is_default() && select_in_explorer(path) {
         return;
     }
-    let folder = match path.trim_end_matches('\\').rsplit_once('\\') {
-        // Keep the separator of drive roots, `C:` alone means the current directory of C:
-        Some((parent, _)) if parent.len() == 2 => format!("{}\\", parent),
-        Some((parent, _)) => parent.to_string(),
-        None => return,
-    };
-    open(&folder);
+    if let Some(folder) = parent(path) {
+        open(&folder);
+    }
 }
 
 /// Whether folders open in Explorer, i.e. no other file manager made its verb the default.
@@ -89,35 +91,68 @@ fn explorer_is_default() -> bool {
     )
 }
 
-fn select_in_explorer(path: &str) -> bool {
-    unsafe {
-        let mut item: *mut ITEMIDLIST = std::ptr::null_mut();
-        if SHParseDisplayName(&HSTRING::from(path), None, &mut item, 0, None).is_err() {
-            return false;
+/// Item id lists of paths, freed on drop.
+struct Pidls(Vec<*mut ITEMIDLIST>);
+
+impl Pidls {
+    /// `None` if a path does not exist (any more).
+    fn new<S: AsRef<str>>(paths: &[S]) -> Option<Self> {
+        let mut pidls = Pidls(Vec::with_capacity(paths.len()));
+        for path in paths {
+            let pidl = unsafe { ILCreateFromPathW(&HSTRING::from(path.as_ref())) };
+            if pidl.is_null() {
+                return None;
+            }
+            pidls.0.push(pidl);
         }
-        // An item alone opens its parent folder with the item selected
-        let ok = SHOpenFolderAndSelectItems(item, None, 0).is_ok();
-        ILFree(Some(item));
-        ok
+        Some(pidls)
+    }
+
+    fn as_const(&self) -> Vec<*const ITEMIDLIST> {
+        self.0.iter().map(|&p| p as *const _).collect()
     }
 }
 
-/// Moves the entry to the Recycle Bin like Explorer's Delete, with Windows' confirmation if
-/// that is turned on (it is off by default). Blocks while the dialog is open. Returns whether
-/// it was deleted.
-pub fn delete(path: &str, window: Option<HWND>) -> bool {
+impl Drop for Pidls {
+    fn drop(&mut self) {
+        for &pidl in &self.0 {
+            unsafe { ILFree(Some(pidl)) };
+        }
+    }
+}
+
+fn select_in_explorer(path: &str) -> bool {
+    let Some(item) = Pidls::new(&[path]) else {
+        return false;
+    };
+    // An item alone opens its parent folder with the item selected
+    unsafe { SHOpenFolderAndSelectItems(item.0[0], None, 0).is_ok() }
+}
+
+/// Deletes the entries like Explorer: to the Recycle Bin, or for good if `permanently`, which
+/// Windows always asks to confirm. Blocks while a dialog is open. Returns whether anything was
+/// deleted.
+pub fn delete(paths: &[String], permanently: bool, window: Option<HWND>) -> bool {
     // A list of paths, each null terminated, ending with an empty one
-    let from = path.encode_utf16().chain([0, 0]).collect::<Vec<u16>>();
+    let from = paths
+        .iter()
+        .flat_map(|p| p.encode_utf16().chain([0]))
+        .chain([0])
+        .collect::<Vec<u16>>();
     let mut operation = SHFILEOPSTRUCTW {
         hwnd: window.unwrap_or_default(),
         wFunc: FO_DELETE,
         pFrom: PCWSTR(from.as_ptr()),
-        fFlags: FOF_ALLOWUNDO.0 as u16,
+        fFlags: if permanently {
+            0
+        } else {
+            FOF_ALLOWUNDO.0 as u16
+        },
         ..Default::default()
     };
     let result = unsafe { SHFileOperationW(&mut operation) };
     if result != 0 {
-        crate::log::write(&format!("Deleting {} failed with {}", path, result));
+        crate::log::write(&format!("Deleting {:?} failed with {}", paths, result));
     }
     result == 0 && !operation.fAnyOperationsAborted.as_bool()
 }
@@ -129,7 +164,7 @@ pub fn properties(path: &str) {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_INVOKEIDLIST,
         lpVerb: w!("properties"),
-        lpFile: windows::core::PCWSTR(file.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
@@ -138,37 +173,29 @@ pub fn properties(path: &str) {
     }
 }
 
-/// Puts the entry on the clipboard the way Explorer's copy does, so it can be pasted into
-/// Explorer or any other program.
-pub fn copy_to_clipboard(path: &str) {
-    let result = unsafe {
-        SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(path), None)
-            .and_then(|item| item.BindToHandler::<_, IDataObject>(None, &BHID_DataObject))
-            .and_then(|data| OleSetClipboard(&data))
-            // Keeps the data on the clipboard after the app exits
-            .and_then(|()| OleFlushClipboard())
-    };
-    if let Err(e) = result {
-        crate::log::write(&format!("Copying {} failed: {}", path, e));
+/// The entries as the shell's data object, the way Explorer copies or drags them.
+fn data_object(paths: &[String]) -> windows::core::Result<IDataObject> {
+    let pidls = Pidls::new(paths).ok_or_else(|| {
+        windows::core::Error::new(
+            windows::Win32::Foundation::E_INVALIDARG,
+            "An entry does not exist any more",
+        )
+    })?;
+    unsafe {
+        SHCreateShellItemArrayFromIDLists(&pidls.as_const())?
+            .BindToHandler::<_, IDataObject>(None, &BHID_DataObject)
     }
 }
 
-/// Drags the entry to wherever the user drops it (Explorer, the desktop, other programs), with
-/// the shell's own drag image and copy/move/link handling. Blocks until the drop.
-pub fn drag_out(path: &str, window: Option<HWND>) {
-    let result = unsafe {
-        SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(path), None)
-            .and_then(|item| item.BindToHandler::<_, IDataObject>(None, &BHID_DataObject))
-            .and_then(|data| {
-                SHDoDragDrop(
-                    window,
-                    &data,
-                    None::<&IDropSource>,
-                    DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
-                )
-            })
-    };
+/// Puts the entries on the clipboard the way Explorer's copy does, so they can be pasted into
+/// Explorer or any other program.
+pub fn copy_to_clipboard(paths: &[String]) {
+    let result = data_object(paths).and_then(|data| unsafe {
+        OleSetClipboard(&data)?;
+        // Keeps the data on the clipboard after the app exits
+        OleFlushClipboard()
+    });
     if let Err(e) = result {
-        crate::log::write(&format!("Dragging {} failed: {}", path, e));
+        crate::log::write(&format!("Copying {:?} failed: {}", paths, e));
     }
 }

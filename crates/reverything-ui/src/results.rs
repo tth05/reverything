@@ -9,15 +9,19 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::component::{h_flex, ActiveTheme, Icon, IconName, Sizable};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use reverything_protocol::{Request, Response, Row, Sort, SortColumn};
 
 use crate::client::ServiceClient;
 use crate::format;
 use crate::icons::{FileIcons, Loaded};
+use crate::selection::Selection;
 use crate::settings::{ColumnSetting, Settings};
+use crate::shell::full_path;
 use crate::view::{
-    CopyFile, CopyName, CopyPath, DeleteSelected, OpenSelected, RevealSelected, ShowProperties,
+    CopyFile, CopyName, CopyPath, DeletePermanently, DeleteSelected, OpenSelected, RevealSelected,
+    SearchInFolder, ShowProperties,
 };
 
 /// Rows fetched per request
@@ -30,8 +34,43 @@ pub const ROW_SIZE: gpui_kit::component::Size = gpui_kit::component::Size::Size(
 /// Cells get 4px vertical padding at custom sizes, the text has to fit in the rest. 16px is
 /// what 12px text needs including descenders.
 const CELL_LINE_HEIGHT: Pixels = px(16.);
-/// How far the mouse has to move with the button down before a row is dragged out
-const DRAG_THRESHOLD: Pixels = px(6.);
+
+/// Which kinds of entries the results show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Show {
+    #[default]
+    All,
+    Files,
+    Folders,
+}
+
+impl Show {
+    pub fn files(self) -> bool {
+        self != Show::Folders
+    }
+
+    pub fn folders(self) -> bool {
+        self != Show::Files
+    }
+
+    /// All, files, folders, all again
+    pub fn next(self) -> Self {
+        match self {
+            Show::All => Show::Files,
+            Show::Files => Show::Folders,
+            Show::Folders => Show::All,
+        }
+    }
+
+    /// `only`, or all if that is shown already
+    pub fn toggle(self, only: Show) -> Self {
+        if self == only {
+            Show::All
+        } else {
+            only
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnKind {
@@ -121,9 +160,11 @@ fn columns_from_settings(settings: &[ColumnSetting]) -> Vec<VisibleColumn> {
             }
         }
     }
+    // Attributes are rarely needed, they can be turned on in the header's menu
     if columns.is_empty() {
         columns = ColumnKind::ALL
             .into_iter()
+            .filter(|&kind| kind != ColumnKind::Attributes)
             .map(|kind| VisibleColumn {
                 kind,
                 width: px(kind.default_width()),
@@ -156,9 +197,7 @@ pub struct Results {
     query: String,
     /// Column the user sorted by, `None` for the default order by name
     sorted_by: Option<(ColumnKind, bool)>,
-    /// Include files and folders in the results
-    pub files: bool,
-    pub folders: bool,
+    pub show: Show,
     /// Incremented for every search we start
     seq: u64,
     /// `seq` of the search whose results are shown
@@ -188,8 +227,11 @@ pub struct Results {
     loaded_icons: Option<async_channel::Receiver<Loaded>>,
     /// Row the context menu was opened for
     pub menu_row: Option<usize>,
-    /// Row and position of a left button press that may turn into dragging the entry out
-    drag_start: Option<(usize, Point<Pixels>)>,
+    pub selection: Selection,
+    /// Row whose selection a click just changed, the table selects it as well afterwards
+    clicked: Option<usize>,
+    /// The next time the table clears its selection, the selection here stays
+    pub keep_selection: bool,
     pub last_search: Option<SearchTiming>,
     pub last_page: Option<Duration>,
     pub error: Option<String>,
@@ -203,8 +245,7 @@ impl Results {
             columns: columns_from_settings(columns),
             query: String::new(),
             sorted_by: None,
-            files: true,
-            folders: true,
+            show: Show::All,
             seq: 0,
             shown_seq: 0,
             shown_at: Instant::now(),
@@ -221,7 +262,9 @@ impl Results {
             icons,
             loaded_icons: Some(loaded_icons),
             menu_row: None,
-            drag_start: None,
+            selection: Selection::default(),
+            clicked: None,
+            keep_selection: false,
             last_search: None,
             last_page: None,
             error: None,
@@ -266,15 +309,20 @@ impl Results {
         self.query = query.clone();
         self.seq += 1;
         self.searching = true;
+        // A new search starts over, a refresh keeps the selected entries
+        if scroll_to_top {
+            self.selection.clear();
+        }
         let seq = self.seq;
+        let (files, folders) = (self.show.files(), self.show.folders());
         let request = Request::Search {
             query,
             sort: self.sort(),
-            files: self.files,
-            folders: self.folders,
+            files,
+            folders,
             rows: PAGE as u32,
         };
-        let input = (self.query.clone(), self.sort(), self.files, self.folders);
+        let input = (self.query.clone(), self.sort(), files, folders);
         self.input = input.clone();
 
         let t = Instant::now();
@@ -412,6 +460,47 @@ impl Results {
             });
         })
         .detach();
+    }
+
+    fn is_selected(&self, row: usize) -> bool {
+        !self.selection.paths.is_empty()
+            && self
+                .row(row)
+                .is_some_and(|r| self.selection.contains(&full_path(r)))
+    }
+
+    /// Changes the selection for a click on `row`, see [`Selection::click`].
+    fn click(&mut self, row: usize, modifiers: Modifiers) {
+        self.clicked = Some(row);
+        // Taken out while the closure reads the rows
+        let mut selection = std::mem::take(&mut self.selection);
+        selection.click(row, modifiers.control, modifiers.shift, |r| {
+            self.row(r).map(full_path)
+        });
+        self.selection = selection;
+    }
+
+    /// The table selected `row`: after a click on it the selection is already right, after
+    /// moving with the keyboard it is just that row. Returns whether `row` is selected.
+    pub fn table_selected(&mut self, row: usize) -> bool {
+        if self.clicked.take() == Some(row) {
+            return self.is_selected(row);
+        }
+        let path = self.row(row).map(full_path);
+        self.selection.set(row, path);
+        true
+    }
+
+    /// Selects the rows on screen. Never more, actions should only apply to entries the user
+    /// has seen.
+    pub fn select_visible(&mut self, visible: Range<usize>) {
+        self.selection.paths = visible.filter_map(|r| self.row(r).map(full_path)).collect();
+    }
+
+    /// Whether the selection has more than one entry and an action on `row` applies to all of
+    /// them.
+    fn acts_on_many(&self, row: usize) -> bool {
+        self.selection.paths.len() > 1 && self.is_selected(row)
     }
 
     fn cell_text(row: &Row, kind: ColumnKind) -> String {
@@ -677,44 +766,37 @@ impl TableDelegate for Results {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
+        // Like the table's own selected row
+        let theme = cx.theme();
+        let selected = if theme.list.active_highlight {
+            theme.tokens.table_active
+        } else {
+            theme.tokens.accent
+        };
         div()
             .id(("row", row_ix))
+            .when(self.is_selected(row_ix), |row| row.bg(selected))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |table, event: &MouseDownEvent, _, _| {
-                    table.delegate_mut().drag_start = Some((row_ix, event.position));
+                cx.listener(move |table, event: &MouseDownEvent, window, cx| {
+                    table.delegate_mut().click(row_ix, event.modifiers);
+                    table.focus_handle(cx).focus(window, cx);
+                    cx.notify();
                 }),
             )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|table, _: &MouseUpEvent, _, _| table.delegate_mut().drag_start = None),
+            // A right click on an entry that is not selected selects just it, like in Explorer
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |table, _: &MouseDownEvent, _, cx| {
+                    let results = table.delegate_mut();
+                    if !results.is_selected(row_ix) {
+                        results.click(row_ix, Modifiers::default());
+                        table.set_selected_row(row_ix, cx);
+                        // Selecting forgets the right clicked row, which the menu opens for
+                        table.set_right_clicked_row(Some(row_ix), cx);
+                    }
+                }),
             )
-            .on_mouse_move(cx.listener(|table, event: &MouseMoveEvent, window, cx| {
-                let results = table.delegate_mut();
-                let Some((row, start)) = results.drag_start else {
-                    return;
-                };
-                if event.pressed_button != Some(MouseButton::Left) {
-                    results.drag_start = None;
-                    return;
-                }
-                let moved = event.position - start;
-                if moved.x.abs() < DRAG_THRESHOLD && moved.y.abs() < DRAG_THRESHOLD {
-                    return;
-                }
-                results.drag_start = None;
-                let Some(path) = results.row(row).map(crate::shell::full_path) else {
-                    return;
-                };
-                let hwnd = crate::desktop::hwnd(window).map(|h| h.0 as usize);
-                // The shell runs its own message loop until the drop, so start it outside of
-                // this event handler
-                cx.spawn(async move |_, _| {
-                    let hwnd = hwnd.map(|h| windows::Win32::Foundation::HWND(h as *mut _));
-                    crate::shell::drag_out(&path, hwnd);
-                })
-                .detach();
-            }))
     }
 
     fn context_menu(
@@ -725,11 +807,25 @@ impl TableDelegate for Results {
         _: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
         self.menu_row = Some(row_ix);
+        let directory = self.row(row_ix).is_some_and(|r| r.directory);
+        // Opening folders and properties are for one entry
+        let single = !self.acts_on_many(row_ix);
         menu.menu_with_icon("Open", IconName::ExternalLink, Box::new(OpenSelected))
+            .when(single, |menu| {
+                menu.menu_with_icon(
+                    "Open containing folder",
+                    IconName::FolderOpen,
+                    Box::new(RevealSelected),
+                )
+            })
             .menu_with_icon(
-                "Open containing folder",
-                IconName::FolderOpen,
-                Box::new(RevealSelected),
+                if directory {
+                    "Search in this folder"
+                } else {
+                    "Search in the containing folder"
+                },
+                IconName::Search,
+                Box::new(SearchInFolder),
             )
             .separator()
             .menu_with_icon("Copy", IconName::Copy, Box::new(CopyFile))
@@ -737,7 +833,10 @@ impl TableDelegate for Results {
             .menu("Copy name", Box::new(CopyName))
             .separator()
             .menu_with_icon("Delete", IconName::Delete, Box::new(DeleteSelected))
-            .menu_with_icon("Properties", IconName::Info, Box::new(ShowProperties))
+            .menu("Delete permanently", Box::new(DeletePermanently))
+            .when(single, |menu| {
+                menu.menu_with_icon("Properties", IconName::Info, Box::new(ShowProperties))
+            })
     }
 
     fn visible_rows_changed(

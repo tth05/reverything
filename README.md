@@ -7,11 +7,11 @@ are indexed in seconds, and results appear as you type.
 
 - Search as you type, with wildcards (`*.mp3`), folders (`photos\2024`, `+C:\code\`), exclusions
   (`!node_modules\`) and size or date filters (`size:>1gb`, `dm:today`). Hover the `?` next to the search box for a short overview.
-- Open files and folders, drag them into other programs, copy them with Ctrl+C, show them in Explorer (or the file
-  manager that replaced it).
+- Open files and folders, copy them with Ctrl+C, show them in Explorer (or the file manager that replaced it), several
+  at once.
 - Lives in the tray and comes up with a global shortcut (Settings shows which one).
 - Uses almost no resources while you do not use it: the index is only kept up to date while the window has the
-  focus, and is dropped from memory after an hour without it.
+  focus, and is dropped from memory after an hour without it (adjustable in the settings).
 
 ## Contents
 - [Installation](#installation)
@@ -54,12 +54,13 @@ After installing, no drive is indexed yet: the window shows how to turn them on 
 | Ctrl+Shift+C | Copy the full path |
 | Alt+Enter | Properties |
 | Ctrl+F, Ctrl+L | Focus the search box |
-| Ctrl+, | Settings |
-| Alt+F | Show or hide files in the results |
-| Alt+D | Show or hide folders in the results |
+| Ctrl+, | Settings (Escape goes back) |
+| Alt+F, Alt+D | Only files, only folders (again for both); the button next to the search box cycles through them |
+| Ctrl+click, Shift+click | Select several results |
+| Ctrl+A | Select the results on screen (never ones you have not seen) |
+| Delete, Shift+Delete | Delete to the Recycle Bin, delete permanently (in the results, the search box keeps its own keys) |
 | Escape | Hide to the tray |
-| Drag a row | Drop the file into Explorer or any other program |
-| Right click a row | Open, open folder, copy, copy path or name, delete to the Recycle Bin, properties |
+| Right click a row | Open, open folder, search in that folder, copy, copy path or name, delete, properties |
 | Drag a column header | Reorder the columns |
 | Right click a column header | Show or hide columns |
 

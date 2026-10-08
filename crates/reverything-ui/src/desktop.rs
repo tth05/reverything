@@ -35,9 +35,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::settings::{HotkeyChoice, Settings, WindowPlacement};
 use crate::view::{FocusSearch, OpenSettings};
 
-/// A window hidden in the tray for this long is closed, and opened again when needed
-const CLOSE_HIDDEN_AFTER: Duration = Duration::from_secs(10 * 60);
-
 /// Signalled when Reverything is started a second time
 pub struct SecondInstance(usize);
 
@@ -398,7 +395,8 @@ pub fn remember_bounds(window: &Window, cx: &mut App) {
     }
 }
 
-/// Hides the window to the tray. If it stays hidden for [`CLOSE_HIDDEN_AFTER`] it is closed.
+/// Hides the window to the tray. If it stays hidden for as long as the settings say, it is
+/// closed, and opened again when needed.
 pub fn hide(window: &Window, cx: &mut App) {
     remember_bounds(window, cx);
     if let Some(h) = hwnd(window) {
@@ -406,9 +404,12 @@ pub fn hide(window: &Window, cx: &mut App) {
             let _ = ShowWindow(h, SW_HIDE);
         }
     }
-    if cx.has_global::<Desktop>() {
+    let minutes = cx.global::<Settings>().close_hidden_after_mins;
+    if cx.has_global::<Desktop>() && minutes > 0 {
         let task = cx.spawn(async move |cx| {
-            cx.background_executor().timer(CLOSE_HIDDEN_AFTER).await;
+            cx.background_executor()
+                .timer(Duration::from_secs(minutes * 60))
+                .await;
             cx.update(Desktop::close_hidden_window);
         });
         cx.global_mut::<Desktop>().close_hidden = Some(task);

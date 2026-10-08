@@ -16,6 +16,7 @@ mod format;
 mod icons;
 mod log;
 mod results;
+mod selection;
 mod settings;
 mod shell;
 mod update;

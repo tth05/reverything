@@ -131,6 +131,10 @@ pub struct Settings {
     pub check_updates: bool,
     /// Unix time of the last check for a new release
     pub last_update_check: u64,
+    /// A window hidden in the tray for this many minutes is closed to save memory, 0 for never
+    pub close_hidden_after_mins: u64,
+    /// Index changes refresh the results at most this often
+    pub refresh_secs: u64,
 }
 
 impl Default for Settings {
@@ -145,6 +149,8 @@ impl Default for Settings {
             window: None,
             check_updates: true,
             last_update_check: 0,
+            close_hidden_after_mins: 10,
+            refresh_secs: 10,
         }
     }
 }

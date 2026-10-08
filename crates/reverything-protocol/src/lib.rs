@@ -26,7 +26,7 @@ pub fn pipe_name() -> String {
 }
 
 /// Bumped on incompatible changes. Clients and the service have to agree on it.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Upper bound for requests, which come from less privileged processes
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -66,6 +66,11 @@ pub enum Request {
     /// Indexes exactly these volumes (drive letters). The choice is saved by the service.
     SetVolumes {
         volumes: Vec<char>,
+    },
+    /// Unloads the indices after no client was active for this long, 0 for never. Saved by the
+    /// service.
+    SetUnloadAfter {
+        secs: u64,
     },
     /// The client's window got (`true`) or lost the focus. The indices are only loaded and
     /// updated live while a client is active. Clients that never send this count as active
@@ -183,6 +188,8 @@ pub struct Status {
     pub private_bytes: u64,
     pub searches: u64,
     pub last_search_us: Option<u64>,
+    /// See [`Request::SetUnloadAfter`]
+    pub unload_after_secs: u64,
     /// Every NTFS volume, including the ones that are not indexed
     pub volumes: Vec<VolumeStatus>,
 }

@@ -40,8 +40,8 @@ use crate::ntfs::volume::{ntfs_volumes, volume_data, Volume};
 const IDLE_CHECK: Duration = Duration::from_secs(5 * 60);
 /// The journal is read once this fraction of it is new, long before it wraps
 const READ_AT_FRACTION: u64 = 4;
-/// Without an active client for this long, the index is dropped from memory
-const UNLOAD_AFTER: Duration = Duration::from_secs(60 * 60);
+/// Without an active client for this long, the index is dropped from memory, by default
+pub const UNLOAD_AFTER: Duration = Duration::from_secs(60 * 60);
 /// With more changed records than this, a full scan is about as fast as fetching them
 const MAX_PENDING: usize = 1_000_000;
 /// A failed volume (e.g. an unplugged USB disk) is tried again after this, doubling up to
@@ -245,6 +245,15 @@ impl IndexSet {
     pub fn set_idle_timing(&self, check: Duration, unload_after: Duration) {
         *self.idle_check.lock().unwrap() = check;
         *self.unload_after.lock().unwrap() = unload_after;
+    }
+
+    /// Unloads the indices after no client was active for this long, `None` for never.
+    pub fn set_unload_after(&self, after: Option<Duration>) {
+        *self.unload_after.lock().unwrap() = after.unwrap_or(Duration::MAX);
+    }
+
+    pub fn unload_after(&self) -> Option<Duration> {
+        Some(*self.unload_after.lock().unwrap()).filter(|&d| d != Duration::MAX)
     }
 
     pub fn generation(&self) -> u64 {
@@ -672,9 +681,11 @@ impl IndexSet {
     }
 
     /// Waits until a client becomes active, the service stops, the volume is disabled, or
-    /// [`IDLE_CHECK`] passed.
+    /// [`IDLE_CHECK`] passed, or the time to unload after if that is shorter.
     fn wait_inactive(&self, i: usize, run: u64) {
-        let check = *self.idle_check.lock().unwrap();
+        let check = (*self.idle_check.lock().unwrap())
+            .min(*self.unload_after.lock().unwrap())
+            .max(Duration::from_secs(1));
         let lock = self.wake_lock.lock().unwrap();
         let _ = self
             .wake
