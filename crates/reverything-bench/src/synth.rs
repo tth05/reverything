@@ -8,6 +8,7 @@
 //! A part can keep only a fraction of the source: whole subtrees of at most [`SUBTREE`] entries
 //! are kept or dropped. Everything is derived from a seed, so a spec always gives the same index.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -90,7 +91,7 @@ pub fn run(source_dir: &Path, out_dir: &Path, spec: &str, seed: u64) -> Result<(
 
     let mut sources = HashMap::new();
     for part in targets.iter().flat_map(|t| &t.parts) {
-        if !sources.contains_key(&part.source) {
+        if let Entry::Vacant(slot) = sources.entry(part.source) {
             let t = std::time::Instant::now();
             let index = load_offline(Volume { id: part.source }, source_dir)?;
             println!(
@@ -99,7 +100,7 @@ pub fn run(source_dir: &Path, out_dir: &Path, spec: &str, seed: u64) -> Result<(
                 index.file_count(),
                 t.elapsed()
             );
-            sources.insert(part.source, index);
+            slot.insert(index);
         }
     }
 
@@ -181,8 +182,8 @@ fn copy_part(
     };
 
     let (sr, r) = (&src.records, &mut out.records);
-    for id in 0..sr.len() {
-        if sr.flags[id] & FLAG_IN_USE == 0 || !keep[id] {
+    for (id, &kept) in keep.iter().enumerate() {
+        if sr.flags[id] & FLAG_IN_USE == 0 || !kept {
             continue;
         }
         let t = base as usize + id;
