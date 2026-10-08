@@ -75,6 +75,9 @@ GPUI_FXC_PATH = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.20348.0\x64\fxc
   should use a directory in the repository, e.g. `target\dev-db`.
 - `REVERYTHING_PIPE=\\.\pipe\reverything-dev` makes the window, `query` and the console/bench service use another
   pipe, so a development service can run next to the installed one. The installed service ignores it.
+- `RV_UI_TRACE=1` makes the window log every search to `ui.log`: hits, service time, when the answer arrived
+  and when the frame with its rows was done, counted from the input change. `RV_UI_SCRIPT=d||e|` puts each
+  `|` separated text into the search box, one per second, to measure without typing.
 - `reverything-service query <text>` searches through a running service from the command line.
   `RV_QUERY_VOLUMES=CD` first changes the indexed volumes, `RV_QUERY_NO_FILES` / `RV_QUERY_NO_FOLDERS` filter the
   results and `RV_QUERY_STATUS` prints the full status (`RV_QUERY_STATUS_ONLY` without searching, which would count

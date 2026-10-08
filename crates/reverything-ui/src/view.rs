@@ -210,7 +210,28 @@ impl MainView {
             .detach();
         view.search(true, cx);
         view.poll_status(window, cx);
+        view.run_script(window, cx);
         view
+    }
+
+    /// For measuring: `RV_UI_SCRIPT=d||e||` puts each `|` separated text into the search box,
+    /// one per second, as if typed
+    fn run_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(script) = std::env::var("RV_UI_SCRIPT") else {
+            return;
+        };
+        let steps = script.split('|').map(str::to_string).collect::<Vec<_>>();
+        cx.spawn_in(window, async move |view, cx| {
+            for step in steps {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let _ = view.update_in(cx, |view, window, cx| {
+                    view.input
+                        .update(cx, |input, cx| input.set_value(step, window, cx));
+                    view.search(true, cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn search(&mut self, scroll_to_top: bool, cx: &mut Context<Self>) {

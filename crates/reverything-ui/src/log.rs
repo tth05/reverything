@@ -6,6 +6,13 @@ use std::time::SystemTime;
 
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
+/// Whether `RV_UI_TRACE` asks for timings of every search, from the input change to the frame
+/// showing its rows
+pub fn tracing() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("RV_UI_TRACE").is_some())
+}
+
 pub fn write(message: &str) {
     let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
         return;

@@ -170,6 +170,10 @@ pub struct Results {
     input: (String, Sort, bool, bool),
     /// The newest search has not been answered yet
     searching: bool,
+    /// With `RV_UI_TRACE`: when the shown search started and what to log once its rows are drawn
+    trace_frame: Option<(Instant, String)>,
+    /// When the newest search started, for tracing
+    search_started: Instant,
     /// Id of the result set on the service side
     search: u64,
     total: usize,
@@ -206,6 +210,8 @@ impl Results {
             shown_at: Instant::now(),
             input: (String::new(), Sort::default(), true, true),
             searching: false,
+            trace_frame: None,
+            search_started: Instant::now(),
             search: 0,
             total: 0,
             pages: HashMap::new(),
@@ -272,6 +278,7 @@ impl Results {
         self.input = input.clone();
 
         let t = Instant::now();
+        self.search_started = t;
         let response = self.client.send(request);
 
         cx.spawn(async move |table, cx| {
@@ -293,6 +300,18 @@ impl Results {
                 }
                 results.shown_seq = seq;
                 results.shown_at = Instant::now();
+                if crate::log::tracing() {
+                    if let Ok(Response::Search { total, took_us, .. }) = &response {
+                        let summary = format!(
+                            "{:?}: {} hits, service {:.1} ms, answer after {:.1} ms",
+                            input.0,
+                            total,
+                            *took_us as f64 / 1000.0,
+                            ms(t.elapsed())
+                        );
+                        results.trace_frame = Some((t, summary));
+                    }
+                }
                 results.searching = seq != results.seq;
                 match response {
                     Ok(Response::Search {
@@ -451,6 +470,10 @@ impl Results {
     }
 }
 
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
 /// The parts of `text` that matched the search, in bold.
 fn bold_ranges(text: &str, ranges: &[(u32, u32)]) -> Vec<(Range<usize>, HighlightStyle)> {
     let bold = HighlightStyle {
@@ -525,9 +548,20 @@ impl TableDelegate for Results {
         &mut self,
         row_ix: usize,
         col_ix: usize,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        if let Some((started, summary)) = self.trace_frame.take() {
+            let drawing = started.elapsed();
+            window.on_next_frame(move |_, _| {
+                crate::log::write(&format!(
+                    "trace {}, drawing after {:.1} ms, frame done after {:.1} ms",
+                    summary,
+                    ms(drawing),
+                    ms(started.elapsed())
+                ))
+            });
+        }
         let Some(row) = self.row(row_ix) else {
             return div().into_any_element();
         };
@@ -557,6 +591,13 @@ impl TableDelegate for Results {
             cx.spawn(async move |table, cx| {
                 while let Ok(icon) = loaded.recv().await {
                     let updated = table.update(cx, |table, cx| {
+                        if crate::log::tracing() {
+                            crate::log::write(&format!(
+                                "trace icon {:?} after {:.1} ms",
+                                icon.0,
+                                ms(table.delegate().search_started.elapsed())
+                            ));
+                        }
                         table.delegate_mut().icons.insert(icon);
                         cx.notify();
                     });
