@@ -305,15 +305,21 @@ fn bench_startup(volumes: Vec<reverything_core::ntfs::volume::Volume>) -> Result
                     let t = Instant::now();
                     let mut follower = JournalFollower::new(&index)?;
                     let changed = follower.poll_changes().map_err(|e| eyre::eyre!("{:?}", e))?;
+                    let poll = t.elapsed();
+                    let t = Instant::now();
                     let updates = follower.fetch(&changed);
+                    let fetch = t.elapsed();
+                    let t = Instant::now();
                     index.apply_updates(&updates, follower.reader.next_usn());
                     println!(
-                        "{}: loaded {} entries in {:?}, replayed {} journal records ({} updates) in {:?}",
+                        "{}: loaded {} entries in {:?}, replayed {} journal records ({} updates): read journal {:?}, fetch {:?}, apply {:?}",
                         vol.id,
                         index.file_count(),
                         loaded,
                         changed.len(),
                         updates.len(),
+                        poll,
+                        fetch,
                         t.elapsed()
                     );
                     Ok(index)
