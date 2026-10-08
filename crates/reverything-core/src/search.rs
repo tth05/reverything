@@ -89,6 +89,18 @@ pub fn search_all(
     sort: Sort,
     excluded: &[Option<Vec<u64>>],
 ) -> Results {
+    search_all_cancellable(set, query, sort, excluded, &|| false).expect("Not cancelled")
+}
+
+/// [`search_all`] that gives up once `cancelled` returns true, `None` then. Matching and
+/// scoring ask it once per chunk of entries, so it should be cheap, like an atomic load.
+pub fn search_all_cancellable(
+    set: &IndexSet,
+    query: &Query,
+    sort: Sort,
+    excluded: &[Option<Vec<u64>>],
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Option<Results> {
     let _span = info_span!("search").entered();
     let indices = info_span!("search.lock").in_scope(|| read_all(set));
 
@@ -101,13 +113,16 @@ pub fn search_all(
             if query.is_match_all() && excluded.is_none() {
                 index.sorted.clone()
             } else {
-                Arc::new(index.search(query, excluded))
+                Arc::new(index.search_cancellable(query, excluded, cancelled))
             }
         })
         .enumerate()
         .filter(|(_, ids)| !ids.is_empty())
         .collect::<Vec<_>>();
     drop(matching);
+    if cancelled() {
+        return None;
+    }
 
     let descending = !sort.ascending;
     let total = per_volume.iter().map(|(_, ids)| ids.len()).sum::<usize>();
@@ -130,7 +145,7 @@ pub fn search_all(
             Results::lazy(order, descending, lists)
         };
     let _sorting = info_span!("search.sort").entered();
-    match sort.column {
+    let results = match sort.column {
         SortColumn::Relevance => match Ranker::new(query) {
             Some(ranker) => {
                 let lists = per_volume
@@ -143,6 +158,9 @@ pub fn search_all(
                             ids.par_chunks(4096)
                                 .flat_map_iter(|chunk| {
                                     let mut scores = Vec::with_capacity(chunk.len());
+                                    if cancelled() {
+                                        return scores.into_iter();
+                                    }
                                     prefetched(
                                         chunk,
                                         |id| ranker.prefetch_record(index, id),
@@ -153,6 +171,14 @@ pub fn search_all(
                                 })
                                 .collect::<Vec<_>>()
                         });
+                        // Grouping millions of hits takes milliseconds
+                        if cancelled() {
+                            return List {
+                                volume: v,
+                                ids: Arc::default(),
+                                groups: Vec::new(),
+                            };
+                        }
                         let (ids, groups) =
                             info_span!("search.group").in_scope(|| group_by_score(&ids, &scores));
                         List {
@@ -199,7 +225,8 @@ pub fn search_all(
                 .map(|(v, ids)| list(v, ids))
                 .collect(),
         ),
-    }
+    };
+    (!cancelled()).then_some(results)
 }
 
 /// Merges the per volume results, which are each in name order, into one list ordered by name,

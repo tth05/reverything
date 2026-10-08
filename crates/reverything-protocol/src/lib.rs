@@ -73,12 +73,21 @@ pub enum Request {
     SetActive {
         active: bool,
     },
+    /// Stops search number `search` of the connection whose [`Response::Hello`] gave
+    /// `session`, if it still runs; it is answered with [`Response::Cancelled`]. Sent on another
+    /// connection, since the one searching waits for the answer.
+    Cancel {
+        session: u64,
+        search: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     Hello {
         version: u32,
+        /// Identifies this connection for [`Request::Cancel`]
+        session: u64,
     },
     Search {
         search: u64,
@@ -86,6 +95,10 @@ pub enum Response {
         took_us: u64,
         /// The first rows, as many as asked for
         rows: Vec<Row>,
+    },
+    /// The search with this number was cancelled, see [`Request::Cancel`]. It has no results.
+    Cancelled {
+        search: u64,
     },
     Rows {
         search: u64,
@@ -260,6 +273,7 @@ pub fn read_message<T: DeserializeOwned>(r: &mut impl Read, max_bytes: usize) ->
 pub struct Client {
     reader: io::BufReader<std::fs::File>,
     writer: io::BufWriter<std::fs::File>,
+    session: u64,
 }
 
 impl Client {
@@ -286,12 +300,16 @@ impl Client {
         let mut client = Self {
             reader: io::BufReader::new(file.try_clone()?),
             writer: io::BufWriter::new(file),
+            session: 0,
         };
         match client.request(&Request::Hello {
             version: PROTOCOL_VERSION,
         })? {
-            Response::Hello { version } if version == PROTOCOL_VERSION => Ok(client),
-            Response::Hello { version } => Err(io::Error::other(format!(
+            Response::Hello { version, session } if version == PROTOCOL_VERSION => {
+                client.session = session;
+                Ok(client)
+            }
+            Response::Hello { version, .. } => Err(io::Error::other(format!(
                 "The service speaks protocol version {}, expected {}",
                 version, PROTOCOL_VERSION
             ))),
@@ -302,6 +320,11 @@ impl Client {
     pub fn request(&mut self, request: &Request) -> io::Result<Response> {
         write_message(&mut self.writer, request)?;
         read_message(&mut self.reader, MAX_RESPONSE_BYTES)
+    }
+
+    /// Identifies this connection for [`Request::Cancel`]
+    pub fn session(&self) -> u64 {
+        self.session
     }
 }
 

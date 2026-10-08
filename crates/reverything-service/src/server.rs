@@ -3,11 +3,12 @@
 //! Clients run with fewer privileges than the service, so everything they send is treated as
 //! untrusted: message sizes are capped and the service never touches files on their behalf.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use eyre::{bail, Result};
@@ -25,7 +26,7 @@ use reverything_core::index::build::ScanStats;
 use reverything_core::index::search::{FolderExclusion, Matcher, Query};
 use reverything_core::index::{ATTRIBUTE_MASK, FLAG_DIRECTORY};
 use reverything_core::results::Results;
-use reverything_core::search::{exclusions, hit_parts, read_all, search_all};
+use reverything_core::search::{exclusions, hit_parts, read_all, search_all_cancellable};
 use reverything_core::service::{self as core_service, BatchStats, IndexSet, SaveStats};
 use reverything_protocol::{
     read_message, write_message, BatchTimings, Request, Response, Row, SaveTimings, SavedIndex,
@@ -39,6 +40,8 @@ use crate::security::{SecurityAttributes, PIPE_SDDL};
 pub struct Server {
     set: Arc<IndexSet>,
     pipe: String,
+    /// Per connection token: the number up to which its searches are cancelled
+    sessions: Mutex<HashMap<u64, Arc<AtomicU64>>>,
     searches: AtomicU64,
     /// Duration of the last search in microseconds, `u64::MAX` if there was none
     last_search_us: AtomicU64,
@@ -49,6 +52,7 @@ impl Server {
         Arc::new(Self {
             set,
             pipe,
+            sessions: Mutex::default(),
             searches: AtomicU64::new(0),
             last_search_us: AtomicU64::new(u64::MAX),
         })
@@ -88,8 +92,16 @@ impl Server {
     }
 
     fn handle_client(&self, file: File) -> Result<()> {
-        let mut session = Session::default();
+        let mut session = Session {
+            token: random_token(),
+            ..Default::default()
+        };
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(session.token, session.cancel.clone());
         let result = self.serve_session(&mut session, &file);
+        self.sessions.lock().unwrap().remove(&session.token);
         if session.active == Some(true) {
             self.set.client_active(false);
         }
@@ -116,6 +128,7 @@ impl Server {
         match request {
             Request::Hello { .. } => Response::Hello {
                 version: PROTOCOL_VERSION,
+                session: session.token,
             },
             Request::Search {
                 query,
@@ -134,6 +147,8 @@ impl Server {
                 if session.active == Some(true) {
                     self.set.wait_until_awake(WAKE_WAIT);
                 }
+                session.search += 1;
+                let id = session.search;
                 let t = Instant::now();
                 let mut query = Query::parse(&query);
                 session.names = query
@@ -150,18 +165,23 @@ impl Server {
                 query.folders.truncate(MAX_EXCLUDED_FOLDERS);
                 query.skip_files = !files;
                 query.skip_folders = !folders;
+                let cancel = session.cancel.clone();
+                let cancelled = move || cancel.load(Ordering::Relaxed) >= id;
                 let results = {
                     let excluded =
                         session.exclusions(&self.set, std::mem::take(&mut query.folders));
-                    search_all(&self.set, &query, core_sort(sort), excluded)
+                    search_all_cancellable(&self.set, &query, core_sort(sort), excluded, &cancelled)
+                };
+                let Some(results) = results else {
+                    session.results = Results::default();
+                    return Response::Cancelled { search: id };
                 };
                 session.results = results;
-                session.search += 1;
                 let took_us = t.elapsed().as_micros() as u64;
                 self.searches.fetch_add(1, Ordering::Relaxed);
                 self.last_search_us.store(took_us, Ordering::Relaxed);
                 Response::Search {
-                    search: session.search,
+                    search: id,
                     total: session.results.len() as u64,
                     took_us,
                     rows: self.rows(session, 0, rows.min(MAX_ROWS_PER_REQUEST) as usize),
@@ -186,6 +206,15 @@ impl Server {
             Request::RefreshVolumes => {
                 self.set.refresh_volumes();
                 Response::Status(self.status())
+            }
+            Request::Cancel {
+                session: token,
+                search,
+            } => {
+                if let Some(cancel) = self.sessions.lock().unwrap().get(&token) {
+                    cancel.fetch_max(search, Ordering::Relaxed);
+                }
+                Response::Done
             }
             Request::SetActive { active } => {
                 if session.active.unwrap_or(false) != active {
@@ -340,6 +369,10 @@ type CachedExclusions = (Vec<FolderExclusion>, Instant, Vec<Option<Vec<u64>>>);
 
 #[derive(Default)]
 struct Session {
+    /// Identifies the connection for [`Request::Cancel`]
+    token: u64,
+    /// Searches up to this number are cancelled
+    cancel: Arc<AtomicU64>,
     /// Whether the client's window is active, `None` until it says
     active: Option<bool>,
     search: u64,
@@ -481,4 +514,17 @@ fn volume_status(letter: char, s: core_service::VolumeStats) -> VolumeStatus {
         records_updated: s.records_updated,
         last_save: s.last_save.map(save),
     }
+}
+
+/// Hard to guess, so other processes cannot cancel the searches of a connection
+fn random_token() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    hasher.finish()
 }

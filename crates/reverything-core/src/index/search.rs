@@ -401,6 +401,17 @@ impl VolumeIndex {
     /// Matching entries in name order. `excluded` is a bitset of directories (see
     /// [`VolumeIndex::exclusions`]) whose entries are left out.
     pub fn search(&self, query: &Query, excluded: Option<&[u64]>) -> Vec<u32> {
+        self.search_cancellable(query, excluded, &|| false)
+    }
+
+    /// [`VolumeIndex::search`] that skips the rest once `cancelled` returns true, which it asks
+    /// once per chunk of entries. The result is incomplete then.
+    pub fn search_cancellable(
+        &self,
+        query: &Query,
+        excluded: Option<&[u64]>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Vec<u32> {
         if !query.include.iter().all(|t| self.on_this_volume(t))
             || (query.skip_files && query.skip_folders)
         {
@@ -468,11 +479,13 @@ impl VolumeIndex {
             .par_chunks(4096)
             .flat_map_iter(|chunk| {
                 let mut hits = Vec::new();
-                prefetched(chunk, far, near, |id| {
-                    if keep(id) {
-                        hits.push(id);
-                    }
-                });
+                if !cancelled() {
+                    prefetched(chunk, far, near, |id| {
+                        if keep(id) {
+                            hits.push(id);
+                        }
+                    });
+                }
                 hits.into_iter()
             })
             .collect()

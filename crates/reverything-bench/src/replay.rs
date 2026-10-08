@@ -1,11 +1,15 @@
-//! Types queries against a running service the way the window does, and measures for every
-//! keystroke how long it takes until rows for that text (or something typed later) arrived.
+//! Types queries against a running service the way the window does, in bursts with pauses, and
+//! measures for every pause how long after the last keystroke the rows for exactly that text
+//! arrived. That is what the window shows: answers for text that was typed over are ignored.
 //!
-//! `serial` does what the window did before the request pipeline: one task per keystroke,
-//! taking turns on one connection, outdated results dropped once they arrived, and the rows
-//! asked for after the search. `pipeline` is what it does now: requests go through
-//! [`reverything_protocol::pipeline`], the first rows come with the search, and every answer
-//! newer than the shown one is shown. A status poll runs every second in both.
+//! - `serial`: what the window did before the request pipeline: one task per keystroke, taking
+//!   turns on one connection, outdated results dropped once they arrived, the rows asked for
+//!   after the search
+//! - `pipeline`: requests go through [`reverything_protocol::pipeline`] and the first rows come
+//!   with the search, but running searches are not cancelled
+//! - `cancel`: like `pipeline`, and a newer search cancels the running one
+//!
+//! A status poll runs every second in all of them.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,20 +20,47 @@ use eyre::{bail, Result};
 use reverything_protocol::pipeline::{Pipeline, Transport};
 use reverything_protocol::{Client, Request, Response, Sort};
 
-/// What gets typed: each step is the input text after one keystroke
-fn script() -> Vec<String> {
+/// The texts typed one after the other. The typist pauses after each.
+const TARGETS: &[&str] = &[
+    "note",
+    "notepad",
+    "",
+    "rea",
+    "readme.md",
+    "readme",
+    "",
+    "e",
+    "",
+    "s",
+    "src",
+    "",
+    "index.js",
+    "",
+];
+const PAUSE: Duration = Duration::from_millis(400);
+
+/// The text after every keystroke, and whether the typist pauses after it
+fn script() -> Vec<(String, bool)> {
     let mut steps = Vec::new();
-    let typed = |text: &str, steps: &mut Vec<String>| {
-        for i in 1..=text.len() {
-            steps.push(text[..i].to_string());
+    let mut text = String::new();
+    for target in TARGETS {
+        let common = text
+            .bytes()
+            .zip(target.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while text.len() > common {
+            text.pop();
+            steps.push((text.clone(), false));
         }
-        for i in (0..text.len()).rev() {
-            steps.push(text[..i].to_string());
+        for c in target[common..].chars() {
+            text.push(c);
+            steps.push((text.clone(), false));
         }
-    };
-    typed("notepad", &mut steps);
-    typed("readme.md", &mut steps);
-    typed("e", &mut steps);
+        if let Some(last) = steps.last_mut() {
+            last.1 = true;
+        }
+    }
     steps
 }
 
@@ -59,6 +90,13 @@ fn connect() -> std::io::Result<Client> {
 
 pub fn run(mode: &str, interval: Duration) -> Result<()> {
     let steps = script();
+    let mut at = Vec::with_capacity(steps.len());
+    let mut t = Duration::ZERO;
+    for (_, pause) in &steps {
+        at.push(t);
+        t += interval + if *pause { PAUSE } else { Duration::ZERO };
+    }
+
     // Warm up the service: loaded indices, ranking locations
     let mut warm = connect()?;
     for q in ["", "a", "e"] {
@@ -67,16 +105,15 @@ pub fn run(mode: &str, interval: Duration) -> Result<()> {
     drop(warm);
 
     let start = Instant::now();
-    // When rows for each step arrived
+    // When the rows for each step arrived
     let done: Arc<Mutex<Vec<Option<Duration>>>> = Arc::new(Mutex::new(vec![None; steps.len()]));
     let latest = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let mut threads = Vec::new();
 
     match mode {
         "serial" => {
             let client = Arc::new(Mutex::new(connect()?));
-            threads.push(std::thread::spawn({
+            std::thread::spawn({
                 let (client, stop) = (client.clone(), stop.clone());
                 move || {
                     while !stop.load(Ordering::SeqCst) {
@@ -84,13 +121,13 @@ pub fn run(mode: &str, interval: Duration) -> Result<()> {
                         std::thread::sleep(Duration::from_secs(1));
                     }
                 }
-            }));
-            for (k, text) in steps.iter().enumerate() {
-                sleep_until(start + interval * k as u32);
+            });
+            for (k, (text, _)) in steps.iter().enumerate() {
+                sleep_until(start + at[k]);
                 latest.store(k, Ordering::SeqCst);
                 let (client, done, latest, text) =
                     (client.clone(), done.clone(), latest.clone(), text.clone());
-                threads.push(std::thread::spawn(move || {
+                std::thread::spawn(move || {
                     let response = client.lock().unwrap().request(&search(&text, 0));
                     // The window dropped responses of outdated searches
                     if latest.load(Ordering::SeqCst) != k {
@@ -103,15 +140,18 @@ pub fn run(mode: &str, interval: Duration) -> Result<()> {
                         let _ = client.lock().unwrap().request(&rows(search, page));
                     }
                     done.lock().unwrap()[k] = Some(start.elapsed());
-                }));
+                });
             }
         }
-        "pipeline" => {
+        "pipeline" | "cancel" => {
             let pipeline = Arc::new(Pipeline::new(
                 || Ok(Box::new(connect()?) as Box<dyn Transport>),
                 || None,
             ));
-            threads.push(std::thread::spawn({
+            if mode == "pipeline" {
+                pipeline.keep_running_searches();
+            }
+            std::thread::spawn({
                 let (pipeline, stop) = (pipeline.clone(), stop.clone());
                 move || {
                     while !stop.load(Ordering::SeqCst) {
@@ -119,30 +159,29 @@ pub fn run(mode: &str, interval: Duration) -> Result<()> {
                         std::thread::sleep(Duration::from_secs(1));
                     }
                 }
-            }));
-            for (k, text) in steps.iter().enumerate() {
-                sleep_until(start + interval * k as u32);
+            });
+            for (k, (text, _)) in steps.iter().enumerate() {
+                sleep_until(start + at[k]);
                 let reply = pipeline.send(search(text, 256));
                 let (pipeline, done) = (pipeline.clone(), done.clone());
-                threads.push(std::thread::spawn(move || {
-                    // Closed without a reply if a newer search replaced it
+                std::thread::spawn(move || {
+                    // Closed without a reply if a newer search replaced or cancelled it
                     let Ok(Ok(Response::Search { search, .. })) = reply.recv_blocking() else {
                         return;
                     };
-                    // The first page came with the answer and can be shown, even if newer
-                    // input is on its way
+                    // The first page came with the answer
                     done.lock().unwrap()[k] = Some(start.elapsed());
                     let _ = pipeline.send(rows(search, 1)).recv_blocking();
-                }));
+                });
             }
         }
-        _ => bail!("Mode is serial or pipeline"),
+        _ => bail!("Mode is serial, pipeline or cancel"),
     }
 
-    // Everything typed is answered once the last step is
+    // The last step is a pause, so it gets an answer
     let last = steps.len() - 1;
     while done.lock().unwrap()[last].is_none() {
-        if start.elapsed() > interval * steps.len() as u32 + Duration::from_secs(60) {
+        if start.elapsed() > t + Duration::from_secs(60) {
             bail!("No rows for the last step after a minute");
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -151,32 +190,29 @@ pub fn run(mode: &str, interval: Duration) -> Result<()> {
 
     let done = done.lock().unwrap().clone();
     let mut latencies = Vec::new();
-    println!("{:<12} {:>9} {:>11}", "input", "typed at", "rows after");
-    for (k, text) in steps.iter().enumerate() {
-        let typed = interval * k as u32;
-        // Rows for this or a later input
-        let shown = done[k..].iter().flatten().min().copied();
-        let latency = shown.map(|s| s.saturating_sub(typed));
-        if let Some(l) = latency {
-            latencies.push(l);
+    println!("{:<12} {:>11}", "paused at", "rows after");
+    for (k, (text, pause)) in steps.iter().enumerate() {
+        if !pause {
+            continue;
         }
+        let latency = done[k].map(|d| d.saturating_sub(at[k]));
+        latencies.extend(latency);
         println!(
-            "{:<12} {:>7} ms {:>8} ms",
+            "{:<12} {:>8} ms",
             format!("{:?}", text),
-            typed.as_millis(),
             latency.map_or("-".into(), |l| format!("{:.0}", l.as_secs_f64() * 1000.0))
         );
     }
     latencies.sort();
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     println!(
-        "{}: {} keystrokes every {} ms, rows after: median {:.0} ms, 90% {:.0} ms, max {:.0} ms",
+        "{}: keystrokes every {} ms, rows {} ms after the last one before a pause (median), max {:.0} ms",
         mode,
-        steps.len(),
         interval.as_millis(),
-        ms(latencies[latencies.len() / 2]),
-        ms(latencies[latencies.len() * 9 / 10]),
-        ms(*latencies.last().unwrap())
+        latencies
+            .get(latencies.len() / 2)
+            .map_or("-".into(), |&l| format!("{:.0}", ms(l))),
+        latencies.last().map_or(0.0, |&l| ms(l))
     );
     Ok(())
 }

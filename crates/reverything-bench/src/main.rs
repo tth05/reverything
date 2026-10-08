@@ -9,7 +9,7 @@
 //!     compares two saved runs
 //! reverything-bench journal [--dir DIR] [--volume C] [--runs N]
 //!     times applying batches of journal changes to one volume
-//! reverything-bench replay serial|pipeline [--interval MS]
+//! reverything-bench replay serial|pipeline|cancel [--interval MS]
 //!     types queries against a running service (REVERYTHING_PIPE), see replay.rs
 //! ```
 //!
