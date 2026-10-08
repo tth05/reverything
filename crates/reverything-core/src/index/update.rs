@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use fixedbitset::FixedBitSet;
 use rayon::prelude::*;
 use tracing::info_span;
 
@@ -434,23 +435,21 @@ impl VolumeIndex {
 
     /// [`VolumeIndex::resort`] for large batches: filters the whole list, then inserts `new`.
     fn resort_all(&mut self, touched: &[u32], new: &[u32]) {
-        let mut records = vec![0u64; self.records.len().div_ceil(64)];
-        let mut links = vec![0u64; self.links.len().div_ceil(64)];
+        let mut records = FixedBitSet::with_capacity(self.records.len());
+        let mut links = FixedBitSet::with_capacity(self.links.len());
         for &id in touched {
-            let (set, i) = if is_link(id) {
-                (&mut links, link_index(id))
+            if is_link(id) {
+                links.insert(link_index(id));
             } else {
-                (&mut records, id as usize)
-            };
-            set[i / 64] |= 1 << (i % 64);
+                records.insert(id as usize);
+            }
         }
         let untouched = |id: u32| {
-            let (set, i) = if is_link(id) {
-                (&links, link_index(id))
+            if is_link(id) {
+                !links.contains(link_index(id))
             } else {
-                (&records, id as usize)
-            };
-            set[i / 64] & (1 << (i % 64)) == 0
+                !records.contains(id as usize)
+            }
         };
         // Search results may still hold the current list
         match Arc::get_mut(&mut self.sorted) {

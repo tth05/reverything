@@ -7,7 +7,8 @@ use tracing::info_span;
 
 use crate::index::folders::NO_RANK;
 use crate::index::rank::{group_by_score, Ranker};
-use crate::index::search::{FolderExclusion, Query};
+use crate::index::scope::Scope;
+use crate::index::search::{FolderScope, Query};
 use crate::index::{prefetch, prefetched, VolumeIndex};
 use crate::results::{List, Order, Results};
 use crate::service::IndexSet;
@@ -53,12 +54,13 @@ impl Default for Sort {
     }
 }
 
-/// Per volume bitsets of the directories a query's folder exclusions leave out, for
-/// [`search_all`]. Resolving them walks every directory, so callers may cache the result.
-pub fn exclusions(set: &IndexSet, folders: &[FolderExclusion]) -> Vec<Option<Vec<u64>>> {
+/// The query's folder scopes resolved per volume, for [`search_all`]. Resolving them walks
+/// every directory, so callers may cache the result.
+pub fn scopes(set: &IndexSet, folders: &[FolderScope]) -> Vec<Scope> {
+    let _span = info_span!("search.scope").entered();
     set.volumes
         .par_iter()
-        .map(|v| v.index.read().unwrap().exclusions(folders))
+        .map(|v| v.index.read().unwrap().scope(folders))
         .collect()
 }
 
@@ -70,19 +72,14 @@ pub fn read_all(set: &IndexSet) -> Vec<RwLockReadGuard<'_, VolumeIndex>> {
         .collect()
 }
 
-/// Searches all volumes. `excluded` holds the resolved folder exclusions of the query per
-/// volume, see [`exclusions`].
+/// Searches all volumes. `scopes` holds the resolved folder scopes of the query per volume (see
+/// [`scopes`]), missing ones are [`Scope::All`].
 ///
 /// The hits of every volume are put in their final order within the volume; the combined order
 /// is only worked out for the rows that are read, see [`Results`]. Each phase runs in a
 /// `tracing` span named `search.*`, so benchmarks and traces can tell where the time goes.
-pub fn search_all(
-    set: &IndexSet,
-    query: &Query,
-    sort: Sort,
-    excluded: &[Option<Vec<u64>>],
-) -> Results {
-    search_all_cancellable(set, query, sort, excluded, &|| false).expect("Not cancelled")
+pub fn search_all(set: &IndexSet, query: &Query, sort: Sort, scopes: &[Scope]) -> Results {
+    search_all_cancellable(set, query, sort, scopes, &|| false).expect("Not cancelled")
 }
 
 /// [`search_all`] that gives up once `cancelled` returns true, `None` then. Matching and
@@ -91,7 +88,7 @@ pub fn search_all_cancellable(
     set: &IndexSet,
     query: &Query,
     sort: Sort,
-    excluded: &[Option<Vec<u64>>],
+    scopes: &[Scope],
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Option<Results> {
     let _span = info_span!("search").entered();
@@ -102,11 +99,11 @@ pub fn search_all_cancellable(
         .par_iter()
         .enumerate()
         .map(|(i, index)| {
-            let excluded = excluded.get(i).and_then(|e| e.as_deref());
-            if query.is_match_all() && excluded.is_none() {
+            let scope = scopes.get(i).unwrap_or(&Scope::All);
+            if query.is_match_all() && matches!(scope, Scope::All) {
                 index.sorted.clone()
             } else {
-                Arc::new(index.search_cancellable(query, excluded, cancelled))
+                Arc::new(index.search_cancellable(query, scope, cancelled))
             }
         })
         .enumerate()

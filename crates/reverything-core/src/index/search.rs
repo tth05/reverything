@@ -1,23 +1,30 @@
-//! Case-insensitive substring search with path components and exclusions.
+//! Case-insensitive substring search with path components and folder scopes.
 //!
-//! A query is a list of terms separated by spaces (use quotes for spaces inside a term). An
-//! entry has to match every term:
+//! A query is a list of terms separated by spaces. An entry has to match every term:
 //!
 //! - `foo\bar\baz` matches entries whose name contains `baz`, whose parent's name contains `bar`
 //!   and whose grandparent's name contains `foo`. A leading `C:` anchors the path at the root of
 //!   that volume, a trailing `\` matches everything directly in the matching directories.
+//! - `'a b'` keeps the spaces in a term. `"a b"` also does, and has to match the whole name.
+//!   Quotes can cover single path segments (`"src"\main`) or the whole term.
+//! - A segment with `*` (any characters) or `?` (one character) has to match as a whole, e.g.
+//!   `*.mp3` or `report-??.pdf`. Without them it matches anywhere in the name.
+//! - `**` as a folder stands for any number of folders, also none: `C:\**\AppData\` is every
+//!   `AppData` folder on `C:`, `photos\**` everything below folders matching `photos`.
 //! - `!term` leaves out entries matching `term`.
-//! - `!term\` leaves out the directories matching `term` and everything below them.
-//! - `!C:\some\folder` leaves out that exact folder and everything below it.
+//! - `!folder\` leaves out everything below the directories matching `folder`, `+folder\` leaves
+//!   out everything else. Several `+` folders add up, and the closest of the matching folders
+//!   above an entry decides; on the same folder `!` wins. Both only look at the folders above an
+//!   entry, not at the entry itself. `+term` without `\` is the same as `term`.
 //! - `size:`, `dm:` and `dc:` filter by size, modification and creation date, see
 //!   [`crate::index::filter`].
-//! - A name or folder with `*` (any characters) or `?` (one character) has to match as a whole,
-//!   e.g. `*.mp3` or `report-??.pdf`. Without them it matches anywhere in the name.
 
+use fixedbitset::{Block, FixedBitSet};
 use memchr::{memchr2_iter, memchr_iter};
 use rayon::prelude::*;
 
 use crate::index::filter::{Field, Filter};
+use crate::index::scope::Scope;
 use crate::index::{prefetch, prefetched, VolumeIndex, FLAG_DIRECTORY, FLAG_IN_USE};
 use crate::ntfs::ROOT_RECORD;
 
@@ -29,8 +36,8 @@ pub struct Query {
     pub include: Vec<Term>,
     /// Terms an entry must not match
     pub exclude: Vec<Term>,
-    /// Folders whose whole subtree is left out
-    pub folders: Vec<FolderExclusion>,
+    /// Folders whose contents are searched or left out
+    pub folders: Vec<FolderScope>,
     /// Size and date conditions
     pub filters: Vec<Filter>,
     /// Leave out files
@@ -40,7 +47,7 @@ pub struct Query {
 }
 
 /// A single term, see the module documentation.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Term {
     pub volume: Option<char>,
     pub anchored: bool,
@@ -50,44 +57,37 @@ pub struct Term {
     pub name_text: Option<String>,
 }
 
-/// A folder subtree to leave out. Comparable, so resolved exclusions can be cached.
+/// `+folder\` or `!folder\`: the directories matching `folder` (the name of the term, or the
+/// root for a bare `C:\`) and whether their contents are searched or left out. Comparable, so
+/// resolved scopes can be cached.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FolderExclusion {
-    /// An exact path like `C:\Windows\WinSxS`
-    Path(String),
-    /// Every directory matching a term like `node_modules`
-    Matching(String),
+pub struct FolderScope {
+    pub include: bool,
+    pub folder: Term,
 }
 
 impl Query {
     pub fn parse(text: &str) -> Self {
         let mut query = Query::default();
         for token in tokenize(text) {
-            let negate = token.starts_with('!');
-            if let Some(filter) = Filter::parse(token.trim_start_matches('!'), negate) {
-                query.filters.push(filter);
-                continue;
-            }
-            let Some(negated) = token.strip_prefix('!') else {
-                query.include.push(Term::parse(&token));
-                continue;
-            };
-            if negated.is_empty() {
-                continue;
-            }
-            if is_absolute_path(negated) {
-                query
-                    .folders
-                    .push(FolderExclusion::Path(negated.to_string()));
-            } else if negated.ends_with(['\\', '/']) {
-                let term = negated.trim_end_matches(['\\', '/']);
-                if !term.is_empty() {
-                    query
-                        .folders
-                        .push(FolderExclusion::Matching(term.to_string()));
+            let negate = token.prefix == Some('!');
+            if !token.quoted {
+                if let Some(filter) = Filter::parse(&token.raw, negate) {
+                    query.filters.push(filter);
+                    continue;
                 }
-            } else {
-                query.exclude.push(Term::parse(negated));
+            }
+            let term = Term::from_segments(&token.segments, token.folder);
+            if term.is_match_all() {
+                continue;
+            }
+            match token.prefix {
+                Some(prefix) if token.folder => query.folders.push(FolderScope {
+                    include: prefix == '+',
+                    folder: term.into_folder(),
+                }),
+                Some('!') => query.exclude.push(term),
+                _ => query.include.push(term),
             }
         }
         query
@@ -103,75 +103,186 @@ impl Query {
     }
 }
 
-/// Splits at whitespace outside of double quotes and removes the quotes.
-fn tokenize(text: &str) -> Vec<String> {
+/// A term split into path segments.
+#[derive(Debug, Default, PartialEq)]
+struct Token {
+    /// `!` or `+` in front, outside of quotes
+    prefix: Option<char>,
+    segments: Vec<Segment>,
+    /// Ends with a separator
+    folder: bool,
+    /// Has quotes, so it is no filter
+    quoted: bool,
+    /// The text after the prefix, for filters
+    raw: String,
+}
+
+#[derive(Debug, PartialEq)]
+struct Segment {
+    text: String,
+    /// In double quotes: matches the whole name
+    exact: bool,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum Quote {
+    None,
+    Single,
+    Double,
+}
+
+/// Splits at whitespace outside of quotes, and the terms at `\` and `/`.
+///
+/// Names can contain `'` but not `"`, so a `'` only opens a quote at the start of a segment and
+/// only closes it before whitespace, a separator or the end: `bob's files` needs no quotes. An
+/// unclosed quote covers the rest of the text.
+fn tokenize(text: &str) -> Vec<Token> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let is_separator = |c: char| c == '\\' || c == '/';
     let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    for c in text.chars() {
-        match c {
-            '"' => quoted = !quoted,
-            c if c.is_whitespace() && !quoted => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
+    let mut token = Token::default();
+    let mut segment = String::new();
+    let mut exact = false;
+    let mut quote = Quote::None;
+
+    let end_segment = |token: &mut Token, segment: &mut String, exact: &mut bool, quote: Quote| {
+        if !segment.is_empty() {
+            token.segments.push(Segment {
+                text: std::mem::take(segment),
+                exact: *exact,
+            });
+        }
+        *exact = quote == Quote::Double;
+    };
+
+    for (i, &c) in chars.iter().enumerate() {
+        if quote == Quote::None && c.is_whitespace() {
+            end_segment(&mut token, &mut segment, &mut exact, quote);
+            if token.prefix.is_some() || !token.raw.is_empty() {
+                tokens.push(std::mem::take(&mut token));
             }
-            c => current.push(c),
+            continue;
+        }
+        if quote == Quote::None
+            && matches!(c, '!' | '+')
+            && token.prefix.is_none()
+            && token.raw.is_empty()
+        {
+            token.prefix = Some(c);
+            continue;
+        }
+        token.raw.push(c);
+        match (quote, c) {
+            (_, c) if is_separator(c) => {
+                end_segment(&mut token, &mut segment, &mut exact, quote);
+                token.folder = true;
+            }
+            (Quote::None, '"') => {
+                quote = Quote::Double;
+                exact = true;
+                token.quoted = true;
+            }
+            (Quote::Double, '"') => quote = Quote::None,
+            // Names can not contain it
+            (Quote::Single, '"') => {}
+            (Quote::None, '\'') if segment.is_empty() && !exact => {
+                quote = Quote::Single;
+                token.quoted = true;
+            }
+            (Quote::Single, '\'')
+                if chars
+                    .get(i + 1)
+                    .is_none_or(|&n| n.is_whitespace() || is_separator(n)) =>
+            {
+                quote = Quote::None
+            }
+            (_, c) => {
+                segment.push(c);
+                token.folder = false;
+            }
         }
     }
-    if !current.is_empty() {
-        tokens.push(current);
+    end_segment(&mut token, &mut segment, &mut exact, quote);
+    if token.prefix.is_some() || !token.raw.is_empty() {
+        tokens.push(token);
     }
     tokens
 }
 
-/// `C:` or `C:\...`
-fn is_absolute_path(text: &str) -> bool {
+/// `C:`
+fn is_drive(text: &str) -> bool {
     let b = text.as_bytes();
-    b.len() >= 2
-        && b[0].is_ascii_alphabetic()
-        && b[1] == b':'
-        && (b.len() == 2 || b[2] == b'\\' || b[2] == b'/')
+    b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
 impl Term {
+    /// A single term without quotes, e.g. `windows\system32\`.
     pub fn parse(text: &str) -> Self {
-        let text = text.trim();
-        let ends_with_separator = text.ends_with(['\\', '/']);
-        let mut parts = text
-            .split(['\\', '/'])
-            .filter(|p| !p.is_empty())
-            .collect::<Vec<_>>();
+        let token = tokenize(text).into_iter().next().unwrap_or_default();
+        Self::from_segments(&token.segments, token.folder)
+    }
 
+    fn from_segments(segments: &[Segment], folder: bool) -> Self {
+        let matcher = |s: &Segment| {
+            if s.exact {
+                Matcher::exact(&s.text)
+            } else {
+                Matcher::new(&s.text)
+            }
+        };
         let mut term = Term::default();
-        if let Some(first) = parts.first() {
-            let b = first.as_bytes();
-            if b.len() == 2
-                && b[1] == b':'
-                && b[0].is_ascii_alphabetic()
-                && (parts.len() > 1 || ends_with_separator)
-            {
-                term.volume = Some(b[0].to_ascii_uppercase() as char);
+        let mut segments = segments;
+        if let Some(first) = segments.first() {
+            if is_drive(&first.text) && (segments.len() > 1 || folder) {
+                term.volume = Some(first.text.as_bytes()[0].to_ascii_uppercase() as char);
                 term.anchored = true;
-                parts.remove(0);
+                segments = &segments[1..];
             }
         }
-
+        let levels = |s: &Segment| !s.exact && s.text == "**";
+        let name = match segments.split_last() {
+            // `a\**` is everything below `a`, like `a\**\`
+            Some((name, dirs)) if !folder && !levels(name) => {
+                segments = dirs;
+                Some(name)
+            }
+            _ => None,
+        };
+        term.dirs = segments
+            .iter()
+            .map(|s| {
+                if levels(s) {
+                    Matcher::Levels
+                } else {
+                    matcher(s)
+                }
+            })
+            .collect();
+        term.dirs
+            .dedup_by(|a, b| *a == Matcher::Levels && *b == Matcher::Levels);
+        // Any levels below any folder is no condition
+        if !term.anchored && term.dirs.first() == Some(&Matcher::Levels) {
+            term.dirs.remove(0);
+        }
         // `*` alone matches every name, like no name part at all
-        if parts.last().is_some_and(|p| p.chars().all(|c| c == '*')) && !ends_with_separator {
-            parts.pop();
-            term.name_text = None;
-            term.dirs = parts.into_iter().map(Matcher::new).collect();
-            return term;
+        if let Some(name) = name.filter(|n| !n.text.chars().all(|c| c == '*')) {
+            term.name = Some(matcher(name));
+            term.name_text = Some(name.text.clone());
         }
-        if !ends_with_separator {
-            if let Some(name) = parts.pop() {
-                term.name = Some(Matcher::new(name));
-                term.name_text = Some(name.to_string());
-            }
-        }
-        term.dirs = parts.into_iter().map(Matcher::new).collect();
         term
+    }
+
+    /// The term of `+term\` or `!term\`, whose name is the folder: `a\b\` becomes `a\b`.
+    fn into_folder(mut self) -> Self {
+        if self.name.is_none() {
+            // Everything below a folder counts anyway
+            if self.dirs.last() == Some(&Matcher::Levels) {
+                self.dirs.pop();
+            }
+            self.name = self.dirs.pop();
+        }
+        self.name_text = None;
+        self
     }
 
     pub fn is_match_all(&self) -> bool {
@@ -179,19 +290,33 @@ impl Term {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Matcher {
     /// Lowercased ASCII needle, matched with ASCII case folding
     Ascii(Vec<u8>),
     /// Lowercased needle containing non-ASCII characters
     Unicode(String),
+    /// Lowercased ASCII text that has to be the whole name
+    Exact(Vec<u8>),
     /// Lowercased pattern with `*` and `?` that has to match the whole name
     Glob(String),
     /// A pattern like `*.mp3`: the name ends with this lowercased ASCII text
     Suffix(Vec<u8>),
+    /// `**` among the folders of a term: any number of folders. Matches every name.
+    Levels,
 }
 
 impl Matcher {
+    /// Matches the whole name, with wildcards if there are any.
+    pub fn exact(text: &str) -> Self {
+        if text.is_ascii() && !text.contains(['*', '?']) {
+            Matcher::Exact(text.to_ascii_lowercase().into_bytes())
+        } else {
+            // Without wildcards a pattern is the whole name
+            Matcher::Glob(text.to_lowercase())
+        }
+    }
+
     pub fn new(needle: &str) -> Self {
         if needle.contains(['*', '?']) {
             let pattern = needle.to_lowercase();
@@ -217,6 +342,8 @@ impl Matcher {
                 let hay = String::from_utf8_lossy(hay).to_lowercase();
                 hay.contains(needle.as_str())
             }
+            Matcher::Exact(text) => hay.eq_ignore_ascii_case(text),
+            Matcher::Levels => true,
             Matcher::Glob(pattern) => glob_matches(pattern, hay),
             Matcher::Suffix(suffix) => {
                 hay.len() >= suffix.len()
@@ -235,6 +362,13 @@ impl Matcher {
                 .into_iter()
                 .collect(),
             Matcher::Unicode(needle) => find_ci(name, needle, 0).into_iter().collect(),
+            Matcher::Levels => Vec::new(),
+            Matcher::Exact(text) => name
+                .as_bytes()
+                .eq_ignore_ascii_case(text)
+                .then_some(0..name.len())
+                .into_iter()
+                .collect(),
             Matcher::Suffix(suffix) => {
                 let start = name.len().saturating_sub(suffix.len());
                 if name.is_char_boundary(start)
@@ -358,25 +492,19 @@ fn contains_ascii_ci(hay: &[u8], needle: &[u8]) -> bool {
     }
 }
 
-#[inline]
-fn bit(set: &[u64], id: u32) -> bool {
-    set.get(id as usize / 64)
-        .is_some_and(|w| w & (1 << (id % 64)) != 0)
-}
-
 /// A term prepared for one volume.
-struct PreparedTerm<'a> {
+pub(crate) struct PreparedTerm<'a> {
     term: &'a Term,
     /// Directories the entry has to be in, if the term has path components
-    parents: Option<Vec<u64>>,
+    parents: Option<FixedBitSet>,
 }
 
 impl PreparedTerm<'_> {
     #[inline]
-    fn matches(&self, index: &VolumeIndex, id: u32) -> bool {
+    pub(crate) fn matches(&self, index: &VolumeIndex, id: u32) -> bool {
         self.parents
             .as_ref()
-            .is_none_or(|set| bit(set, index.parent(id)))
+            .is_none_or(|set| set.contains(index.parent(id) as usize))
             && self
                 .term
                 .name
@@ -386,22 +514,22 @@ impl PreparedTerm<'_> {
 }
 
 impl VolumeIndex {
-    fn on_this_volume(&self, term: &Term) -> bool {
+    pub(crate) fn on_this_volume(&self, term: &Term) -> bool {
         term.volume
             .is_none_or(|v| v == self.volume.id.to_ascii_uppercase())
     }
 
-    fn prepare<'a>(&self, term: &'a Term) -> PreparedTerm<'a> {
+    pub(crate) fn prepare<'a>(&self, term: &'a Term) -> PreparedTerm<'a> {
         PreparedTerm {
             term,
             parents: (term.anchored || !term.dirs.is_empty()).then(|| self.match_dirs(term)),
         }
     }
 
-    /// Matching entries in name order. `excluded` is a bitset of directories (see
-    /// [`VolumeIndex::exclusions`]) whose entries are left out.
-    pub fn search(&self, query: &Query, excluded: Option<&[u64]>) -> Vec<u32> {
-        self.search_cancellable(query, excluded, &|| false)
+    /// Matching entries in name order, within the query's resolved folder scope (see
+    /// [`VolumeIndex::scope`]).
+    pub fn search(&self, query: &Query, scope: &Scope) -> Vec<u32> {
+        self.search_cancellable(query, scope, &|| false)
     }
 
     /// [`VolumeIndex::search`] that skips the rest once `cancelled` returns true, which it asks
@@ -409,9 +537,14 @@ impl VolumeIndex {
     pub fn search_cancellable(
         &self,
         query: &Query,
-        excluded: Option<&[u64]>,
+        scope: &Scope,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Vec<u32> {
+        let excluded = match scope {
+            Scope::All => None,
+            Scope::Nothing => return Vec::new(),
+            Scope::Excluding(dirs) => Some(dirs),
+        };
         if !query.include.iter().all(|t| self.on_this_volume(t))
             || (query.skip_files && query.skip_folders)
         {
@@ -446,7 +579,7 @@ impl VolumeIndex {
                         Field::Created => self.created(id) as u64,
                     })
                 })
-                && excluded.is_none_or(|set| !bit(set, self.parent(id)) && !bit(set, id))
+                && excluded.is_none_or(|set| !set.contains(self.parent(id) as usize))
                 && include.iter().all(|t| t.matches(self, id))
                 && !exclude.iter().any(|t| t.matches(self, id))
         };
@@ -491,73 +624,49 @@ impl VolumeIndex {
             .collect()
     }
 
-    /// The exclusion bitset for the folder exclusions of a query, `None` if none of them
-    /// applies to this volume.
-    pub fn exclusions(&self, folders: &[FolderExclusion]) -> Option<Vec<u64>> {
-        let mut roots = Vec::new();
-        for folder in folders {
-            match folder {
-                FolderExclusion::Path(path) => roots.extend(self.find_directory(path)),
-                FolderExclusion::Matching(text) => {
-                    let term = Term::parse(text);
-                    if !self.on_this_volume(&term) {
-                        continue;
-                    }
-                    let prepared = self.prepare(&term);
-                    let flags = &self.records.flags;
-                    roots.par_extend(
-                        (0..flags.len() as u32)
-                            .into_par_iter()
-                            .filter(|&id| flags[id as usize] & DIR_IN_USE == DIR_IN_USE)
-                            .filter(|&id| prepared.matches(self, id)),
-                    );
-                }
-            }
-        }
-        (!roots.is_empty()).then(|| self.excluded_dirs(&roots))
-    }
-
-    /// Bitset of the directories the last path component of the term may be in.
-    fn match_dirs(&self, term: &Term) -> Vec<u64> {
+    /// The directories the last path component of the term may be in, by record number.
+    fn match_dirs(&self, term: &Term) -> FixedBitSet {
         let n = self.records.len();
-        let words = n.div_ceil(64);
-
         let mut set = term.anchored.then(|| {
-            let mut root = vec![0u64; words];
-            if let Some(w) = root.get_mut(ROOT_RECORD as usize / 64) {
-                *w |= 1 << (ROOT_RECORD % 64);
-            }
+            let mut root = FixedBitSet::with_capacity(n);
+            root.set(ROOT_RECORD as usize, (ROOT_RECORD as usize) < n);
             root
         });
 
         for matcher in &term.dirs {
-            let prev = set.as_deref();
+            if *matcher == Matcher::Levels {
+                set = set.map(|dirs| self.below(&dirs));
+                continue;
+            }
+            let prev = set.as_ref();
             let flags = &self.records.flags;
             let parent = &self.records.parent;
-            let next = (0..words)
+            // A block per task, so the bits are set without synchronization
+            let blocks = (0..n.div_ceil(Block::BITS as usize))
                 .into_par_iter()
                 .with_min_len(256)
-                .map(|w| {
-                    let mut bits = 0u64;
-                    for b in 0..64 {
-                        let id = w * 64 + b;
-                        if id >= n {
-                            break;
-                        }
+                .map(|block| {
+                    let first = block * Block::BITS as usize;
+                    let mut bits: Block = 0;
+                    for id in first..n.min(first + Block::BITS as usize) {
                         if flags[id] & DIR_IN_USE == DIR_IN_USE
-                            && prev.is_none_or(|p| bit(p, parent[id]))
+                            && prev.is_none_or(|p| p.contains(parent[id] as usize))
                             && matcher.matches(self.name(id as u32))
                         {
-                            bits |= 1 << b;
+                            bits |= 1 << (id - first);
                         }
                     }
                     bits
                 })
                 .collect::<Vec<_>>();
-            set = Some(next);
+            set = Some(FixedBitSet::with_capacity_and_blocks(n, blocks));
         }
 
-        set.unwrap_or_else(|| vec![u64::MAX; words])
+        set.unwrap_or_else(|| {
+            let mut all = FixedBitSet::with_capacity(n);
+            all.insert_range(..);
+            all
+        })
     }
 }
 
@@ -609,8 +718,8 @@ mod tests {
         let t = Term::parse(r"c:\windows\notepad");
         assert_eq!(t.volume, Some('C'));
         assert!(t.anchored);
-        assert_eq!(t.dirs.len(), 1);
-        assert!(t.name.is_some());
+        assert_eq!(t.dirs, vec![Matcher::new("windows")]);
+        assert_eq!(t.name, Some(Matcher::new("notepad")));
 
         let t = Term::parse(r"system32\");
         assert_eq!(t.dirs.len(), 1);
@@ -622,12 +731,60 @@ mod tests {
     }
 
     #[test]
+    fn tokens() {
+        let segments = |text: &str| {
+            tokenize(text)
+                .into_iter()
+                .map(|t| {
+                    let parts = t
+                        .segments
+                        .iter()
+                        .map(|s| {
+                            if s.exact {
+                                format!("={}", s.text)
+                            } else {
+                                s.text.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    let prefix = t.prefix.map(String::from).unwrap_or_default();
+                    format!("{prefix}{parts}{}", if t.folder { "/" } else { "" })
+                })
+                .collect::<Vec<_>>()
+        };
+        // Apostrophes inside words need no quotes
+        assert_eq!(segments("bob's files"), ["bob's", "files"]);
+        assert_eq!(segments("'a b'  c"), ["a b", "c"]);
+        assert_eq!(segments("'bob's file' x"), ["bob's file", "x"]);
+        assert_eq!(segments(r#""my file""#), ["=my file"]);
+        assert_eq!(segments(r"+'My Projects'\ .rs"), ["+My Projects/", ".rs"]);
+        assert_eq!(
+            segments(r#""C:\Program Files\foo.txt""#),
+            ["=C:|=Program Files|=foo.txt"]
+        );
+        assert_eq!(segments(r#""src"\main"#), ["=src|main"]);
+        assert_eq!(segments(r#"!C:\"Windows"\"#), [r"!C:|=Windows/"]);
+        assert_eq!(segments("a/b/"), ["a|b/"]);
+        // Unclosed quotes cover the rest, while typing
+        assert_eq!(segments("'my fi"), ["my fi"]);
+        assert_eq!(segments(r#"x "my fi"#), ["x", "=my fi"]);
+        // Quotes keep a `+` or `!` that is part of the name
+        assert_eq!(
+            segments("'+notes' '!x'"),
+            ["+notes", "!x"].map(|s| s.to_string())
+        );
+        assert_eq!(segments("!"), ["!"]);
+        assert!(segments("  ").is_empty());
+    }
+
+    #[test]
     fn parse_filters() {
-        let q = Query::parse("report size:>1mb !dm:today dm:");
+        let q = Query::parse("report size:>1mb !dm:today dm: dm:2024/05/01 'size:>1mb'");
         assert_eq!(q.filters.len(), 2);
         assert!(q.filters[1].negate);
-        // Not a valid filter, so a normal term
-        assert_eq!(q.include.len(), 2);
+        // Not valid filters, or quoted, so normal terms
+        assert_eq!(q.include.len(), 4);
         assert!(!q.is_match_all());
     }
 
@@ -635,19 +792,186 @@ mod tests {
     fn parse_query() {
         assert!(Query::parse("  ").is_match_all());
 
-        let q = Query::parse(r#"notepad "my file" !winsxs !node_modules\ !C:\Windows\Temp"#);
-        assert_eq!(q.include.len(), 2);
+        let q = Query::parse(r"notepad 'my file' !winsxs !node_modules\ +C:\code\ +x");
+        assert_eq!(q.include.len(), 3);
         assert_eq!(q.exclude.len(), 1);
         assert_eq!(
-            q.folders,
+            q.folders
+                .iter()
+                .map(|f| (f.include, f.folder.volume, f.folder.name.clone()))
+                .collect::<Vec<_>>(),
             vec![
-                FolderExclusion::Matching("node_modules".into()),
-                FolderExclusion::Path(r"C:\Windows\Temp".into()),
+                (false, None, Some(Matcher::new("node_modules"))),
+                (true, Some('C'), Some(Matcher::new("code"))),
             ]
         );
         assert!(!q.is_match_all());
 
-        // A lone `!` is ignored
-        assert!(Query::parse("!").is_match_all());
+        // A lone `!` or `+` is ignored
+        assert!(Query::parse("! + \\").is_match_all());
+    }
+
+    #[test]
+    fn exact() {
+        let m = |text: &str, name: &str| Matcher::exact(text).matches(name.as_bytes());
+        assert!(m("readme.md", "README.md"));
+        assert!(!m("readme.md", "readme.md.bak"));
+        assert!(m("größe", "GRÖSSE".replace("SS", "ß").as_str()));
+        assert!(m("*.md", "a.md"));
+        assert_eq!(Matcher::exact("Readme").find("README"), vec![0..6]);
+        assert!(Matcher::exact("Readme").find("READMEs").is_empty());
+    }
+
+    #[test]
+    fn folder_scopes() {
+        let index = crate::index::testing::tree(
+            'C',
+            &[
+                r"code\app\main.rs",
+                r"code\app\target\out.rs",
+                r"code\target\keep\a.rs",
+                r"other\main.rs",
+                r"other\target\x.rs",
+                r"My Projects\main.rs",
+                r"Windows\note.txt",
+                r"Windows.old\note.txt",
+                r"readme.md",
+                r"readme.md.bak",
+            ],
+        );
+        let find = |text: &str| {
+            let query = Query::parse(text);
+            let scope = index.scope(&query.folders);
+            let mut paths = index
+                .search(&query, &scope)
+                .into_iter()
+                .map(|id| index.full_path(id)[3..].to_string())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+
+        assert_eq!(
+            find(r".rs !target\"),
+            [
+                r"My Projects\main.rs",
+                r"code\app\main.rs",
+                r"other\main.rs"
+            ]
+        );
+        // Only what is in the folders is left out, not the folders
+        assert_eq!(
+            find(r"target !target\"),
+            [r"code\app\target", r"code\target", r"other\target"]
+        );
+        assert_eq!(
+            find(r"+code\ .rs"),
+            [
+                r"code\app\main.rs",
+                r"code\app\target\out.rs",
+                r"code\target\keep\a.rs"
+            ]
+        );
+        assert_eq!(
+            find(r"+code\ +other\ main"),
+            [r"code\app\main.rs", r"other\main.rs"]
+        );
+        assert_eq!(find(r"+code\ !target\ .rs"), [r"code\app\main.rs"]);
+        // The closest folder decides
+        assert_eq!(
+            find(r"!code\ +code\app\ .rs"),
+            [r"code\app\main.rs", r"code\app\target\out.rs"]
+        );
+        assert_eq!(find(r"+code\ !code\ .rs"), Vec::<String>::new());
+        // Segments match anywhere unless in double quotes
+        assert_eq!(
+            find(r"+C:\Windows\ note"),
+            [r"Windows.old\note.txt", r"Windows\note.txt"]
+        );
+        assert_eq!(find(r#"+C:\"Windows"\ note"#), [r"Windows\note.txt"]);
+        assert_eq!(find(r#"+"C:\Windows"\ note"#), [r"Windows\note.txt"]);
+        assert_eq!(find(r#""readme.md""#), ["readme.md"]);
+        assert_eq!(find("readme.md"), ["readme.md", "readme.md.bak"]);
+        assert_eq!(find(r"'my projects'\main"), [r"My Projects\main.rs"]);
+        assert_eq!(find(r"+'my projects'\ main"), [r"My Projects\main.rs"]);
+        // Without `\` a plain term
+        assert_eq!(find("+main"), find("main"));
+        // Other volumes have nothing in scope
+        assert!(find(r"+D:\ main").is_empty());
+        assert_eq!(
+            find(r"+C:\ !C:\code\ main.rs"),
+            [r"My Projects\main.rs", r"other\main.rs"]
+        );
+    }
+
+    #[test]
+    fn levels() {
+        let index = crate::index::testing::tree(
+            'C',
+            &[
+                r"AppData\top.txt",
+                r"Users\me\AppData\Local\x.txt",
+                r"Users\me\AppData\Roaming\y.txt",
+                r"Users\me\notes.txt",
+                r"other\deep\AppData\w.txt",
+                r"other\deep\AppDataOld\v.txt",
+            ],
+        );
+        let find = |text: &str| {
+            let query = Query::parse(text);
+            let scope = index.scope(&query.folders);
+            let mut paths = index
+                .search(&query, &scope)
+                .into_iter()
+                .map(|id| index.full_path(id)[3..].to_string())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        let txt = |paths: Vec<String>| {
+            paths
+                .into_iter()
+                .filter(|p| p.ends_with(".txt"))
+                .collect::<Vec<_>>()
+        };
+
+        // Any number of folders, also none
+        assert_eq!(
+            txt(find(r#"+C:\**\"AppData"\"#)),
+            [
+                r"AppData\top.txt",
+                r"Users\me\AppData\Local\x.txt",
+                r"Users\me\AppData\Roaming\y.txt",
+                r"other\deep\AppData\w.txt",
+            ]
+        );
+        assert_eq!(
+            find(r#"C:\**\"AppData"\"#),
+            [
+                r"AppData\top.txt",
+                r"Users\me\AppData\Local",
+                r"Users\me\AppData\Roaming",
+                r"other\deep\AppData\w.txt",
+            ]
+        );
+        assert_eq!(
+            txt(find(r"Users\**")),
+            [
+                r"Users\me\AppData\Local\x.txt",
+                r"Users\me\AppData\Roaming\y.txt",
+                r"Users\me\notes.txt",
+            ]
+        );
+        assert_eq!(
+            txt(find(r"users\**\local\*")),
+            [r"Users\me\AppData\Local\x.txt"]
+        );
+        assert_eq!(txt(find(r"+C:\**\ .txt")).len(), 6);
+        assert_eq!(find(r"**\**\top"), find("top"));
+        assert_eq!(
+            txt(find(r#"!**\"appdata"\ .txt"#)),
+            [r"Users\me\notes.txt", r"other\deep\AppDataOld\v.txt"]
+        );
+        assert!(Query::parse(r"** !**").is_match_all());
     }
 }

@@ -5,8 +5,8 @@ are indexed in seconds, and results appear as you type.
 
 ![Reverything searching for programs larger than 1 MB in System32, without WinSxS](assets/screenshot.png)
 
-- Search as you type, with wildcards (`*.mp3`), folders (`photos\2024`), exclusions (`!node_modules\`) and size or
-  date filters (`size:>1gb`, `dm:today`). Hover the `?` next to the search box for a short overview.
+- Search as you type, with wildcards (`*.mp3`), folders (`photos\2024`, `+C:\code\`), exclusions
+  (`!node_modules\`) and size or date filters (`size:>1gb`, `dm:today`). Hover the `?` next to the search box for a short overview.
 - Open files and folders, drag them into other programs, copy them with Ctrl+C, show them in Explorer (or the file
   manager that replaced it).
 - Lives in the tray and comes up with a global shortcut (Settings shows which one).
@@ -67,25 +67,34 @@ Hovering the status icon in the bottom right shows a summary, its "Details" swit
 widths and visibility are saved.
 
 ### Search syntax
-Terms are separated by spaces (use quotes for spaces inside a term) and all have to match. Matching is
-case-insensitive.
+Terms are separated by spaces and all have to match. Matching is case-insensitive. A term matches the name of a
+file or folder, and with `\` also the folders it is in. Every part between `\` matches anywhere in a name, unless it
+is in double quotes.
 
 | Query | Finds |
 | --- | --- |
 | `notepad` | names containing `notepad` |
 | `report 2026` | names containing both `report` and `2026` |
-| `"my file"` | names containing `my file` |
+| `'my file'` | names containing `my file`; single quotes keep the spaces |
+| `"readme.md"` | names that are exactly `readme.md`; double quotes match the whole name |
 | `windows\system32\note` | `note` directly in a folder matching `system32`, inside one matching `windows` |
 | `system32\` | everything directly in folders matching `system32` |
-| `C:\Users\` | everything directly in `C:\Users` |
-| `*.mp3` | names ending in `.mp3`; `*` and `?` make a term match the whole name |
+| `C:\Users\` | everything directly in folders matching `Users` at the root of `C:` |
+| `"C:\Program Files\foo.txt"` | exactly this file; quotes can cover a whole path or single parts like `C:\"Windows"\` |
+| `C:\**\AppData\`, `photos\**` | `**` stands for any number of folders, also none: everything directly in an `AppData` folder anywhere on `C:`, everything below `photos` |
+| `+C:\**\"AppData"\ .ini` | `.ini` anywhere below every folder named exactly `AppData` on `C:` |
+| `*.mp3` | names ending in `.mp3`; `*` and `?` make a part match the whole name |
 | `report-??.pdf` | e.g. `report-07.pdf`, `?` is exactly one character |
 | `.rs !test` | names containing `.rs` but not `test` |
+| `+src\ .rs` | `.rs` anywhere below folders matching `src`; several `+` folders add up |
+| `.rs !target\` | leaves out everything below folders matching `target` |
+| `+C:\code\ !target\ !.git\` | everything below `C:\code`, except below `target` and `.git`; the closest of the folders decides |
 | `size:>1gb`, `size:1mb..5mb`, `size:empty` | size filter (units b, kb, mb, gb, tb; folders use their total size) |
 | `dm:today`, `dm:lastweek`, `dc:2024`, `dm:>=2024-05-01`, `dm:2024-01..2024-03` | modified (`dm:`) or created (`dc:`) date in local time; also `yesterday`, `thisweek`, `thismonth`, `lastmonth`, `thisyear`, `lastyear` |
 | `!size:<1mb` | `!` in front of a filter negates it |
-| `.rs !target\` | leaves out folders matching `target` and everything below them |
-| `notepad !C:\Windows` | leaves out exactly `C:\Windows` and everything below it |
+
+`+folder\` and `!folder\` only look at the folders an entry is in, so the matching folders themselves still show
+up. A `'` in the middle of a word, like in `bob's`, needs no quotes.
 
 ### Result order
 Results are ordered by relevance unless a column is sorted (the Name column gives plain name order). Compared in

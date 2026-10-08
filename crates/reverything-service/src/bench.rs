@@ -176,8 +176,8 @@ fn bench_search(set: &reverything_core::service::IndexSet) {
         };
         let t = Instant::now();
         let query = reverything_core::index::search::Query::parse(q);
-        let excluded = reverything_core::search::exclusions(set, &query.folders);
-        let results = search_all(set, &query, sort, &excluded);
+        let scopes = reverything_core::search::scopes(set, &query.folders);
+        let results = search_all(set, &query, sort, &scopes);
         println!(
             "  search {:?} by {:?}: {} hits in {:?}",
             q,

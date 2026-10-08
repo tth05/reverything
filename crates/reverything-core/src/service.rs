@@ -20,6 +20,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use eyre::{bail, ensure, Result};
+use fixedbitset::FixedBitSet;
 use rayon::prelude::*;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{
@@ -1129,19 +1130,17 @@ impl Runtime {
 /// A set of record numbers as a bitset, a few hundred KB for millions of records.
 #[derive(Default)]
 struct RecordSet {
-    bits: Vec<u64>,
+    bits: FixedBitSet,
     len: usize,
 }
 
 impl RecordSet {
     fn insert(&mut self, record: u32) {
-        let word = record as usize / 64;
-        if word >= self.bits.len() {
-            self.bits.resize(word + 1, 0);
+        let record = record as usize;
+        if record >= self.bits.len() {
+            self.bits.grow(record + 1);
         }
-        let mask = 1u64 << (record % 64);
-        if self.bits[word] & mask == 0 {
-            self.bits[word] |= mask;
+        if !self.bits.put(record) {
             self.len += 1;
         }
     }
@@ -1155,19 +1154,11 @@ impl RecordSet {
     }
 
     fn to_vec(&self) -> Vec<u32> {
-        let mut records = Vec::with_capacity(self.len);
-        for (w, &word) in self.bits.iter().enumerate() {
-            let mut word = word;
-            while word != 0 {
-                records.push((w * 64) as u32 + word.trailing_zeros());
-                word &= word - 1;
-            }
-        }
-        records
+        self.bits.ones().map(|r| r as u32).collect()
     }
 
     fn clear(&mut self) {
-        self.bits = Vec::new();
+        self.bits = FixedBitSet::new();
         self.len = 0;
     }
 }

@@ -23,10 +23,11 @@ use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY
 use windows::Win32::System::Threading::GetCurrentProcess;
 
 use reverything_core::index::build::ScanStats;
-use reverything_core::index::search::{FolderExclusion, Matcher, Query};
+use reverything_core::index::scope::Scope;
+use reverything_core::index::search::{FolderScope, Matcher, Query};
 use reverything_core::index::{ATTRIBUTE_MASK, FLAG_DIRECTORY};
 use reverything_core::results::Results;
-use reverything_core::search::{exclusions, hit_parts, read_all, search_all_cancellable};
+use reverything_core::search::{hit_parts, read_all, scopes, search_all_cancellable};
 use reverything_core::service::{self as core_service, BatchStats, IndexSet, SaveStats};
 use reverything_protocol::{
     read_message, write_message, BatchTimings, Request, Response, Row, SaveTimings, SavedIndex,
@@ -154,23 +155,28 @@ impl Server {
                 session.names = query
                     .include
                     .iter()
-                    .filter_map(|t| t.name_text.as_deref())
-                    .map(Matcher::new)
+                    .filter_map(|t| t.name.clone())
                     .collect();
+                let searched = query
+                    .folders
+                    .iter()
+                    .filter(|f| f.include)
+                    .map(|f| &f.folder);
                 session.folders = query
                     .include
                     .iter()
-                    .flat_map(|t| t.dirs.iter().cloned())
+                    .chain(searched)
+                    .flat_map(|t| t.dirs.iter().chain(&t.name))
+                    .cloned()
                     .collect();
-                query.folders.truncate(MAX_EXCLUDED_FOLDERS);
+                query.folders.truncate(MAX_FOLDERS);
                 query.skip_files = !files;
                 query.skip_folders = !folders;
                 let cancel = session.cancel.clone();
                 let cancelled = move || cancel.load(Ordering::Relaxed) >= id;
                 let results = {
-                    let excluded =
-                        session.exclusions(&self.set, std::mem::take(&mut query.folders));
-                    search_all_cancellable(&self.set, &query, core_sort(sort), excluded, &cancelled)
+                    let scopes = session.scopes(&self.set, std::mem::take(&mut query.folders));
+                    search_all_cancellable(&self.set, &query, core_sort(sort), scopes, &cancelled)
                 };
                 let Some(results) = results else {
                     session.results = Results::default();
@@ -356,16 +362,16 @@ fn merge(mut ranges: Vec<std::ops::Range<usize>>) -> Vec<(u32, u32)> {
     merged
 }
 
-/// More are ignored
-const MAX_EXCLUDED_FOLDERS: usize = 256;
+/// More `+folder\` and `!folder\` terms are ignored
+const MAX_FOLDERS: usize = 256;
 /// How long a search waits for indices that are still loading after the app became active
 const WAKE_WAIT: Duration = Duration::from_secs(3);
-/// How long resolved folder exclusions are reused before they are looked up again, so new
-/// directories below excluded folders get excluded too
-const EXCLUSION_CACHE_TIME: Duration = Duration::from_secs(10);
+/// How long resolved folder scopes are reused before they are looked up again, so new
+/// directories below the folders count too
+const SCOPE_CACHE_TIME: Duration = Duration::from_secs(10);
 
-/// Folder exclusions, when they were resolved, and the bitsets per volume
-type CachedExclusions = (Vec<FolderExclusion>, Instant, Vec<Option<Vec<u64>>>);
+/// Folder scopes, when they were resolved, and the result per volume
+type CachedScopes = (Vec<FolderScope>, Instant, Vec<Scope>);
 
 #[derive(Default)]
 struct Session {
@@ -379,28 +385,29 @@ struct Session {
     results: Results,
     /// Name parts of the search, to highlight them in the rows
     names: Vec<Matcher>,
-    /// Folder parts of the search (`system32\`), to highlight them in the folder column
+    /// Folder parts of the search (`system32\`, `+src\`), to highlight them in the folder
+    /// column
     folders: Vec<Matcher>,
-    /// Folder exclusions of the last query, when they were resolved, and the resulting bitsets
-    /// per volume
-    exclusions: Option<CachedExclusions>,
+    /// Folder scopes of the last query, when they were resolved, and the result per volume
+    scopes: Option<CachedScopes>,
 }
 
 impl Session {
     /// Resolving the folders walks every directory, so the result is cached while typing.
-    fn exclusions(&mut self, set: &IndexSet, folders: Vec<FolderExclusion>) -> &[Option<Vec<u64>>] {
+    fn scopes(&mut self, set: &IndexSet, folders: Vec<FolderScope>) -> &[Scope] {
         if folders.is_empty() {
-            self.exclusions = None;
+            self.scopes = None;
             return &[];
         }
-        let stale = self.exclusions.as_ref().is_none_or(|(cached, at, _)| {
-            *cached != folders || at.elapsed() > EXCLUSION_CACHE_TIME
-        });
+        let stale = self
+            .scopes
+            .as_ref()
+            .is_none_or(|(cached, at, _)| *cached != folders || at.elapsed() > SCOPE_CACHE_TIME);
         if stale {
-            let resolved = exclusions(set, &folders);
-            self.exclusions = Some((folders, Instant::now(), resolved));
+            let resolved = scopes(set, &folders);
+            self.scopes = Some((folders, Instant::now(), resolved));
         }
-        &self.exclusions.as_ref().unwrap().2
+        &self.scopes.as_ref().unwrap().2
     }
 }
 

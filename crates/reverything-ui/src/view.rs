@@ -147,8 +147,9 @@ impl MainView {
         // The window opens focused. Being active makes the service load the index right away.
         let client = Arc::new(ServiceClient::new(true));
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Search, e.g. report, *.pdf, photos\\2024, !draft, !node_modules\\")
+            InputState::new(window, cx).placeholder(
+                "Search, e.g. report, *.pdf, photos\\2024, +C:\\code\\, !node_modules\\",
+            )
         });
         let columns = cx.global::<Settings>().columns.clone();
         let table = cx.new(|cx| {
@@ -1240,19 +1241,22 @@ fn search_help(cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     let examples = [
         ("report", "Names containing \"report\""),
+        ("'my file'", "Names containing \"my file\", with the space"),
+        ("\"readme.md\"", "Names that are exactly \"readme.md\""),
         ("*.pdf", "Files by extension (* and ? match the whole name)"),
         ("!draft", "Leave out names containing \"draft\""),
         (
-            "!node_modules\\",
-            "Leave out matching folders with everything inside",
-        ),
-        (
-            "!C:\\Windows",
-            "Leave out this folder with everything inside",
-        ),
-        (
             "photos\\2024",
-            "\"2024\" inside a folder matching \"photos\"",
+            "\"2024\" directly in a folder matching \"photos\"",
+        ),
+        (
+            "+C:\\code\\",
+            "Only what is anywhere below matching folders",
+        ),
+        ("C:\\**\\temp\\", "** stands for any number of folders"),
+        (
+            "!node_modules\\",
+            "Leave out everything below matching folders",
         ),
         ("size:>1gb", "Larger than 1 GB, also <, .. like 1mb..5mb"),
         ("dm:today", "Modified today, also thisweek, 2024, >=2024-05"),
@@ -1276,9 +1280,9 @@ fn search_help(cx: &App) -> impl IntoElement {
                 .child(div().text_color(theme.muted_foreground).child(meaning))
         }))
         .child(div().mt_1().text_color(theme.muted_foreground).child(
-            "Separate terms with spaces, every term has to match. Case does not matter, \
-                     quotes keep spaces in a term. Best matches come first, sort by Name for \
-                     plain name order.",
+            "Separate terms with spaces, every term has to match. Case does not matter. \
+                     + and ! folders only look at the folders an entry is in. Best matches come \
+                     first, sort by Name for plain name order.",
         ))
 }
 

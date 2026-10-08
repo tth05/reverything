@@ -5,11 +5,11 @@
 //! additional names of hard linked files.
 
 pub mod build;
-pub mod exclude;
 pub mod filter;
 pub mod folders;
 pub mod persist;
 pub mod rank;
+pub mod scope;
 pub mod search;
 pub mod sizes;
 pub mod sort;

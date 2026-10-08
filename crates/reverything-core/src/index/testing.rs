@@ -51,3 +51,45 @@ pub fn names(seed: u64, n: usize) -> Vec<String> {
         })
         .collect()
 }
+
+/// A volume with the given paths below the root, like `a\b\c.txt`. Folders on the way are
+/// created, a trailing `\` makes the entry itself a folder.
+pub fn tree(letter: char, paths: &[&str]) -> VolumeIndex {
+    let mut entries: Vec<(String, u32, bool)> = Vec::new();
+    for path in paths {
+        let mut parent = ROOT_RECORD;
+        let parts = path
+            .split('\\')
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>();
+        for (i, part) in parts.iter().enumerate() {
+            let directory = i + 1 < parts.len() || path.ends_with('\\');
+            let existing = entries
+                .iter()
+                .position(|(name, p, _)| name == part && *p == parent);
+            let id = match existing {
+                Some(at) => 16 + at as u32,
+                None => {
+                    entries.push((part.to_string(), parent, directory));
+                    16 + entries.len() as u32 - 1
+                }
+            };
+            parent = id;
+        }
+    }
+    let mut index = VolumeIndex::empty(Volume { id: letter });
+    index.records = Records::with_len(16 + entries.len());
+    let r = &mut index.records;
+    r.flags[ROOT_RECORD as usize] = FLAG_IN_USE | FLAG_DIRECTORY;
+    r.parent[ROOT_RECORD as usize] = ROOT_RECORD;
+    for (i, (name, parent, directory)) in entries.iter().enumerate() {
+        let id = 16 + i;
+        r.flags[id] = FLAG_IN_USE | if *directory { FLAG_DIRECTORY } else { 0 };
+        r.parent[id] = *parent;
+        r.name_off[id] = index.names.len() as u32;
+        r.name_len[id] = name.len() as u16;
+        index.names.extend_from_slice(name.as_bytes());
+    }
+    index.sort_and_compact();
+    index
+}

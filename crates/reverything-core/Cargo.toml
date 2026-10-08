@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 eyre.workspace = true
 rayon.workspace = true
+fixedbitset.workspace = true
 memchr.workspace = true
 log.workspace = true
 tracing.workspace = true

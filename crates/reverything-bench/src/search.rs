@@ -13,7 +13,7 @@ use reverything_core::index::persist::load_offline;
 use reverything_core::index::search::Query;
 use reverything_core::ntfs::volume::Volume;
 use reverything_core::results::Results;
-use reverything_core::search::{exclusions, read_all, search_all, Sort, SortColumn};
+use reverything_core::search::{read_all, scopes, search_all, Sort, SortColumn};
 use reverything_core::service::IndexSet;
 
 use crate::phases;
@@ -48,7 +48,12 @@ const QUERIES: &[(&str, SortColumn)] = &[
     (r"c:\users\", SortColumn::Path),
     (r"notepad !winsxs", SortColumn::Relevance),
     (r".rs !target\", SortColumn::Relevance),
-    (r"!C:\Windows !C:\Users", SortColumn::Relevance),
+    (r"!C:\Windows\ !C:\Users\", SortColumn::Relevance),
+    (r"+C:\Users\ .dll", SortColumn::Relevance),
+    (r#"+C:\**\"AppData"\ .dll"#, SortColumn::Relevance),
+    (r"+node_modules\ !test\ index", SortColumn::Relevance),
+    (r#""index.js""#, SortColumn::Relevance),
+    ("'a b'", SortColumn::Relevance),
     ("size:>100mb", SortColumn::Relevance),
     ("dm:today", SortColumn::Relevance),
     // Sorting by a column instead of relevance
@@ -106,8 +111,8 @@ pub fn run(dir: &Path, runs: usize, filter: Option<&str>, save: Option<&Path>) -
         for _ in 0..runs {
             let t = Instant::now();
             let query = Query::parse(text);
-            let excluded = exclusions(&set, &query.folders);
-            let result = search_all(&set, &query, sort, &excluded);
+            let scopes = scopes(&set, &query.folders);
+            let result = search_all(&set, &query, sort, &scopes);
             hits = result.len();
             // The first two pages of rows, which the app reads right away
             for page in 0..2 {

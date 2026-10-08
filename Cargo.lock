@@ -6134,6 +6134,7 @@ version = "1.0.1"
 dependencies = [
  "chrono",
  "eyre",
+ "fixedbitset",
  "log",
  "memchr",
  "rayon",

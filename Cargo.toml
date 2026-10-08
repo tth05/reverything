@@ -12,6 +12,7 @@ reverything-protocol = { path = "crates/reverything-protocol" }
 windows = { version = "0.62.2", default-features = false, features = ["std"] }
 eyre = "0.6.14"
 rayon = "1.12.0"
+fixedbitset = "0.5.7"
 memchr = "2.8.3"
 mimalloc = "0.1.52"
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }

@@ -179,6 +179,8 @@ fn match_quality(name: &[u8], matcher: &Matcher) -> u8 {
             let name = String::from_utf8_lossy(name).to_lowercase();
             quality_ascii(name.as_bytes(), needle.as_bytes())
         }
+        Matcher::Exact(_) => 4,
+        Matcher::Levels => 0,
         // Every hit matches the whole pattern, location and the rest decide
         Matcher::Glob(_) | Matcher::Suffix(_) => 2,
     }
@@ -294,9 +296,9 @@ impl Ranker {
         let terms = query
             .include
             .iter()
-            .filter_map(|t| t.name_text.as_ref())
-            .map(|text| RankTerm {
-                matcher: Matcher::new(text),
+            .filter_map(|t| Some((t.name.clone()?, t.name_text.as_ref()?)))
+            .map(|(matcher, text)| RankTerm {
+                matcher,
                 typed: text.as_bytes().to_vec(),
                 cased: text.bytes().any(|b| b.is_ascii_alphabetic()),
                 finder: memmem::Finder::new(text).into_owned(),
