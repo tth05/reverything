@@ -1,8 +1,10 @@
 //! The result table. The service keeps the result set; the table only knows its size and
 //! fetches the rows around the visible range in pages.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,11 +31,54 @@ const PAGE: usize = 256;
 /// How long the shown results have to be unchanged before an answer for input that was typed
 /// over is shown anyway
 const SHOW_OUTDATED_AFTER: Duration = Duration::from_millis(250);
-/// Compact rows, smaller than the table's smallest preset (26px)
-pub const ROW_SIZE: gpui_kit::component::Size = gpui_kit::component::Size::Size(px(24.));
-/// Cells get 4px vertical padding at custom sizes, the text has to fit in the rest. 16px is
-/// what 12px text needs including descenders.
+/// Compact rows like Explorer's, smaller than the table's smallest preset (26px)
+pub const ROW_SIZE: gpui_kit::component::Size = gpui_kit::component::Size::Size(px(20.));
+/// What 12px text needs including descenders
 const CELL_LINE_HEIGHT: Pixels = px(16.);
+/// Cells have no vertical padding, so selected names fill the row and touch the ones above
+/// and below; their content is centered instead
+const CELL_PADDING: Edges<Pixels> = Edges {
+    top: px(0.),
+    bottom: px(0.),
+    left: px(6.),
+    right: px(6.),
+};
+
+/// A cell's text, centered in the row.
+fn cell_text(text: impl IntoElement) -> Div {
+    div().h_full().flex().items_center().child(
+        div()
+            .w_full()
+            .text_xs()
+            .line_height(CELL_LINE_HEIGHT)
+            .truncate()
+            .child(text),
+    )
+}
+
+/// The background of selected names. The table's own selection color is made transparent
+/// (see `view::apply_theme`), so only the names are highlighted, like in Explorer.
+pub struct NameHighlight(pub Hsla);
+
+impl Global for NameHighlight {}
+
+/// A selection rectangle dragged from the space next to the names. Points are in list content
+/// coordinates: window coordinates minus the scroll offset.
+pub struct Marquee {
+    start: Point<Pixels>,
+    end: Point<Pixels>,
+    /// What was selected before, kept with Ctrl
+    base: Vec<String>,
+}
+
+impl Marquee {
+    fn bounds(&self) -> Bounds<Pixels> {
+        Bounds::from_corners(
+            point(self.start.x.min(self.end.x), self.start.y.min(self.end.y)),
+            point(self.start.x.max(self.end.x), self.start.y.max(self.end.y)),
+        )
+    }
+}
 
 /// Which kinds of entries the results show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -232,6 +277,20 @@ pub struct Results {
     clicked: Option<usize>,
     /// The next time the table clears its selection, the selection here stays
     pub keep_selection: bool,
+    /// The scroll position of the table's list, set by the view
+    pub scroll: Option<UniformListScrollHandle>,
+    /// Where the icon and name of each drawn row are, in list content coordinates
+    name_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    /// The current press was on a name, not on the space next to it
+    pressed_name: bool,
+    /// The context menu was opened on a name: the table's outline of the right clicked row is
+    /// only for the space next to the names
+    menu_on_name: bool,
+    /// The last press was next to a name: the table selects that row on the click, which is
+    /// ignored, and a double click opens nothing
+    pub pressed_empty: Option<usize>,
+    pub empty_select: Option<usize>,
+    pub marquee: Option<Marquee>,
     pub last_search: Option<SearchTiming>,
     pub last_page: Option<Duration>,
     pub error: Option<String>,
@@ -265,6 +324,13 @@ impl Results {
             selection: Selection::default(),
             clicked: None,
             keep_selection: false,
+            scroll: None,
+            name_bounds: Rc::default(),
+            pressed_name: false,
+            menu_on_name: false,
+            pressed_empty: None,
+            empty_select: None,
+            marquee: None,
             last_search: None,
             last_page: None,
             error: None,
@@ -379,6 +445,7 @@ impl Results {
                             results.stale.extend(pages);
                         }
                         results.pending.clear();
+                        results.name_bounds.borrow_mut().clear();
                         // The first page comes with the answer
                         if !rows.is_empty() {
                             results.stale.remove(&0);
@@ -491,6 +558,48 @@ impl Results {
         true
     }
 
+    /// The list's scroll offset, negative when scrolled down.
+    pub fn scroll_offset(&self) -> Point<Pixels> {
+        self.scroll
+            .as_ref()
+            .map_or(Point::default(), |s| s.0.borrow().base_handle.offset())
+    }
+
+    /// The marquee in window coordinates, for drawing it.
+    pub fn marquee_bounds(&self) -> Option<Bounds<Pixels>> {
+        let offset = self.scroll_offset();
+        self.marquee.as_ref().map(|m| {
+            let b = m.bounds();
+            Bounds::new(b.origin + offset, b.size)
+        })
+    }
+
+    /// Moves the end of the marquee to `position` (window coordinates) and selects every name
+    /// it touches.
+    pub fn drag_marquee(&mut self, position: Point<Pixels>) {
+        let offset = self.scroll_offset();
+        let Some(marquee) = &mut self.marquee else {
+            return;
+        };
+        marquee.end = position - offset;
+        let area = marquee.bounds();
+        let mut paths = marquee.base.clone();
+        let mut rows = self
+            .name_bounds
+            .borrow()
+            .iter()
+            .filter(|(_, b)| b.intersects(&area))
+            .map(|(&row, _)| row)
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        for path in rows.into_iter().filter_map(|r| self.row(r).map(full_path)) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        self.selection.paths = paths;
+    }
+
     /// Selects the rows on screen. Never more, actions should only apply to entries the user
     /// has seen.
     pub fn select_visible(&mut self, visible: Range<usize>) {
@@ -592,7 +701,9 @@ impl TableDelegate for Results {
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
         let VisibleColumn { kind, width } = self.columns[col_ix];
-        let column = Column::new(kind.key(), kind.title()).width(width);
+        let column = Column::new(kind.key(), kind.title())
+            .width(width)
+            .paddings(CELL_PADDING);
         let column = match self.sorted_by {
             Some((sorted, true)) if sorted == kind => column.ascending(),
             Some((sorted, false)) if sorted == kind => column.descending(),
@@ -658,20 +769,10 @@ impl TableDelegate for Results {
         let text = Self::cell_text(row, kind);
         if kind == ColumnKind::Folder {
             let highlights = bold_ranges(&text, &row.folder_highlights);
-            return div()
-                .text_xs()
-                .line_height(CELL_LINE_HEIGHT)
-                .truncate()
-                .child(StyledText::new(text).with_highlights(highlights))
-                .into_any_element();
+            return cell_text(StyledText::new(text).with_highlights(highlights)).into_any_element();
         }
         if kind != ColumnKind::Name {
-            return div()
-                .text_xs()
-                .line_height(CELL_LINE_HEIGHT)
-                .truncate()
-                .child(text)
-                .into_any_element();
+            return cell_text(text).into_any_element();
         }
 
         let (name, directory, matched) = (row.name.clone(), row.directory, row.highlights.clone());
@@ -709,16 +810,66 @@ impl TableDelegate for Results {
             .into_any_element(),
         };
         let highlights = bold_ranges(&text, &matched);
+        let selected = self.is_selected(row_ix);
+        let highlight = cx.global::<NameHighlight>().0;
+        let (name_bounds, scroll) = (self.name_bounds.clone(), self.scroll.clone());
+        // Only the icon and the name are the entry, the space next to them starts a selection
+        // rectangle, like in Explorer
         h_flex()
-            .gap_1p5()
+            .h_full()
             .overflow_hidden()
-            .child(icon)
             .child(
-                div()
-                    .text_xs()
-                    .line_height(CELL_LINE_HEIGHT)
-                    .truncate()
-                    .child(StyledText::new(text).with_highlights(highlights)),
+                h_flex()
+                    .id(("name", row_ix))
+                    .relative()
+                    .h_full()
+                    .min_w_0()
+                    .gap_1()
+                    .px_1()
+                    .when(selected, |name| name.bg(highlight))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|table, _: &MouseDownEvent, _, _| {
+                            table.delegate_mut().menu_on_name = true;
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |table, event: &MouseDownEvent, window, cx| {
+                            let results = table.delegate_mut();
+                            results.pressed_name = true;
+                            results.click(row_ix, event.modifiers);
+                            table.focus_handle(cx).focus(window, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .child(icon)
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(CELL_LINE_HEIGHT)
+                            .truncate()
+                            .child(StyledText::new(text).with_highlights(highlights)),
+                    )
+                    // Remembers where the name was drawn, for the selection rectangle
+                    .child(
+                        canvas(
+                            move |bounds, _, _| {
+                                let offset = scroll.as_ref().map_or(Point::default(), |s| {
+                                    s.0.borrow().base_handle.offset()
+                                });
+                                name_bounds.borrow_mut().insert(
+                                    row_ix,
+                                    Bounds::new(bounds.origin - offset, bounds.size),
+                                );
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    ),
             )
             .into_any_element()
     }
@@ -735,10 +886,7 @@ impl TableDelegate for Results {
         div()
             .id(("th", col_ix))
             .size_full()
-            .text_xs()
-            .line_height(CELL_LINE_HEIGHT)
-            .truncate()
-            .child(self.columns[col_ix].kind.title())
+            .child(cell_text(self.columns[col_ix].kind.title()))
             .context_menu(move |menu, _, _| {
                 ColumnKind::ALL.into_iter().fold(menu, |menu, kind| {
                     let table = table.clone();
@@ -766,20 +914,31 @@ impl TableDelegate for Results {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
-        // Like the table's own selected row
-        let theme = cx.theme();
-        let selected = if theme.list.active_highlight {
-            theme.tokens.table_active
-        } else {
-            theme.tokens.accent
-        };
         div()
             .id(("row", row_ix))
-            .when(self.is_selected(row_ix), |row| row.bg(selected))
+            // No lines between the rows
+            .border_color(transparent_black())
+            // Pressing next to a name starts a selection rectangle, without Ctrl it clears the
+            // selection
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |table, event: &MouseDownEvent, window, cx| {
-                    table.delegate_mut().click(row_ix, event.modifiers);
+                    let offset = table.delegate().scroll_offset();
+                    let results = table.delegate_mut();
+                    if std::mem::take(&mut results.pressed_name) {
+                        results.pressed_empty = None;
+                        return;
+                    }
+                    results.pressed_empty = Some(row_ix);
+                    results.empty_select = Some(row_ix);
+                    if !event.modifiers.control {
+                        results.selection.clear();
+                    }
+                    results.marquee = Some(Marquee {
+                        start: event.position - offset,
+                        end: event.position - offset,
+                        base: results.selection.paths.clone(),
+                    });
                     table.focus_handle(cx).focus(window, cx);
                     cx.notify();
                 }),
@@ -787,7 +946,7 @@ impl TableDelegate for Results {
             // A right click on an entry that is not selected selects just it, like in Explorer
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |table, _: &MouseDownEvent, _, cx| {
+                cx.listener(move |table, _: &MouseDownEvent, window, cx| {
                     let results = table.delegate_mut();
                     if !results.is_selected(row_ix) {
                         results.click(row_ix, Modifiers::default());
@@ -795,6 +954,10 @@ impl TableDelegate for Results {
                         // Selecting forgets the right clicked row, which the menu opens for
                         table.set_right_clicked_row(Some(row_ix), cx);
                     }
+                    // The menu returns the focus here when it closes. Otherwise a menu open
+                    // while right clicking another row gives it back to the search box, which
+                    // shows that for a few frames until the new menu takes it.
+                    table.focus_handle(cx).focus(window, cx);
                 }),
             )
     }
@@ -804,9 +967,17 @@ impl TableDelegate for Results {
         row_ix: usize,
         menu: PopupMenu,
         _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
         self.menu_row = Some(row_ix);
+        // The menu is built, the right clicked row is not needed any more. The actions use
+        // `menu_row`.
+        if std::mem::take(&mut self.menu_on_name) {
+            cx.spawn(async move |table, cx| {
+                let _ = table.update(cx, |table, cx| table.set_right_clicked_row(None, cx));
+            })
+            .detach();
+        }
         let directory = self.row(row_ix).is_some_and(|r| r.directory);
         // Opening folders and properties are for one entry
         let single = !self.acts_on_many(row_ix);

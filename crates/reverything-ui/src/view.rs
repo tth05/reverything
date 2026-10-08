@@ -1,5 +1,7 @@
 //! The search window: search box, result table and a status bar with the service health.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,7 +26,7 @@ use crate::client::ServiceClient;
 use crate::desktop::{self, Desktop};
 use crate::drives::{Drive, DriveChoice};
 use crate::format;
-use crate::results::{Results, Show};
+use crate::results::{NameHighlight, Results, Show};
 use crate::settings::{HotkeyChoice, Settings, ThemeChoice};
 use crate::shell;
 use crate::update;
@@ -90,6 +92,22 @@ pub fn apply_theme(window: Option<&mut Window>, cx: &mut App) {
     // The dark theme's table header text is barely readable, use the muted text color like the
     // light theme does
     theme.table_head_foreground = theme.muted_foreground;
+    // Selected results are highlighted on their name only, like in Explorer: the table's
+    // highlight of its selected row becomes invisible, its color goes to the names. A theme that
+    // was not reset still has it invisible, then the color from before stays.
+    // Hovering a row shows nothing
+    theme.table_hover = transparent_black();
+    theme.tokens.table_hover = transparent_black().into();
+    let table_active = theme.tokens.table_active.color;
+    theme.list.active_highlight = true;
+    theme.table_active = transparent_black();
+    theme.tokens.table_active = transparent_black().into();
+    if table_active.a > 0. {
+        cx.set_global(NameHighlight(table_active));
+    } else if !cx.has_global::<NameHighlight>() {
+        let accent = cx.theme().accent;
+        cx.set_global(NameHighlight(accent));
+    }
 }
 
 /// Progress of looking for and installing an update
@@ -143,6 +161,12 @@ pub struct MainView {
     /// Changing a setting of the service failed
     settings_error: Option<String>,
     time_fields: TimeFields,
+    /// Where the results area is, for drawing the selection rectangle
+    results_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// Where the mouse is while a selection rectangle is dragged
+    marquee_pointer: Option<Point<Pixels>>,
+    /// Scrolls while the selection rectangle is dragged past the top or bottom of the list
+    autoscroll: Option<Task<()>>,
     /// A newer release, offered at the bottom left
     update: Option<update::Update>,
     /// What the update is doing, shown at the bottom left
@@ -168,6 +192,11 @@ impl MainView {
                 .col_resizable(true)
                 .col_movable(true)
                 .sortable(true)
+        });
+        // The results need the scroll position for the selection rectangle
+        table.update(cx, |table, _| {
+            let scroll = table.vertical_scroll_handle.clone();
+            table.delegate_mut().scroll = Some(scroll);
         });
 
         let time_fields = TimeFields::new(window, cx);
@@ -207,9 +236,18 @@ impl MainView {
                 _ => {}
             }),
             cx.subscribe_in(&table, window, |view, table, event, _, cx| match event {
-                TableEvent::DoubleClickedRow(row) => view.open_row(*row, cx),
+                // Not for a double click next to the name
+                TableEvent::DoubleClickedRow(row)
+                    if table.read(cx).delegate().pressed_empty != Some(*row) =>
+                {
+                    view.open_row(*row, cx)
+                }
                 // The table selects one row, the results keep the multi-selection
                 TableEvent::SelectRow(row) => table.update(cx, |table, cx| {
+                    // A click next to the name leaves the selection to the rectangle
+                    if table.delegate_mut().empty_select.take() == Some(*row) {
+                        return;
+                    }
                     if !table.delegate_mut().table_selected(*row) {
                         // Ctrl+click took it out of the selection
                         table.delegate_mut().keep_selection = true;
@@ -252,6 +290,9 @@ impl MainView {
             drive_error: None,
             settings_error: None,
             time_fields,
+            results_bounds: Rc::default(),
+            marquee_pointer: None,
+            autoscroll: None,
             update: None,
             update_state: UpdateState::Idle,
             started,
@@ -1636,14 +1677,156 @@ impl MainView {
                                 }
                             },
                         ))
+                        .relative()
                         .child(
                             DataTable::new(&self.table)
-                                .stripe(true)
+                                .stripe(false)
                                 .with_size(crate::results::ROW_SIZE),
-                        ),
+                        )
+                        .child(self.render_marquee(cx)),
                 )
             }
         })
+    }
+}
+
+impl MainView {
+    /// The selection rectangle while it is dragged, and mouse tracking for it anywhere in the
+    /// window.
+    fn render_marquee(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let results = self.table.read(cx).delegate();
+        let dragging = results.marquee.is_some();
+        let area = results
+            .scroll
+            .as_ref()
+            .map(|s| s.0.borrow().base_handle.bounds());
+        let origin = self.results_bounds.get().origin;
+        let rectangle = results
+            .marquee_bounds()
+            // Not over the header
+            .and_then(|b| area.map(|area| b.intersect(&area)))
+            .filter(|b| !b.size.width.is_zero() || !b.size.height.is_zero())
+            .map(|b| {
+                div()
+                    .absolute()
+                    .left(b.origin.x - origin.x)
+                    .top(b.origin.y - origin.y)
+                    .w(b.size.width)
+                    .h(b.size.height)
+                    .bg(cx.theme().selection.opacity(0.25))
+                    .border_1()
+                    .border_color(cx.theme().selection)
+            });
+
+        let bounds = self.results_bounds.clone();
+        let view = cx.entity();
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                canvas(
+                    move |area, _, _| bounds.set(area),
+                    move |_, _, window, _| {
+                        if !dragging {
+                            return;
+                        }
+                        let moved = view.clone();
+                        window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                            if phase.bubble() {
+                                let pressed = e.pressed_button == Some(MouseButton::Left);
+                                moved.update(cx, |view, cx| {
+                                    view.marquee_moved(e.position, pressed, cx)
+                                });
+                            }
+                        });
+                        let released = view.clone();
+                        window.on_mouse_event(move |e: &MouseUpEvent, phase, _, cx| {
+                            if phase.bubble() && e.button == MouseButton::Left {
+                                released.update(cx, |view, cx| view.end_marquee(cx));
+                            }
+                        });
+                    },
+                )
+                .size_full(),
+            )
+            .children(rectangle)
+    }
+
+    fn marquee_moved(&mut self, position: Point<Pixels>, pressed: bool, cx: &mut Context<Self>) {
+        if !pressed {
+            self.end_marquee(cx);
+            return;
+        }
+        self.marquee_pointer = Some(position);
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().drag_marquee(position);
+            cx.notify();
+        });
+        if self.autoscroll.is_none() {
+            self.autoscroll = Some(cx.spawn(async move |view, cx| loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let going = view
+                    .update(cx, |view, cx| view.autoscroll_step(cx))
+                    .unwrap_or(false);
+                if !going {
+                    let _ = view.update(cx, |view, _| view.autoscroll = None);
+                    return;
+                }
+            }));
+        }
+        cx.notify();
+    }
+
+    /// Scrolls towards the mouse while it is above or below the list during a drag. Returns
+    /// whether to keep going.
+    fn autoscroll_step(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(position) = self.marquee_pointer else {
+            return false;
+        };
+        let scrolled = self.table.update(cx, |table, cx| {
+            let results = table.delegate();
+            let Some(handle) = results
+                .scroll
+                .as_ref()
+                .map(|s| s.0.borrow().base_handle.clone())
+            else {
+                return false;
+            };
+            if results.marquee.is_none() {
+                return false;
+            }
+            let area = handle.bounds();
+            let distance = if position.y < area.top() {
+                position.y - area.top()
+            } else if position.y > area.bottom() {
+                position.y - area.bottom()
+            } else {
+                return true;
+            };
+            let mut offset = handle.offset();
+            let max = handle.max_offset();
+            offset.y = (offset.y - distance / 2.).clamp(-max.y, px(0.));
+            handle.set_offset(offset);
+            table.delegate_mut().drag_marquee(position);
+            cx.notify();
+            true
+        });
+        cx.notify();
+        scrolled
+    }
+
+    fn end_marquee(&mut self, cx: &mut Context<Self>) {
+        self.marquee_pointer = None;
+        self.autoscroll = None;
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().marquee = None;
+            cx.notify();
+        });
+        cx.notify();
     }
 }
 
