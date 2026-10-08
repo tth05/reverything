@@ -27,3 +27,8 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+# Fixes row spacing and blank rows far down long result lists. Remove once gpui-kit depends on
+# a gpui-pre that includes the uniform_list fix from Zed.
+[patch.crates-io]
+gpui-pre = { git = "https://github.com/Pelotrio/gpui-pre", rev = "e51e2f31ebd842240ddfa2ffd5fcb7424e54685c" }

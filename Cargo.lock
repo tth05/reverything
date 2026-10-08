@@ -2658,8 +2658,7 @@ dependencies = [
 [[package]]
 name = "gpui-pre"
 version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e87a42bb37c7cb4e76dd1ac0ce88851e46e976e0373a47ab3e0757abffee54d"
+source = "git+https://github.com/Pelotrio/gpui-pre?rev=e51e2f31ebd842240ddfa2ffd5fcb7424e54685c#e51e2f31ebd842240ddfa2ffd5fcb7424e54685c"
 dependencies = [
  "accesskit",
  "anyhow",
