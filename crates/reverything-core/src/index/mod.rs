@@ -96,6 +96,51 @@ impl Records {
         self.flags.is_empty()
     }
 
+    /// Capacity for `n` records. Grows in small steps: doubling would leave hundreds of MB
+    /// unused on large volumes, and copies everything every time anyway.
+    fn grown_capacity(&self, n: usize) -> usize {
+        n.max(self.len() + self.len() / 64)
+    }
+
+    /// Resizes to `n` records, growing in small steps.
+    pub fn grow_to(&mut self, n: usize) {
+        fn reserve<T>(v: &mut Vec<T>, cap: usize) {
+            v.reserve_exact(cap.saturating_sub(v.len()));
+        }
+        if n > self.flags.capacity() {
+            let cap = self.grown_capacity(n);
+            reserve(&mut self.name_off, cap);
+            reserve(&mut self.name_len, cap);
+            reserve(&mut self.parent, cap);
+            reserve(&mut self.flags, cap);
+            reserve(&mut self.size, cap);
+            reserve(&mut self.created, cap);
+            reserve(&mut self.modified, cap);
+            reserve(&mut self.sequence, cap);
+        }
+        self.resize(n);
+    }
+
+    /// A copy with room for `n` records, see [`VolumeIndex::prepare_updates`].
+    pub fn with_room(&self, n: usize) -> Records {
+        let cap = self.grown_capacity(n);
+        fn copy<T: Copy>(v: &[T], cap: usize) -> Vec<T> {
+            let mut c = Vec::with_capacity(cap);
+            c.extend_from_slice(v);
+            c
+        }
+        Records {
+            name_off: copy(&self.name_off, cap),
+            name_len: copy(&self.name_len, cap),
+            parent: copy(&self.parent, cap),
+            flags: copy(&self.flags, cap),
+            size: copy(&self.size, cap),
+            created: copy(&self.created, cap),
+            modified: copy(&self.modified, cap),
+            sequence: copy(&self.sequence, cap),
+        }
+    }
+
     pub fn resize(&mut self, n: usize) {
         self.name_off.resize(n, 0);
         self.name_len.resize(n, 0);

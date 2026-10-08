@@ -64,11 +64,9 @@ pub fn run(dir: &Path, letter: char, runs: usize) -> Result<()> {
                     let result = held.then(|| index.sorted.clone());
                     usn += 1;
                     // Like the service: grown with read access, before the timed write access
-                    let grown = index.grown_names(&updates);
+                    let prepared = index.prepare_updates(&updates);
                     let t = Instant::now();
-                    if let Some(grown) = grown {
-                        index.use_names(grown);
-                    }
+                    index.use_prepared(prepared);
                     index.apply_updates(&updates, usn);
                     times.push(t.elapsed());
                     drop(result);
@@ -98,6 +96,23 @@ pub fn run(dir: &Path, letter: char, runs: usize) -> Result<()> {
                 );
             }
         }
+    }
+    // Rewriting the names once a quarter is garbage: built with read access, swapped in with
+    // write access
+    for _ in 0..3 {
+        let garbage = index.garbage;
+        let t = Instant::now();
+        let compacted = index.compacted();
+        let build = t.elapsed();
+        let t = Instant::now();
+        index.use_compacted(compacted);
+        println!(
+            "compact names: built in {:?}, swapped in {:?} ({:.1} MB names, {:.1} MB garbage before)",
+            build,
+            t.elapsed(),
+            index.names.len() as f64 / 1048576.0,
+            garbage as f64 / 1048576.0
+        );
     }
     crate::print_memory("at the end");
     Ok(())

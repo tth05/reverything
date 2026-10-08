@@ -516,6 +516,46 @@ impl IndexSet {
         true
     }
 
+    /// Applies `updates` to the installed index of volume `i` with the write lock held as
+    /// briefly as possible: names and records grow before, and the names are rewritten once
+    /// enough of them are garbage after, both with read access while searches go on. Only the
+    /// volume's own thread changes its index, so nothing changes in between. Returns how long
+    /// applying took, the entries and the index size, or `None` if `run` is no longer current.
+    fn apply_installed(
+        &self,
+        i: usize,
+        run: u64,
+        updates: &[RecordUpdate],
+        usn: i64,
+    ) -> Option<(Duration, usize, usize)> {
+        let slot = &self.volumes[i];
+        let prepared = slot.index.read().unwrap().prepare_updates(updates);
+        let t = Instant::now();
+        let (entries, bytes) = {
+            let mut index = slot.index.write().unwrap();
+            if !self.is_current(i, run) {
+                return None;
+            }
+            index.use_prepared(prepared);
+            index.apply_updates(updates, usn);
+            (index.file_count(), index.heap_bytes())
+        };
+        let apply = t.elapsed();
+
+        let compacted = {
+            let index = slot.index.read().unwrap();
+            index.needs_compaction().then(|| index.compacted())
+        };
+        if let Some(compacted) = compacted {
+            let mut index = slot.index.write().unwrap();
+            if !self.is_current(i, run) {
+                return None;
+            }
+            index.use_compacted(compacted);
+        }
+        Some((apply, entries, bytes))
+    }
+
     /// Keeps volume `i` indexed until it is disabled or the service stops.
     fn run_volume(&self, i: usize, run: u64) {
         if self.offline {
@@ -763,30 +803,19 @@ impl IndexSet {
             self.trim();
         } else {
             let records = rt.since_index.to_vec();
-            // Reading the records and growing the names happen before taking the write lock,
-            // so searches go on meanwhile. Only this thread changes the index.
+            // Read before taking the write lock, so searches go on meanwhile
             let t = Instant::now();
             let updates = follower.fetch(&records);
             let fetch = t.elapsed();
-            let grown = slot.index.read().unwrap().grown_names(&updates);
-            let (batch, entries, bytes) = {
-                let mut index = slot.index.write().unwrap();
-                if !self.is_current(i, run) {
-                    return Ok(());
-                }
-                let t = Instant::now();
-                if let Some(grown) = grown {
-                    index.use_names(grown);
-                }
-                index.apply_updates(&updates, usn);
-                let batch = BatchStats {
-                    records: records.len(),
-                    updates: updates.len(),
-                    fetch,
-                    apply: t.elapsed(),
-                    at: SystemTime::now(),
-                };
-                (batch, index.file_count(), index.heap_bytes())
+            let Some((apply, entries, bytes)) = self.apply_installed(i, run, &updates, usn) else {
+                return Ok(());
+            };
+            let batch = BatchStats {
+                records: records.len(),
+                updates: updates.len(),
+                fetch,
+                apply,
+                at: SystemTime::now(),
             };
             if !records.is_empty() {
                 slot.dirty.store(true, Ordering::Release);
@@ -860,21 +889,9 @@ impl IndexSet {
             let t = Instant::now();
             let updates = follower.fetch(&changed);
             let fetch = t.elapsed();
-            // This thread is the only one changing the index, so it can grow the names while
-            // searches go on
-            let grown = slot.index.read().unwrap().grown_names(&updates);
-
-            let t = Instant::now();
-            let (entries, bytes) = {
-                let mut index = slot.index.write().unwrap();
-                if !self.is_current(i, run) {
-                    return Ok(());
-                }
-                if let Some(grown) = grown {
-                    index.use_names(grown);
-                }
-                index.apply_updates(&updates, follower.reader.next_usn());
-                (index.file_count(), index.heap_bytes())
+            let usn = follower.reader.next_usn();
+            let Some((apply, entries, bytes)) = self.apply_installed(i, run, &updates, usn) else {
+                return Ok(());
             };
             slot.dirty.store(true, Ordering::Release);
 
@@ -882,7 +899,7 @@ impl IndexSet {
                 records: changed.len(),
                 updates: updates.len(),
                 fetch,
-                apply: t.elapsed(),
+                apply,
                 at: SystemTime::now(),
             };
             self.update_stats(i, run, |s| {
@@ -1018,6 +1035,9 @@ fn apply(
     let fetch = t.elapsed();
     let t = Instant::now();
     index.apply_updates(&updates, usn);
+    if index.needs_compaction() {
+        index.compact_names();
+    }
     BatchStats {
         records: records.len(),
         updates: updates.len(),

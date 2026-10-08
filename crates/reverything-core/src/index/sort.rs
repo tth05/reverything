@@ -76,18 +76,25 @@ impl VolumeIndex {
         order
     }
 
+    /// Whether enough of the names are garbage to rewrite them, see [`VolumeIndex::compacted`].
+    pub fn needs_compaction(&self) -> bool {
+        self.garbage > (1 << 20) && self.garbage > self.names.len() / 4
+    }
+
     /// Rewrites the name arena in sorted order, dropping names that are no longer referenced.
     /// Searching in sorted order then reads the arena mostly sequentially.
     pub fn compact_names(&mut self) {
-        let order = self.name_order();
-        // Free link slots end up with an empty name
-        for (l, &r) in self.links.record.iter().enumerate() {
-            if r == NO_RECORD {
-                self.links.name_off[l] = 0;
-                self.links.name_len[l] = 0;
-            }
-        }
+        let compacted = self.compacted();
+        self.use_compacted(compacted);
+    }
 
+    /// The names rewritten in sorted order without the garbage, and the new name offsets.
+    ///
+    /// Takes tens of milliseconds for large volumes. The thread that changes the index calls it
+    /// with read access, so searches can go on meanwhile, and swaps the result in with
+    /// [`VolumeIndex::use_compacted`].
+    pub fn compacted(&self) -> Compacted {
+        let order = self.name_order();
         let mut offsets = order
             .par_iter()
             .map(|&id| self.name(id).len() as u32)
@@ -99,35 +106,77 @@ impl VolumeIndex {
             total += len;
         }
 
-        let old = std::mem::take(&mut self.names);
         let mut names = vec![0u8; total as usize];
-        let dst = SyncPtr(names.as_mut_ptr());
-        let (records, links) = (&mut self.records, &mut self.links);
-        let rec_off = SyncPtr(records.name_off.as_mut_ptr());
-        let link_off = SyncPtr(links.name_off.as_mut_ptr());
-        let (rec_len, link_len) = (&records.name_len, &links.name_len);
+        let mut record_off = self.records.name_off.clone();
+        let (mut link_off, mut link_len) =
+            (self.links.name_off.clone(), self.links.name_len.clone());
+        // Free link slots end up with an empty name
+        for (l, &r) in self.links.record.iter().enumerate() {
+            if r == NO_RECORD {
+                (link_off[l], link_len[l]) = (0, 0);
+            }
+        }
 
+        let dst = SyncPtr(names.as_mut_ptr());
+        let rec_off = SyncPtr(record_off.as_mut_ptr());
+        let link_off_ptr = SyncPtr(link_off.as_mut_ptr());
         // Every id appears once, so the writes are disjoint
         order
             .par_iter()
             .zip(&offsets)
             .for_each(|(&id, &new_off)| unsafe {
-                let (off_ptr, len) = if is_link(id) {
-                    let l = link_index(id);
-                    (link_off.get().add(l), link_len[l] as usize)
+                let name = self.name(id);
+                let off_ptr = if is_link(id) {
+                    link_off_ptr.get().add(link_index(id))
                 } else {
-                    let i = id as usize;
-                    (rec_off.get().add(i), rec_len[i] as usize)
+                    rec_off.get().add(id as usize)
                 };
                 std::ptr::copy_nonoverlapping(
-                    old.as_ptr().add(*off_ptr as usize),
+                    name.as_ptr(),
                     dst.get().add(new_off as usize),
-                    len,
+                    name.len(),
                 );
                 *off_ptr = new_off;
             });
 
-        self.names = names;
-        self.garbage = 0;
+        Compacted {
+            names,
+            record_off,
+            link_off,
+            link_len,
+            from: self.compaction_state(),
+        }
     }
+
+    /// Takes the result of [`VolumeIndex::compacted`], unless the index changed since.
+    pub fn use_compacted(&mut self, compacted: Compacted) -> bool {
+        if compacted.from != self.compaction_state() {
+            return false;
+        }
+        self.names = compacted.names;
+        self.records.name_off = compacted.record_off;
+        self.links.name_off = compacted.link_off;
+        self.links.name_len = compacted.link_len;
+        self.garbage = 0;
+        true
+    }
+
+    /// Changes whenever names, records or links change
+    fn compaction_state(&self) -> [usize; 4] {
+        [
+            self.names.as_ptr() as usize,
+            self.names.len(),
+            self.records.len(),
+            self.links.len(),
+        ]
+    }
+}
+
+/// Names rewritten without garbage, see [`VolumeIndex::compacted`].
+pub struct Compacted {
+    names: Vec<u8>,
+    record_off: Vec<u32>,
+    link_off: Vec<u32>,
+    link_len: Vec<u16>,
+    from: [usize; 4],
 }

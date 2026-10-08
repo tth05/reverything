@@ -9,8 +9,8 @@ use tracing::info_span;
 
 use crate::index::build::flags_and_size;
 use crate::index::{
-    is_link, link_id, link_index, VolumeIndex, FLAG_DIRECTORY, FLAG_HAS_LINKS, FLAG_IN_USE,
-    FLAG_SIZE_GUESSED, NO_RECORD,
+    is_link, link_id, link_index, Records, VolumeIndex, FLAG_DIRECTORY, FLAG_HAS_LINKS,
+    FLAG_IN_USE, FLAG_SIZE_GUESSED, NO_RECORD,
 };
 use crate::ntfs::io::Handle;
 use crate::ntfs::record::{
@@ -166,7 +166,7 @@ impl VolumeIndex {
                 continue;
             }
             if r >= self.records.len() {
-                self.records.resize(r + 1);
+                self.records.grow_to(r + 1);
             }
 
             // Take the record out of the folder sizes, and put it back in after the update
@@ -230,9 +230,6 @@ impl VolumeIndex {
         if !touched.is_empty() {
             info_span!("update.resort").in_scope(|| self.resort(touched, before));
         }
-        if self.garbage > (1 << 20) && self.garbage > self.names.len() / 4 {
-            info_span!("update.compact").in_scope(|| self.compact_names());
-        }
     }
 
     fn push_name(&mut self, name: &[u8]) -> (u32, u16) {
@@ -246,35 +243,54 @@ impl VolumeIndex {
         (off, len as u16)
     }
 
-    /// The names with room for everything `updates` may add, if there is not enough room.
+    /// Grows the names and records ahead of `updates`, if they need more room than there is.
     ///
-    /// Growing copies all names, which takes tens of milliseconds for large volumes. Called with
-    /// read access before applying the updates, searches can go on meanwhile; the result goes to
-    /// [`VolumeIndex::use_names`].
-    pub fn grown_names(&self, updates: &[RecordUpdate]) -> Option<GrownNames> {
+    /// Growing copies them all, which takes tens of milliseconds for large volumes. The thread
+    /// that applies the updates calls this with read access, so searches can go on meanwhile,
+    /// then hands the result to [`VolumeIndex::use_prepared`] with write access.
+    pub fn prepare_updates(&self, updates: &[RecordUpdate]) -> Prepared {
+        let _span = info_span!("update.prepare").entered();
         let adds = updates
             .iter()
             .filter_map(|u| u.state.as_ref())
             .flat_map(|s| &s.names)
             .map(|(_, name)| name.len().min(u16::MAX as usize))
             .sum::<usize>();
-        if self.names.len() + adds <= self.names.capacity() {
-            return None;
-        }
-        let _span = info_span!("update.grow_names_ahead").entered();
-        let mut names = Vec::with_capacity(self.names.len() + name_growth(&self.names, adds));
-        names.extend_from_slice(&self.names);
-        Some(GrownNames {
-            names,
-            from: (self.names.as_ptr() as usize, self.names.len()),
-        })
+        let names = (self.names.len() + adds > self.names.capacity()).then(|| {
+            let mut names = Vec::with_capacity(self.names.len() + name_growth(&self.names, adds));
+            names.extend_from_slice(&self.names);
+            (names, self.names_state())
+        });
+        let records = updates
+            .iter()
+            .map(|u| u.record as usize + 1)
+            .max()
+            .filter(|&n| n > self.records.flags.capacity())
+            .map(|n| (self.records.with_room(n), self.records_state()));
+        Prepared { names, records }
     }
 
-    /// Takes names from [`VolumeIndex::grown_names`], unless the names changed since.
-    pub fn use_names(&mut self, grown: GrownNames) {
-        if grown.from == (self.names.as_ptr() as usize, self.names.len()) {
-            self.names = grown.names;
+    /// Takes what [`VolumeIndex::prepare_updates`] grew, unless the index changed since.
+    pub fn use_prepared(&mut self, prepared: Prepared) {
+        if let Some((names, from)) = prepared.names {
+            if from == self.names_state() {
+                self.names = names;
+            }
         }
+        if let Some((records, from)) = prepared.records {
+            if from == self.records_state() {
+                self.records = records;
+            }
+        }
+    }
+
+    /// Identifies the names, to tell whether they changed: any change moves or resizes them.
+    fn names_state(&self) -> (usize, usize) {
+        (self.names.as_ptr() as usize, self.names.len())
+    }
+
+    fn records_state(&self) -> (usize, usize) {
+        (self.records.flags.as_ptr() as usize, self.records.len())
     }
 
     fn remove_links(&mut self, record: u32, touched: &mut Vec<u32>) {
@@ -386,6 +402,13 @@ impl VolumeIndex {
             })
             .collect::<Vec<_>>();
 
+        // Unless search results hold the list, move the entries in place: a new list of this
+        // size can take milliseconds of page faults
+        if let Some(sorted) = Arc::get_mut(&mut self.sorted) {
+            move_in_place(sorted, &removed, &new, &at);
+            return;
+        }
+        let old = &self.sorted;
         let mut out = Vec::with_capacity(old.len() - removed.len() + new.len());
         let mut start = 0;
         let mut skip = removed.iter().copied().peekable();
@@ -454,11 +477,43 @@ impl VolumeIndex {
     }
 }
 
-/// A copy of the names with more room, from [`VolumeIndex::grown_names`].
-pub struct GrownNames {
-    names: Vec<u8>,
-    /// Address and length of the names it was copied from
-    from: (usize, usize),
+/// Removes the entries at the positions `removed` and inserts `new` before the old positions
+/// `at` (both ascending), moving only the entries in between.
+fn move_in_place(sorted: &mut Vec<u32>, removed: &[usize], new: &[u32], at: &[usize]) {
+    if let Some(&first) = removed.first() {
+        let mut write = first;
+        for (i, &r) in removed.iter().enumerate() {
+            let end = removed.get(i + 1).copied().unwrap_or(sorted.len());
+            sorted.copy_within(r + 1..end, write);
+            write += end - r - 1;
+        }
+        sorted.truncate(write);
+    }
+    if new.is_empty() {
+        return;
+    }
+
+    // Open the gaps from the back
+    let len = sorted.len();
+    if len + new.len() > sorted.capacity() {
+        sorted.reserve_exact(new.len().max(len / 64));
+    }
+    sorted.resize(len + new.len(), 0);
+    let mut end = len;
+    for j in (0..new.len()).rev() {
+        // The position without the removed entries
+        let a = at[j] - removed.partition_point(|&r| r < at[j]);
+        sorted.copy_within(a..end, a + j + 1);
+        sorted[a + j] = new[j];
+        end = a;
+    }
+}
+
+/// Copies of the names and records with more room, from [`VolumeIndex::prepare_updates`], each with
+/// the state of what it was copied from.
+pub struct Prepared {
+    names: Option<(Vec<u8>, (usize, usize))>,
+    records: Option<(Records, (usize, usize))>,
 }
 
 /// How much to grow the names by to fit `len` more bytes. Small steps: doubling would add ~100
@@ -633,6 +688,25 @@ mod tests {
                 "round {} with {} updates",
                 round, batch
             );
+
+            // Rewriting the names keeps every name
+            if round % 10 == 9 {
+                let names = |index: &VolumeIndex| {
+                    expected
+                        .iter()
+                        .map(|&id| index.name(id).to_vec())
+                        .collect::<Vec<_>>()
+                };
+                let before = names(&index);
+                let compacted = index.compacted();
+                assert!(index.use_compacted(compacted));
+                assert_eq!(names(&index), before);
+                assert_eq!(index.garbage, 0);
+                assert_eq!(
+                    index.names.len(),
+                    before.iter().map(Vec::len).sum::<usize>()
+                );
+            }
         }
     }
 }
