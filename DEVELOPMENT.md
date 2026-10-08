@@ -202,6 +202,10 @@ Variations are read from `target/bench.env` (`KEY=VALUE` lines):
 4. `reverything-bench compare before.json after.json` compares two saved runs.
 5. `reverything-bench journal --dir target/synth --volume C` times applying batches of journal changes (modified,
    created, renamed and deleted files) to one volume, per phase (`update.*` tracing spans).
+6. `reverything-bench load --dir target/synth` times loading the saved indices like waking up, per phase.
+7. `reverything-bench replay serial|pipeline|cancel` types queries in bursts against a running service
+   (`REVERYTHING_PIPE`, e.g. the offline service on `target\synth`) and measures for every pause how long the rows
+   for exactly that text took.
 
 `reverything-service --console --offline` with `REVERYTHING_DEV_DIR=target\synth` serves the synthetic indices.
 
