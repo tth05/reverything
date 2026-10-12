@@ -27,6 +27,7 @@ use crate::desktop::{self, Desktop};
 use crate::drives::{Drive, DriveChoice};
 use crate::format;
 use crate::menu::{Entry, Menu, MenuIcon};
+use crate::open_with;
 use crate::results::{MenuTarget, NameHighlight, Results, Show};
 use crate::settings::{ExplorerMenu, MenuStyle, Settings, ThemeChoice};
 use crate::shell;
@@ -135,6 +136,9 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 /// After the window became active, index changes refresh the results right away for this long,
 /// while the service catches up with what happened in the meantime
 const ACTIVATION_REFRESH: Duration = Duration::from_secs(5);
+/// How far the mouse has to move with the button down on a name before the selection is
+/// dragged out, about Windows' default
+const DRAG_THRESHOLD: Pixels = px(4.);
 /// Lower than the default title bar (34px)
 const TITLE_BAR_HEIGHT: Pixels = px(30.);
 
@@ -1746,6 +1750,9 @@ impl MainView {
             "Open",
             Box::new(OpenSelected),
         )];
+        if let Some(open_with) = open_with_entry(target) {
+            entries.push(open_with);
+        }
         if single {
             entries.push(
                 action(
@@ -1891,11 +1898,12 @@ impl MainView {
         self.open_menu(entries, position, window, cx);
     }
 
-    /// The selection rectangle while it is dragged, and mouse tracking for it anywhere in the
-    /// window.
+    /// The selection rectangle while it is dragged, and mouse tracking anywhere in the window
+    /// for it and for dragging entries out.
     fn render_marquee(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let results = self.table.read(cx).delegate();
         let dragging = results.marquee.is_some();
+        let pressed_name = results.name_press.is_some();
         let area = results
             .scroll
             .as_ref()
@@ -1929,6 +1937,28 @@ impl MainView {
                 canvas(
                     move |area, _, _| bounds.set(area),
                     move |_, _, window, _| {
+                        if pressed_name {
+                            let moved = view.clone();
+                            window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+                                if phase.bubble() {
+                                    moved.update(cx, |view, cx| {
+                                        view.name_press_moved(e, window, cx)
+                                    });
+                                }
+                            });
+                            let released = view.clone();
+                            // Before the table's click, which selects the row
+                            window.on_mouse_event(move |e: &MouseUpEvent, phase, _, cx| {
+                                if phase.bubble() && e.button == MouseButton::Left {
+                                    released.update(cx, |view, cx| {
+                                        view.table.update(cx, |table, _| {
+                                            table.delegate_mut().release_name()
+                                        });
+                                        cx.notify();
+                                    });
+                                }
+                            });
+                        }
                         if !dragging {
                             return;
                         }
@@ -1952,6 +1982,59 @@ impl MainView {
                 .size_full(),
             )
             .children(rectangle)
+    }
+
+    /// Drags the selection out once the mouse moved far enough from where a name was pressed.
+    fn name_press_moved(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The listener stays until the next frame
+        let Some(start) = self
+            .table
+            .read(cx)
+            .delegate()
+            .name_press
+            .as_ref()
+            .map(|p| p.position)
+        else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            // Released where the view did not see it
+            self.table
+                .update(cx, |table, _| table.delegate_mut().name_press = None);
+            cx.notify();
+            return;
+        }
+        let moved = event.position - start;
+        if moved.x.abs() < DRAG_THRESHOLD && moved.y.abs() < DRAG_THRESHOLD {
+            return;
+        }
+        let paths = self
+            .table
+            .update(cx, |table, _| table.delegate_mut().start_drag());
+        cx.notify();
+        if paths.is_empty() {
+            return;
+        }
+        let hwnd = desktop::hwnd(window).map(|h| h.0 as usize);
+        // The shell runs its own message loop until the drop, which swallows the release, so
+        // start it outside of this event handler
+        cx.spawn(async move |view, cx| {
+            let hwnd = hwnd.map(|h| windows::Win32::Foundation::HWND(h as *mut _));
+            shell::drag_out(&paths, hwnd);
+            // The drop may have moved the entries. Explorer reports a move within a drive as
+            // no effect, so refresh after any drop, giving the service a moment to see it in
+            // the journal like after deleting.
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            let _ = view.update(cx, |view, cx| view.search(false, cx));
+        })
+        .detach();
     }
 
     fn marquee_moved(&mut self, position: Point<Pixels>, pressed: bool, cx: &mut Context<Self>) {
@@ -2028,6 +2111,61 @@ impl MainView {
         });
         cx.notify();
     }
+}
+
+/// Explorer's Open with submenu, for files of one type. Its apps are looked up when it opens.
+fn open_with_entry(target: &MenuTarget) -> Option<Entry> {
+    let extension = |path: &String| {
+        std::path::Path::new(path)
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    };
+    let first = extension(target.paths.first()?);
+    if target.directory || target.paths.iter().any(|p| extension(p) != first) {
+        return None;
+    }
+    let paths = Rc::new(target.paths.clone());
+    Some(Entry::Submenu {
+        icon: MenuIcon::None,
+        label: "Open with".into(),
+        entries: Rc::new(move || {
+            let mut entries = open_with::apps(&first)
+                .into_iter()
+                .map(|app| {
+                    let icon = app.icon().map_or(MenuIcon::None, MenuIcon::Image);
+                    let (app, paths) = (Rc::new(app), paths.clone());
+                    Entry::item(icon, app.name.clone(), move |_, cx| {
+                        let (app, paths) = (app.clone(), paths.clone());
+                        // Apps can start with a dialog, which must not run while the app is
+                        // being updated
+                        cx.spawn(async move |_| app.open(&paths)).detach();
+                    })
+                })
+                .collect::<Vec<_>>();
+            // Windows' dialog takes one file
+            if let [path] = paths.as_slice() {
+                if !entries.is_empty() {
+                    entries.push(Entry::Separator);
+                }
+                let path = path.clone();
+                entries.push(Entry::item(
+                    MenuIcon::None,
+                    "Choose another app",
+                    move |window, cx| {
+                        let (hwnd, path) = (desktop::hwnd(window), path.clone());
+                        cx.spawn(async move |_| open_with::choose(hwnd, &path))
+                            .detach();
+                    },
+                ));
+            }
+            if entries.is_empty() {
+                entries
+                    .push(Entry::item(MenuIcon::None, "No recommended apps", |_, _| {}).disabled());
+            }
+            entries
+        }),
+    })
 }
 
 /// The entries of Explorer's menu at `path` (indices of submenus), for the app's menu.

@@ -7,8 +7,8 @@ are indexed in seconds, and results appear as you type.
 
 - Search as you type, with wildcards (`*.mp3`), folders (`photos\2024`, `+C:\code\`), exclusions
   (`!node_modules\`) and size or date filters (`size:>1gb`, `dm:today`). Hover the `?` next to the search box for a short overview.
-- Open files and folders, copy them with Ctrl+C, show them in Explorer (or the file manager that replaced it), several
-  at once.
+- Open files and folders, drag them into other programs, copy them with Ctrl+C, show them in Explorer (or the file
+  manager that replaced it), several at once.
 - Lives in the tray and comes up with a global shortcut you record in the settings (none by default).
 - Uses almost no resources while you do not use it: the index is only kept up to date while the window has the
   focus, and is dropped from memory after an hour without it (adjustable in the settings).
@@ -60,7 +60,8 @@ After installing, no drive is indexed yet: the window shows how to turn them on 
 | Ctrl+A | Select the results on screen (never ones you have not seen) |
 | Delete, Shift+Delete | Delete to the Recycle Bin, delete permanently (in the results, the search box keeps its own keys) |
 | Escape | Hide to the tray |
-| Right click a row | Open, open folder, search in that folder, copy, copy path or name, delete, properties |
+| Drag a name | Drop the entries into Explorer, a browser's upload or any other program, like from Explorer |
+| Right click a row | Open, open with, open folder, search in that folder, copy, copy path or name, delete, properties |
 | Drag a column header | Reorder the columns |
 | Right click a column header | Show or hide columns |
 

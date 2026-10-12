@@ -16,6 +16,7 @@ mod format;
 mod icons;
 mod log;
 mod menu;
+mod open_with;
 mod results;
 mod selection;
 mod settings;

@@ -17,7 +17,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Shell::{
-    SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
+    SHDefExtractIconW, SHGetFileInfoW, SHLoadIndirectString, SHFILEINFOW, SHGFI_ICON,
+    SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 
@@ -123,6 +124,42 @@ fn load(name: &str, attributes: u32) -> Option<Arc<RenderImage>> {
         let _ = DestroyIcon(info.hIcon);
     }
     image
+}
+
+/// The small icon at `index` of a program or icon file, as in an icon location like
+/// `C:\Windows\notepad.exe,0`, or the logo of a Store app, an indirect string like
+/// `@{Package?ms-resource://Package/Files/Logo.png}`.
+pub fn load_location(path: &str, index: i32) -> Option<Arc<RenderImage>> {
+    if path.starts_with("@{") {
+        return load_package_logo(path);
+    }
+    let mut icon = HICON::default();
+    // The large size in the low word, the small one in the high word
+    let size = (16 << 16) | 32;
+    unsafe { SHDefExtractIconW(&HSTRING::from(path), index, 0, None, Some(&mut icon), size).ok() }
+        .ok()?;
+    if icon.is_invalid() {
+        return None;
+    }
+    let image = icon_to_image(icon);
+    unsafe {
+        let _ = DestroyIcon(icon);
+    }
+    image
+}
+
+/// The logo of a Store app: the indirect string resolves to the file of the logo.
+fn load_package_logo(location: &str) -> Option<Arc<RenderImage>> {
+    let mut path = [0u16; 1024];
+    unsafe { SHLoadIndirectString(&HSTRING::from(location), &mut path, None).ok()? };
+    let len = path.iter().position(|&c| c == 0)?;
+    let mut image = image::open(String::from_utf16_lossy(&path[..len]))
+        .ok()?
+        .into_rgba8();
+    for pixel in image.pixels_mut() {
+        pixel.0.swap(0, 2);
+    }
+    Some(Arc::new(RenderImage::new([Frame::new(image)])))
 }
 
 /// Converts an icon to a BGRA image, which is what GPUI expects.

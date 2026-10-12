@@ -77,6 +77,16 @@ impl Marquee {
     }
 }
 
+/// A left press on a name, which drags the selection out of the window once the mouse moves
+/// far enough.
+pub struct NamePress {
+    /// In window coordinates
+    pub position: Point<Pixels>,
+    /// Ctrl+click on a selected name takes it out of the selection on release, so the
+    /// selection can still be dragged, like in Explorer
+    release_click: Option<(usize, Modifiers)>,
+}
+
 /// The entries a context menu is for and where it opens.
 #[derive(Clone)]
 pub struct MenuTarget {
@@ -301,6 +311,7 @@ pub struct Results {
     pub pressed_empty: Option<usize>,
     pub empty_select: Option<usize>,
     pub marquee: Option<Marquee>,
+    pub name_press: Option<NamePress>,
     /// What the last right click on a row was for
     pub menu_target: Option<MenuTarget>,
     pub last_search: Option<SearchTiming>,
@@ -343,6 +354,7 @@ impl Results {
             pressed_empty: None,
             empty_select: None,
             marquee: None,
+            name_press: None,
             menu_target: None,
             last_search: None,
             last_page: None,
@@ -558,6 +570,39 @@ impl Results {
             self.row(r).map(full_path)
         });
         self.selection = selection;
+    }
+
+    /// A left press on the name of `row`. Pressing a selected name keeps the selection until
+    /// the release, so all of it can be dragged out; without Ctrl the table's click then
+    /// selects just that row.
+    fn press_name(&mut self, row: usize, event: &MouseDownEvent) {
+        let modifiers = event.modifiers;
+        let release_click = if self.is_selected(row) && !modifiers.shift {
+            self.clicked = None;
+            modifiers.control.then_some((row, modifiers))
+        } else {
+            self.click(row, modifiers);
+            None
+        };
+        self.name_press = Some(NamePress {
+            position: event.position,
+            release_click,
+        });
+    }
+
+    /// The left button was released after pressing a name, without dragging. Comes before the
+    /// table's click.
+    pub fn release_name(&mut self) {
+        if let Some((row, modifiers)) = self.name_press.take().and_then(|p| p.release_click) {
+            self.click(row, modifiers);
+        }
+    }
+
+    /// The selection is dragged out, the press does not end in a click.
+    pub fn start_drag(&mut self) -> Vec<String> {
+        self.name_press = None;
+        self.clicked = None;
+        self.selection.paths.clone()
     }
 
     /// The table selected `row`: after a click on it the selection is already right, after
@@ -845,9 +890,16 @@ impl TableDelegate for Results {
                         cx.listener(move |table, event: &MouseDownEvent, window, cx| {
                             let results = table.delegate_mut();
                             results.pressed_name = true;
-                            results.click(row_ix, event.modifiers);
+                            results.press_name(row_ix, event);
                             table.focus_handle(cx).focus(window, cx);
                             cx.notify();
+                        }),
+                    )
+                    // The view handles releases anywhere in the window, once it drew the press
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|table, _: &MouseUpEvent, _, _| {
+                            table.delegate_mut().release_name();
                         }),
                     )
                     .child(icon)
@@ -938,6 +990,7 @@ impl TableDelegate for Results {
                     }
                     results.pressed_empty = Some(row_ix);
                     results.empty_select = Some(row_ix);
+                    results.name_press = None;
                     if !event.modifiers.control {
                         results.selection.clear();
                     }

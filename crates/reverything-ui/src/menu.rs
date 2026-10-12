@@ -73,6 +73,14 @@ impl Entry {
         self
     }
 
+    /// Greys out an item, it cannot be chosen.
+    pub fn disabled(mut self) -> Self {
+        if let Entry::Item { disabled, .. } = &mut self {
+            *disabled = true;
+        }
+        self
+    }
+
     fn selectable(&self) -> bool {
         match self {
             Entry::Separator => false,

@@ -11,11 +11,14 @@ use reverything_protocol::Row;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::IDataObject;
-use windows::Win32::System::Ole::{OleFlushClipboard, OleSetClipboard};
+use windows::Win32::System::Ole::{
+    IDropSource, OleFlushClipboard, OleSetClipboard, DROPEFFECT_COPY, DROPEFFECT_LINK,
+    DROPEFFECT_MOVE,
+};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CLASSES_ROOT, RRF_RT_REG_SZ};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    BHID_DataObject, ILCreateFromPathW, ILFree, SHCreateShellItemArrayFromIDLists,
+    BHID_DataObject, ILCreateFromPathW, ILFree, SHCreateShellItemArrayFromIDLists, SHDoDragDrop,
     SHFileOperationW, SHOpenFolderAndSelectItems, ShellExecuteExW, ShellExecuteW, FOF_ALLOWUNDO,
     FO_DELETE, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, SHFILEOPSTRUCTW,
 };
@@ -197,5 +200,22 @@ pub fn copy_to_clipboard(paths: &[String]) {
     });
     if let Err(e) = result {
         crate::log::write(&format!("Copying {:?} failed: {}", paths, e));
+    }
+}
+
+/// Drags the entries to wherever the user drops them, the way Explorer does: the target picks
+/// copy, move or link (Explorer moves within a drive unless Ctrl is held), browsers and other
+/// programs read the files where they are. Shows the shell's drag image. Blocks until the drop.
+pub fn drag_out(paths: &[String], window: Option<HWND>) {
+    let result = data_object(paths).and_then(|data| unsafe {
+        SHDoDragDrop(
+            window,
+            &data,
+            None::<&IDropSource>,
+            DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
+        )
+    });
+    if let Err(e) = result {
+        crate::log::write(&format!("Dragging {:?} failed: {}", paths, e));
     }
 }
