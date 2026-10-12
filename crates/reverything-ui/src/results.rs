@@ -29,7 +29,8 @@ const PAGE: usize = 256;
 /// over is shown anyway
 const SHOW_OUTDATED_AFTER: Duration = Duration::from_millis(250);
 /// Compact rows like Explorer's, smaller than the table's smallest preset (26px)
-pub const ROW_SIZE: gpui_kit::component::Size = gpui_kit::component::Size::Size(px(20.));
+const ROW_HEIGHT: Pixels = px(20.);
+pub const ROW_SIZE: gpui_kit::component::Size = gpui_kit::component::Size::Size(ROW_HEIGHT);
 /// What 12px text needs including descenders
 const CELL_LINE_HEIGHT: Pixels = px(16.);
 /// Cells have no vertical padding, so selected names fill the row and touch the ones above
@@ -632,6 +633,35 @@ impl Results {
         })
     }
 
+    /// Starts a selection rectangle where the mouse was pressed. Without Ctrl it clears the
+    /// selection.
+    pub fn start_marquee(&mut self, event: &MouseDownEvent) {
+        let start = event.position - self.scroll_offset();
+        self.name_press = None;
+        if !event.modifiers.control {
+            self.selection.clear();
+        }
+        self.marquee = Some(Marquee {
+            start,
+            end: start,
+            base: self.selection.paths.clone(),
+        });
+    }
+
+    /// Whether `position` (window coordinates) is in the list's empty space below its last row.
+    pub fn below_rows(&self, position: Point<Pixels>) -> bool {
+        let Some(handle) = self
+            .scroll
+            .as_ref()
+            .map(|s| s.0.borrow().base_handle.clone())
+        else {
+            return false;
+        };
+        let area = handle.bounds();
+        let rows_end = area.top() + handle.offset().y + ROW_HEIGHT * self.total as f32;
+        area.contains(&position) && position.y >= rows_end
+    }
+
     /// Moves the end of the marquee to `position` (window coordinates) and selects every name
     /// it touches.
     pub fn drag_marquee(&mut self, position: Point<Pixels>) {
@@ -982,7 +1012,6 @@ impl TableDelegate for Results {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |table, event: &MouseDownEvent, window, cx| {
-                    let offset = table.delegate().scroll_offset();
                     let results = table.delegate_mut();
                     if std::mem::take(&mut results.pressed_name) {
                         results.pressed_empty = None;
@@ -990,15 +1019,7 @@ impl TableDelegate for Results {
                     }
                     results.pressed_empty = Some(row_ix);
                     results.empty_select = Some(row_ix);
-                    results.name_press = None;
-                    if !event.modifiers.control {
-                        results.selection.clear();
-                    }
-                    results.marquee = Some(Marquee {
-                        start: event.position - offset,
-                        end: event.position - offset,
-                        base: results.selection.paths.clone(),
-                    });
+                    results.start_marquee(event);
                     table.focus_handle(cx).focus(window, cx);
                     cx.notify();
                 }),

@@ -1700,6 +1700,25 @@ impl MainView {
                                 }
                             },
                         ))
+                        // The list has no rows below its last one, pressing there starts a
+                        // selection rectangle too
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                                view.table.update(cx, |table, cx| {
+                                    let results = table.delegate_mut();
+                                    if !results.below_rows(event.position) {
+                                        return;
+                                    }
+                                    results.pressed_empty = None;
+                                    results.empty_select = None;
+                                    results.start_marquee(event);
+                                    table.focus_handle(cx).focus(window, cx);
+                                    cx.notify();
+                                });
+                                cx.notify();
+                            }),
+                        )
                         .relative()
                         .child(
                             DataTable::new(&self.table)
