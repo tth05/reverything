@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 reverything-protocol.workspace = true
-gpui-kit = "=0.7.0"
+gpui-kit = "=0.7.3"
 image = { version = "0.25", default-features = false }
 raw-window-handle = "0.6.2"
 tray-icon = "0.26.0"
