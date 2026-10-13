@@ -142,6 +142,11 @@ const DRAG_THRESHOLD: Pixels = px(4.);
 /// Lower than the default title bar (34px)
 const TITLE_BAR_HEIGHT: Pixels = px(30.);
 
+/// The search text of a window that was closed, typed into the next one
+struct KeptQuery(String);
+
+impl Global for KeptQuery {}
+
 pub struct MainView {
     input: Entity<InputState>,
     table: Entity<TableState<Results>>,
@@ -198,6 +203,11 @@ impl MainView {
                 "Search, e.g. report, *.pdf, photos\\2024, +C:\\code\\, !node_modules\\",
             )
         });
+        // The window was closed while hidden, it opens again with what was searched
+        if let Some(KeptQuery(query)) = cx.try_global::<KeptQuery>() {
+            let query = query.clone();
+            input.update(cx, |input, cx| input.set_value(query, window, cx));
+        }
         let columns = cx.global::<Settings>().columns.clone();
         let table = cx.new(|cx| {
             TableState::new(Results::new(client.clone(), &columns), window, cx)
@@ -317,6 +327,11 @@ impl MainView {
         };
         cx.observe_window_activation(window, Self::on_activation)
             .detach();
+        cx.on_release(|view, cx| {
+            let query = view.input.read(cx).value().to_string();
+            cx.set_global(KeptQuery(query));
+        })
+        .detach();
         view.search(true, cx);
         view.poll_status(window, cx);
         view.run_script(window, cx);
