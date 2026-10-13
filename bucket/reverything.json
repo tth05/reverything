@@ -1,5 +1,5 @@
 {
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Blazingly fast, resource-efficient global file search for Windows",
   "homepage": "https://github.com/tth05/reverything",
   "license": {
@@ -7,8 +7,8 @@
     "url": "https://github.com/tth05/reverything/blob/master/LICENSE"
   },
   "notes": "Installs the Reverything Index service, which asks for administrator rights once.",
-  "url": "https://github.com/tth05/reverything/releases/download/v1.2.0/reverything-setup-1.2.0.exe#/setup.exe",
-  "hash": "a431c12a4c7ec1a1d9ed6fe8dff477c4940de4100eb8dc5af6414a3e07a6a23c",
+  "url": "https://github.com/tth05/reverything/releases/download/v1.2.1/reverything-setup-1.2.1.exe#/setup.exe",
+  "hash": "150beca41dfbcb96038e3cf2a7b8f3d58220d92dcfc01eea8208f4d35f7d7938",
   "installer": {
     "script": [
       "Start-Process \"$dir\\setup.exe\" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/MANAGED=scoop' -Wait"
