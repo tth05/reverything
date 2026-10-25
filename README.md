@@ -3,7 +3,7 @@ Find any file on your PC by name, instantly. Reverything is a fast file name sea
 [Everything](https://www.voidtools.com/): it reads the file table of your NTFS drives directly, so millions of files
 are indexed in seconds, and results appear as you type.
 
-![Reverything searching for programs larger than 1 MB in System32, without WinSxS](assets/screenshot.png)
+![Reverything searching for programs larger than 2 MB anywhere below C:\Windows, without WinSxS, assembly and Temp](assets/screenshot.png)
 
 - Search as you type, with wildcards (`*.mp3`), folders (`photos\2024`, `+C:\code\`), exclusions
   (`!node_modules\`) and size or date filters (`size:>1gb`, `dm:today`). Hover the `?` next to the search box for a short overview.
