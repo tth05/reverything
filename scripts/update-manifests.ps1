@@ -58,11 +58,11 @@ $scoop = [ordered]@{
 New-Item -ItemType Directory -Force (Join-Path $repo 'bucket') | Out-Null
 $scoop | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $repo 'bucket\reverything.json') -Encoding utf8NoBOM
 
-# winget, in the form microsoft/winget-pkgs expects: schema 1.12.0, CRLF line endings
+# winget, in the form microsoft/winget-pkgs expects: schema 1.28.0, CRLF line endings
 $id = 'tth05.Reverything'
 $dir = Join-Path $repo "packaging\winget\manifests\t\tth05\Reverything\$Version"
 New-Item -ItemType Directory -Force $dir | Out-Null
-$schema = '1.12.0'
+$schema = '1.28.0'
 $date = Get-Date -Format 'yyyy-MM-dd'
 function Write-Manifest([string] $File, [string] $Text) {
     $crlf = ($Text.Trim() -replace "`r?`n", "`r`n") + "`r`n"
