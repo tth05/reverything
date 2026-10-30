@@ -24,7 +24,7 @@ use crate::ntfs::usn::query_journal;
 use crate::ntfs::volume::{volume_data, Volume};
 
 const MAGIC: [u8; 8] = *b"RVINDEX\0";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 /// zstd level. Higher levels barely shrink the index further but take much longer.
 const LEVEL: i32 = 1;
 /// Uncompressed size of a chunk

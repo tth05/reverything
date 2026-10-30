@@ -1,14 +1,17 @@
 //! Folder sizes: the size of a directory is the total size of all files below it. Hard linked
-//! files count in every directory they appear in, like Explorer does.
+//! files count in every directory they appear in, like Explorer does. Files stored inside their
+//! MFT record take no space of their own and don't count.
 
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use rayon::prelude::*;
 
-use crate::index::{VolumeIndex, FLAG_DIRECTORY, FLAG_IN_USE, MAX_DEPTH, NO_RECORD};
+use crate::index::{VolumeIndex, FLAG_DIRECTORY, FLAG_IN_USE, FLAG_RESIDENT, MAX_DEPTH, NO_RECORD};
 use crate::ntfs::ROOT_RECORD;
 
 const DIR_IN_USE: u32 = FLAG_IN_USE | FLAG_DIRECTORY;
+/// `flags & COUNTED_MASK == FLAG_IN_USE` for files that add to their folders
+const COUNTED_MASK: u32 = DIR_IN_USE | FLAG_RESIDENT;
 
 impl VolumeIndex {
     #[inline]
@@ -17,6 +20,16 @@ impl VolumeIndex {
             .flags
             .get(record as usize)
             .is_some_and(|f| f & DIR_IN_USE == DIR_IN_USE)
+    }
+
+    /// What a record adds to the folders above it
+    pub(crate) fn counted_size(&self, record: u32) -> u64 {
+        let r = record as usize;
+        if self.records.flags[r] & FLAG_RESIDENT != 0 {
+            0
+        } else {
+            self.records.size[r]
+        }
     }
 
     /// Computes all folder sizes from scratch in O(n), in parallel.
@@ -41,14 +54,14 @@ impl VolumeIndex {
 
         // Direct contributions of files and their hard links
         (0..n).into_par_iter().with_min_len(4096).for_each(|i| {
-            if flags[i] & DIR_IN_USE == FLAG_IN_USE && is_dir(parent[i]) {
+            if flags[i] & COUNTED_MASK == FLAG_IN_USE && is_dir(parent[i]) {
                 let file = size[i].load(Ordering::Relaxed);
                 size[parent[i] as usize].fetch_add(file, Ordering::Relaxed);
             }
         });
         for (l, &r) in self.links.record.iter().enumerate() {
             let p = self.links.parent[l];
-            if r != NO_RECORD && flags[r as usize] & DIR_IN_USE == FLAG_IN_USE && is_dir(p) {
+            if r != NO_RECORD && flags[r as usize] & COUNTED_MASK == FLAG_IN_USE && is_dir(p) {
                 let file = size[r as usize].load(Ordering::Relaxed);
                 size[p as usize].fetch_add(file, Ordering::Relaxed);
             }
@@ -176,13 +189,13 @@ mod tests {
                 .is_some_and(|f| f & DIR_IN_USE == DIR_IN_USE)
         };
         for i in 0..n {
-            if flags[i] & DIR_IN_USE == FLAG_IN_USE && is_dir(parent[i]) {
+            if flags[i] & COUNTED_MASK == FLAG_IN_USE && is_dir(parent[i]) {
                 size[parent[i] as usize] += size[i];
             }
         }
         for (l, &r) in index.links.record.iter().enumerate() {
             let p = index.links.parent[l];
-            if r != NO_RECORD && flags[r as usize] & DIR_IN_USE == FLAG_IN_USE && is_dir(p) {
+            if r != NO_RECORD && flags[r as usize] & COUNTED_MASK == FLAG_IN_USE && is_dir(p) {
                 size[p as usize] += size[r as usize];
             }
         }
@@ -237,6 +250,38 @@ mod tests {
         }
     }
 
+    /// Files stored in their MFT record keep their size but don't count in folder totals, also
+    /// when they grow out of the record later
+    #[test]
+    fn resident_files_do_not_count() {
+        let mut index = VolumeIndex::empty(Volume { id: 'T' });
+        index.records = Records::with_len(20);
+        let r = &mut index.records;
+        for (i, flags, parent, size) in [
+            (ROOT_RECORD, DIR_IN_USE, ROOT_RECORD, 0),
+            (16, DIR_IN_USE, ROOT_RECORD, 0),
+            (17, FLAG_IN_USE, 16, 1000),
+            (18, FLAG_IN_USE | FLAG_RESIDENT, 16, 300),
+            (19, FLAG_IN_USE | FLAG_RESIDENT, ROOT_RECORD, 50),
+        ] {
+            r.flags[i as usize] = flags;
+            r.parent[i as usize] = parent;
+            r.size[i as usize] = size;
+        }
+        index.compute_folder_sizes();
+        let size = |index: &VolumeIndex, r: u32| index.records.size[r as usize];
+        assert_eq!(size(&index, 16), 1000);
+        assert_eq!(size(&index, ROOT_RECORD), 1000);
+        assert_eq!(size(&index, 18), 300);
+
+        index.add_to_ancestors(18, -(index.counted_size(18) as i64));
+        index.records.flags[18] = FLAG_IN_USE;
+        index.records.size[18] = 5000;
+        index.add_to_ancestors(18, index.counted_size(18) as i64);
+        assert_eq!(size(&index, 16), 6000);
+        assert_eq!(size(&index, ROOT_RECORD), 6000);
+    }
+
     /// Random trees with files, hard links and broken parents give the same sizes as before
     #[test]
     fn parallel_matches_sequential() {
@@ -257,6 +302,7 @@ mod tests {
                 r.flags[i] = match next(10) {
                     0..=2 => FLAG_IN_USE | FLAG_DIRECTORY,
                     3 => 0,
+                    4 => FLAG_IN_USE | FLAG_RESIDENT,
                     _ => FLAG_IN_USE,
                 };
                 // Mostly an earlier record, which may be a file, a free record or the root

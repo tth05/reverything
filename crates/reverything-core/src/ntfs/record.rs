@@ -21,6 +21,14 @@ pub const MFT_REF_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// physical sector size.
 const USA_STRIDE: usize = 512;
 
+/// Attribute flags
+const ATTR_FLAG_COMPRESSED: u16 = 0x00FF;
+const ATTR_FLAG_SPARSE: u16 = 0x8000;
+
+/// Stream that holds the data of files compressed by Windows (`compact /exe`, CompactOS). Their
+/// unnamed stream is empty.
+const WOF_STREAM: &str = "WofCompressedData";
+
 const RECORD_IN_USE: u16 = 0x1;
 const RECORD_IS_DIRECTORY: u16 = 0x2;
 
@@ -117,6 +125,20 @@ impl<'a> Attr<'a> {
         self.data[9]
     }
 
+    /// Whether the attribute is named `name`
+    fn is_named(&self, name: &str) -> bool {
+        let off = u16_at(self.data, 10) as usize;
+        self.data
+            .get(off..off + self.name_len() as usize * 2)
+            .is_some_and(|n| {
+                n.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes(*c))
+                    .eq(name.encode_utf16())
+            })
+    }
+
     /// Value of a resident attribute.
     #[inline]
     pub fn value(&self) -> Option<&'a [u8]> {
@@ -134,13 +156,23 @@ impl<'a> Attr<'a> {
     }
 
     #[inline]
-    pub fn allocated_size(&self) -> u64 {
-        u64_at(self.data, 40)
-    }
-
-    #[inline]
     pub fn real_size(&self) -> u64 {
         u64_at(self.data, 48)
+    }
+
+    /// Size of a non-resident attribute. Sparse and compressed attributes count with the clusters
+    /// they take up, their real size includes holes and uncompressed data.
+    pub fn disk_size(&self) -> u64 {
+        let flags = u16_at(self.data, 12);
+        // Only their headers have the total allocated size, the data runs follow it
+        if flags & (ATTR_FLAG_COMPRESSED | ATTR_FLAG_SPARSE) != 0
+            && u16_at(self.data, 32) >= 72
+            && self.data.len() >= 72
+        {
+            u64_at(self.data, 64)
+        } else {
+            self.real_size()
+        }
     }
 
     /// Mapping pairs of a non-resident attribute.
@@ -244,9 +276,13 @@ pub struct ParsedRecord {
     /// FILETIME values from $STANDARD_INFORMATION
     pub created: u64,
     pub modified: u64,
-    /// Size of the unnamed $DATA stream, if its first piece is in this record
+    /// Size of the unnamed $DATA stream, if its first piece is in this record. See
+    /// [`Attr::disk_size`].
     pub data_size: Option<u64>,
-    pub allocated_size: Option<u64>,
+    /// The unnamed $DATA stream is stored inside the record
+    pub data_resident: bool,
+    /// Size of the [`WOF_STREAM`] of a file compressed by Windows
+    pub wof_size: Option<u64>,
     /// Byte range of a resident $ATTRIBUTE_LIST value inside the record
     pub attribute_list: Option<(usize, usize)>,
 }
@@ -321,12 +357,20 @@ pub fn parse_record(rec: &[u8], out: &mut ParsedRecord, names: &mut Vec<NameRef>
             ATTR_DATA if attr.name_len() == 0 => {
                 if attr.non_resident() {
                     if attr.starting_vcn() == 0 {
-                        out.data_size = Some(attr.real_size());
-                        out.allocated_size = Some(attr.allocated_size());
+                        out.data_size = Some(attr.disk_size());
                     }
                 } else if let Some(v) = attr.value() {
                     out.data_size = Some(v.len() as u64);
-                    out.allocated_size = Some(0);
+                    out.data_resident = true;
+                }
+            }
+            ATTR_DATA if attr.is_named(WOF_STREAM) => {
+                if attr.non_resident() {
+                    if attr.starting_vcn() == 0 {
+                        out.wof_size = Some(attr.disk_size());
+                    }
+                } else if let Some(v) = attr.value() {
+                    out.wof_size = Some(v.len() as u64);
                 }
             }
             _ => {}

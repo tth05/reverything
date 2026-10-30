@@ -9,7 +9,7 @@ use rayon::prelude::*;
 
 use crate::index::{
     Links, Records, VolumeIndex, ATTRIBUTE_MASK, FLAG_DIRECTORY, FLAG_HAS_LINKS, FLAG_IN_USE,
-    FLAG_SIZE_GUESSED,
+    FLAG_RESIDENT, FLAG_SIZE_GUESSED,
 };
 use crate::ntfs::layout::MftLayout;
 use crate::ntfs::record::{
@@ -101,6 +101,8 @@ struct Extension {
     base: u32,
     names: Vec<(u32, Vec<u8>)>,
     data_size: Option<u64>,
+    data_resident: bool,
+    wof_size: Option<u64>,
 }
 
 /// Raw pointers into [`Records`] so chunks parsed on different threads can fill their own
@@ -283,6 +285,8 @@ unsafe fn parse_chunk(
                     })
                     .collect(),
                 data_size: parsed.data_size,
+                data_resident: parsed.data_resident,
+                wof_size: parsed.wof_size,
             });
             continue;
         }
@@ -353,10 +357,20 @@ fn merge_extension(records: &mut Records, links: &mut Links, names: &mut Vec<u8>
         }
     }
 
-    if let Some(size) = ext.data_size {
+    if records.flags[b] & FLAG_DIRECTORY != 0 {
+        return;
+    }
+    // Like in flags_and_size, the compressed stream wins over the unnamed one
+    if let Some(size) = ext.wof_size {
+        records.size[b] = size;
+        records.flags[b] &= !(FLAG_SIZE_GUESSED | FLAG_RESIDENT);
+    } else if let Some(size) = ext.data_size {
         if records.flags[b] & FLAG_SIZE_GUESSED != 0 {
             records.size[b] = size;
             records.flags[b] &= !FLAG_SIZE_GUESSED;
+            if ext.data_resident {
+                records.flags[b] |= FLAG_RESIDENT;
+            }
         }
     }
 }
@@ -367,7 +381,12 @@ pub fn flags_and_size(parsed: &ParsedRecord, fn_size: u64) -> (u32, u64) {
     let size = if parsed.is_directory {
         flags |= FLAG_DIRECTORY;
         0
+    } else if let Some(size) = parsed.wof_size {
+        size
     } else if let Some(size) = parsed.data_size {
+        if parsed.data_resident {
+            flags |= FLAG_RESIDENT;
+        }
         size
     } else {
         flags |= FLAG_SIZE_GUESSED;

@@ -11,7 +11,7 @@ use tracing::info_span;
 use crate::index::build::flags_and_size;
 use crate::index::{
     is_link, link_id, link_index, Records, VolumeIndex, FLAG_DIRECTORY, FLAG_HAS_LINKS,
-    FLAG_IN_USE, FLAG_SIZE_GUESSED, NO_RECORD,
+    FLAG_IN_USE, FLAG_RESIDENT, FLAG_SIZE_GUESSED, NO_RECORD,
 };
 use crate::ntfs::io::Handle;
 use crate::ntfs::record::{
@@ -81,7 +81,6 @@ pub fn fetch_update(handle: &Handle, record: u32, record_size: usize) -> Option<
     let mut names = Vec::new();
     decode(&rec, &refs, &mut names);
     let fn_size = refs.first().map_or(0, |n| n.size);
-    let mut data_size = parsed.data_size;
 
     // Names and the data size may live in extension records
     if let Some((start, end)) = parsed.attribute_list {
@@ -93,11 +92,14 @@ pub fn fetch_update(handle: &Handle, record: u32, record_size: usize) -> Option<
             let mut ext_parsed = ParsedRecord::default();
             if fixup_if_needed(&mut ext_rec) && parse_record(&ext_rec, &mut ext_parsed, &mut refs) {
                 decode(&ext_rec, &refs, &mut names);
-                data_size = data_size.or(ext_parsed.data_size);
+                if parsed.data_size.is_none() {
+                    parsed.data_size = ext_parsed.data_size;
+                    parsed.data_resident = ext_parsed.data_resident;
+                }
+                parsed.wof_size = parsed.wof_size.or(ext_parsed.wof_size);
             }
         }
     }
-    parsed.data_size = data_size;
 
     let (flags, size) = flags_and_size(&parsed, fn_size);
     // A non-resident attribute list could hide the $DATA attribute, keep the old size then
@@ -172,7 +174,7 @@ impl VolumeIndex {
 
             // Take the record out of the folder sizes, and put it back in after the update
             if in_index {
-                self.add_to_ancestors(id, -(self.records.size[r] as i64));
+                self.add_to_ancestors(id, -(self.counted_size(id) as i64));
                 if !was_in_use {
                     self.remove_links(id, &mut touched);
                     self.records.flags[r] &= !FLAG_IN_USE;
@@ -207,13 +209,13 @@ impl VolumeIndex {
                 flags |= self.records.flags[r] & FLAG_HAS_LINKS;
             }
 
-            self.records.flags[r] = flags;
             match state.size {
                 Some(size) => self.records.size[r] = size,
                 None if !was_in_use => self.records.size[r] = 0,
                 // Directory sizes are aggregated, unknown sizes are kept
-                None => {}
+                None => flags |= self.records.flags[r] & FLAG_RESIDENT,
             }
+            self.records.flags[r] = flags;
             self.records.created[r] = state.created;
             self.records.modified[r] = state.modified;
             self.records.sequence[r] = state.sequence;
@@ -221,7 +223,7 @@ impl VolumeIndex {
                 touched.push(id);
             }
 
-            self.add_to_ancestors(id, self.records.size[r] as i64);
+            self.add_to_ancestors(id, self.counted_size(id) as i64);
         }
 
         drop(records);

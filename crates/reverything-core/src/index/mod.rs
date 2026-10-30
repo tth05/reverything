@@ -28,6 +28,8 @@ pub const FLAG_IN_USE: u32 = 1 << 31;
 pub const FLAG_SIZE_GUESSED: u32 = 1 << 30;
 /// The record has additional names in [`Links`].
 pub const FLAG_HAS_LINKS: u32 = 1 << 29;
+/// The file's data is stored inside its MFT record, so it takes no space of its own.
+pub const FLAG_RESIDENT: u32 = 1 << 28;
 /// FILE_ATTRIBUTE_DIRECTORY
 pub const FLAG_DIRECTORY: u32 = 0x10;
 /// FILE_ATTRIBUTE_* bits kept from $STANDARD_INFORMATION
