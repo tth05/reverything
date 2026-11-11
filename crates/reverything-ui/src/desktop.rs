@@ -415,26 +415,38 @@ pub fn show_window(window: &mut Window, cx: &mut App) {
 }
 
 /// [`show_window`], maximized if `maximize`.
+///
+/// The window is moved and shown from a task, outside of this update: Windows delivers the
+/// resulting messages synchronously, and when the window lands on another monitor gpui's
+/// display-changed callback borrows the app, which panics while it is already borrowed.
 pub fn present(window: &mut Window, cx: &mut App, maximize: bool) {
     if cx.has_global::<Desktop>() {
         cx.global_mut::<Desktop>().close_hidden = None;
     }
-    if let Some(h) = hwnd(window) {
-        move_to_cursor_monitor(h);
-        unsafe {
-            let _ = ShowWindow(
-                h,
-                if maximize {
-                    SW_SHOWMAXIMIZED
-                } else if IsIconic(h).as_bool() {
-                    SW_RESTORE
-                } else {
-                    SW_SHOW
-                },
-            );
-            let _ = SetForegroundWindow(h);
-        }
-    }
-    window.activate_window();
     window.dispatch_action(Box::new(FocusSearch), cx);
+    let handle = Window::window_handle(window);
+    cx.spawn(async move |cx| {
+        // Still open, and no longer borrowed once this returns
+        let Ok(h) = handle.update(cx, |_, window, _| hwnd(window)) else {
+            return;
+        };
+        if let Some(h) = h {
+            move_to_cursor_monitor(h);
+            unsafe {
+                let _ = ShowWindow(
+                    h,
+                    if maximize {
+                        SW_SHOWMAXIMIZED
+                    } else if IsIconic(h).as_bool() {
+                        SW_RESTORE
+                    } else {
+                        SW_SHOW
+                    },
+                );
+                let _ = SetForegroundWindow(h);
+            }
+        }
+        let _ = handle.update(cx, |_, window, _| window.activate_window());
+    })
+    .detach();
 }
