@@ -30,17 +30,44 @@ pub struct MftLayout {
     bitmap: Option<Vec<u8>>,
 }
 
+/// The unnamed attributes of $MFT that say where the table and its bitmap are. A large
+/// non-resident attribute can be split into pieces in several records, each with the runs from
+/// its starting VCN on. Only the piece at VCN 0 has the attribute's size, the others store 0.
 #[derive(Default)]
 struct MftAttributes {
     data_pieces: Vec<(u64, Vec<Run>)>,
     data_size: Option<u64>,
-    bitmap: Option<BitmapAttr>,
-    attribute_list: Option<Vec<u8>>,
+    bitmap_pieces: Vec<(u64, Vec<Run>)>,
+    bitmap_size: Option<u64>,
+    bitmap_resident: Option<Vec<u8>>,
+    /// A piece of the bitmap had runs that could not be decoded
+    bitmap_invalid: bool,
 }
 
-enum BitmapAttr {
-    Resident(Vec<u8>),
-    NonResident(Vec<Run>, u64),
+impl MftAttributes {
+    /// The runs of the non-resident bitmap and its size, `None` if there is none.
+    fn bitmap_runs(&self) -> Result<Option<(Vec<Run>, u64)>> {
+        ensure!(!self.bitmap_invalid, "Invalid bitmap runs");
+        if self.bitmap_pieces.is_empty() {
+            return Ok(None);
+        }
+        let runs = join_pieces(&self.bitmap_pieces, "bitmap")?;
+        let size = self
+            .bitmap_size
+            .ok_or_else(|| eyre!("No piece of the bitmap starts at vcn 0"))?;
+        Ok(Some((runs, size)))
+    }
+}
+
+/// A bitmap too short for the table would leave the records past its end out as unused.
+fn check_bitmap(bitmap: &[u8], record_count: u64) -> Result<()> {
+    ensure!(
+        bitmap.len() as u64 * 8 >= record_count,
+        "The bitmap has {} bits for {} records",
+        bitmap.len() as u64 * 8,
+        record_count
+    );
+    Ok(())
 }
 
 impl MftLayout {
@@ -68,12 +95,14 @@ impl MftLayout {
         ensure!(apply_fixup(&mut rec0, true), "$MFT record is corrupt");
 
         let mut attrs = MftAttributes::default();
-        collect_mft_attributes(handle, &layout, &rec0, &mut attrs)?;
+        let list = collect_mft_attributes(&rec0, &mut attrs)?
+            .map(|attr| read_attribute_value(handle, &layout, &attr))
+            .transpose()?;
 
-        // A very fragmented $MFT stores the rest of its data runs in extension records, listed in
-        // the $ATTRIBUTE_LIST. Those records are near the start of the table, which the runs from
-        // record 0 already cover.
-        if let Some(list) = attrs.attribute_list.take() {
+        // A very fragmented $MFT stores the rest of its data and bitmap runs in extension
+        // records, listed in the $ATTRIBUTE_LIST. Those records are near the start of the table,
+        // which the runs from record 0 already cover.
+        if let Some(list) = list {
             layout.extents = build_extents(&attrs.data_pieces, cluster_size)?;
             for ext in attribute_list_records(&list, &[ATTR_DATA, ATTR_BITMAP], 0) {
                 let offset = layout
@@ -84,7 +113,8 @@ impl MftLayout {
                     apply_fixup(&mut rec, true),
                     "$MFT extension record is corrupt"
                 );
-                collect_mft_attributes(handle, &layout, &rec, &mut attrs)?;
+                // Extension records have no list of their own
+                collect_mft_attributes(&rec, &mut attrs)?;
             }
         }
 
@@ -95,15 +125,28 @@ impl MftLayout {
         let mapped = layout.extents.last().map_or(0, |e| e.mft_offset + e.len);
         layout.record_count = data_size.min(mapped) / record_size as u64;
 
-        layout.bitmap = match attrs.bitmap {
-            Some(BitmapAttr::Resident(v)) => Some(v),
-            Some(BitmapAttr::NonResident(runs, size)) => {
-                Some(read_runs(handle, &layout, &runs, size)?)
+        // Without a usable bitmap every record is read, and the in-use flag in its header decides
+        layout.bitmap = match layout.read_bitmap(handle, attrs) {
+            Ok(bitmap) => bitmap,
+            Err(e) => {
+                log::warn!("The $MFT bitmap is unusable, reading every record: {:#}", e);
+                None
             }
-            None => None,
         };
 
         Ok(layout)
+    }
+
+    fn read_bitmap(&self, handle: &Handle, attrs: MftAttributes) -> Result<Option<Vec<u8>>> {
+        let bitmap = match &attrs.bitmap_resident {
+            Some(value) => value.clone(),
+            None => match attrs.bitmap_runs()? {
+                Some((runs, size)) => read_runs(handle, self, &runs, size)?,
+                None => return Ok(None),
+            },
+        };
+        check_bitmap(&bitmap, self.record_count)?;
+        Ok(Some(bitmap))
     }
 
     /// Reads `len` bytes at `offset` with the alignment unbuffered I/O requires.
@@ -331,12 +374,10 @@ impl Drop for ReadSlot {
     }
 }
 
-fn collect_mft_attributes(
-    handle: &Handle,
-    layout: &MftLayout,
-    rec: &[u8],
-    out: &mut MftAttributes,
-) -> Result<()> {
+/// Adds the pieces of $MFT's unnamed $DATA and $BITMAP in `rec` to `out`. Returns its
+/// $ATTRIBUTE_LIST, which only record 0 has.
+fn collect_mft_attributes<'a>(rec: &'a [u8], out: &mut MftAttributes) -> Result<Option<Attr<'a>>> {
+    let mut list = None;
     for attr in attributes(rec) {
         if attr.name_len() != 0 {
             continue;
@@ -349,23 +390,24 @@ fn collect_mft_attributes(
                 }
                 out.data_pieces.push((attr.starting_vcn(), runs));
             }
+            ATTR_BITMAP if attr.non_resident() => {
+                // Unlike broken data runs this is no reason to give up, see `bitmap_runs`
+                match attr.runs() {
+                    Some(runs) => out.bitmap_pieces.push((attr.starting_vcn(), runs)),
+                    None => out.bitmap_invalid = true,
+                }
+                if attr.starting_vcn() == 0 {
+                    out.bitmap_size = Some(attr.real_size());
+                }
+            }
             ATTR_BITMAP => {
-                out.bitmap = Some(if attr.non_resident() {
-                    let runs = attr
-                        .runs()
-                        .ok_or_else(|| eyre!("Invalid $MFT bitmap runs"))?;
-                    BitmapAttr::NonResident(runs, attr.real_size())
-                } else {
-                    BitmapAttr::Resident(attr.value().unwrap_or_default().to_vec())
-                });
+                out.bitmap_resident = Some(attr.value().unwrap_or_default().to_vec());
             }
-            ATTR_ATTRIBUTE_LIST if out.attribute_list.is_none() => {
-                out.attribute_list = Some(read_attribute_value(handle, layout, &attr)?);
-            }
+            ATTR_ATTRIBUTE_LIST if list.is_none() => list = Some(attr),
             _ => {}
         }
     }
-    Ok(())
+    Ok(list)
 }
 
 fn read_attribute_value(handle: &Handle, layout: &MftLayout, attr: &Attr) -> Result<Vec<u8>> {
@@ -376,29 +418,41 @@ fn read_attribute_value(handle: &Handle, layout: &MftLayout, attr: &Attr) -> Res
     read_runs(handle, layout, &runs, attr.real_size())
 }
 
-fn build_extents(pieces: &[(u64, Vec<Run>)], cluster_size: u64) -> Result<Vec<Extent>> {
+/// The runs of an attribute's pieces in VCN order, which must follow each other without gaps.
+fn join_pieces(pieces: &[(u64, Vec<Run>)], what: &str) -> Result<Vec<Run>> {
     let mut pieces = pieces.iter().collect::<Vec<_>>();
     pieces.sort_by_key(|p| p.0);
 
-    let mut extents = Vec::new();
+    let mut joined = Vec::new();
     let mut vcn = 0u64;
     for (start_vcn, runs) in pieces {
         if *start_vcn != vcn {
             bail!(
-                "Gap in $MFT data runs at vcn {} (expected {})",
+                "Gap in $MFT {} runs at vcn {} (expected {})",
+                what,
                 start_vcn,
                 vcn
             );
         }
         for run in runs {
-            let lcn = run.lcn.ok_or_else(|| eyre!("$MFT contains a sparse run"))?;
-            extents.push(Extent {
-                mft_offset: vcn * cluster_size,
-                disk_offset: lcn * cluster_size,
-                len: run.clusters * cluster_size,
-            });
+            joined.push(*run);
             vcn += run.clusters;
         }
+    }
+    Ok(joined)
+}
+
+fn build_extents(pieces: &[(u64, Vec<Run>)], cluster_size: u64) -> Result<Vec<Extent>> {
+    let mut extents = Vec::new();
+    let mut vcn = 0u64;
+    for run in join_pieces(pieces, "data")? {
+        let lcn = run.lcn.ok_or_else(|| eyre!("$MFT contains a sparse run"))?;
+        extents.push(Extent {
+            mft_offset: vcn * cluster_size,
+            disk_offset: lcn * cluster_size,
+            len: run.clusters * cluster_size,
+        });
+        vcn += run.clusters;
     }
     Ok(extents)
 }
@@ -417,4 +471,110 @@ fn read_runs(handle: &Handle, layout: &MftLayout, runs: &[Run], size: u64) -> Re
         off += len;
     }
     Ok(buf[..(size.min(total)) as usize].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record with unnamed non-resident attributes of `(kind, starting vcn, real size, run)`,
+    /// each with the single run `(clusters, lcn)`.
+    fn record(attrs: &[(u32, u64, u64, (u8, u8))]) -> Vec<u8> {
+        let mut rec = vec![0u8; 1024];
+        let mut off = 56;
+        rec[20..22].copy_from_slice(&(off as u16).to_le_bytes());
+        for &(kind, vcn, size, (clusters, lcn)) in attrs {
+            let a = &mut rec[off..off + 72];
+            a[0..4].copy_from_slice(&kind.to_le_bytes());
+            a[4..8].copy_from_slice(&72u32.to_le_bytes());
+            a[8] = 1;
+            a[10..12].copy_from_slice(&64u16.to_le_bytes());
+            a[16..24].copy_from_slice(&vcn.to_le_bytes());
+            a[32..34].copy_from_slice(&64u16.to_le_bytes());
+            a[48..56].copy_from_slice(&size.to_le_bytes());
+            a[64..68].copy_from_slice(&[0x11, clusters, lcn, 0]);
+            off += 72;
+        }
+        rec[off..off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        rec[24..28].copy_from_slice(&(off as u32 + 8).to_le_bytes());
+        rec
+    }
+
+    fn clusters(runs: &[Run]) -> Vec<(Option<u64>, u64)> {
+        runs.iter().map(|r| (r.lcn, r.clusters)).collect()
+    }
+
+    /// A grown $MFT can have its bitmap split over extension records, where every piece after the
+    /// first says its size is 0
+    #[test]
+    fn split_bitmap() {
+        let rec0 = record(&[
+            (ATTR_DATA, 0, 1 << 20, (100, 10)),
+            (ATTR_BITMAP, 0, 3000, (2, 50)),
+        ]);
+        let ext1 = record(&[(ATTR_BITMAP, 3, 0, (1, 70))]);
+        let ext2 = record(&[(ATTR_BITMAP, 2, 0, (1, 60))]);
+
+        let mut attrs = MftAttributes::default();
+        for rec in [&rec0, &ext1, &ext2] {
+            assert!(collect_mft_attributes(rec, &mut attrs).unwrap().is_none());
+        }
+        assert_eq!(attrs.data_size, Some(1 << 20));
+        let (runs, size) = attrs.bitmap_runs().unwrap().unwrap();
+        assert_eq!(size, 3000);
+        assert_eq!(
+            clusters(&runs),
+            [(Some(50), 2), (Some(60), 1), (Some(70), 1)]
+        );
+    }
+
+    /// Bitmaps that would leave records out are not used
+    #[test]
+    fn unusable_bitmap() {
+        let collect = |recs: &[Vec<u8>]| {
+            let mut attrs = MftAttributes::default();
+            for rec in recs {
+                collect_mft_attributes(rec, &mut attrs).unwrap();
+            }
+            attrs
+        };
+        // Without the piece at VCN 0 the size is unknown
+        let attrs = collect(&[record(&[(ATTR_BITMAP, 2, 0, (1, 60))])]);
+        assert!(attrs.bitmap_runs().is_err());
+        // Runs that can not be decoded
+        let mut rec = record(&[(ATTR_BITMAP, 0, 3000, (2, 50))]);
+        rec[56 + 64] = 0x19;
+        let attrs = collect(&[rec]);
+        assert!(attrs.bitmap_runs().is_err());
+        // No bitmap at all is fine, every record is read
+        let attrs = collect(&[record(&[(ATTR_DATA, 0, 1 << 20, (100, 10))])]);
+        assert!(attrs.bitmap_runs().unwrap().is_none());
+
+        assert!(check_bitmap(&[0xFF; 2], 16).is_ok());
+        assert!(check_bitmap(&[0xFF; 2], 17).is_err());
+        assert!(check_bitmap(&[], 1).is_err());
+    }
+
+    #[test]
+    fn gap_between_pieces() {
+        let pieces = [
+            (
+                0,
+                vec![Run {
+                    lcn: Some(5),
+                    clusters: 2,
+                }],
+            ),
+            (
+                3,
+                vec![Run {
+                    lcn: Some(9),
+                    clusters: 1,
+                }],
+            ),
+        ];
+        assert!(join_pieces(&pieces, "bitmap").is_err());
+        assert!(build_extents(&pieces, 4096).is_err());
+        assert_eq!(build_extents(&pieces[..1], 4096).unwrap().len(), 1);
+    }
 }
