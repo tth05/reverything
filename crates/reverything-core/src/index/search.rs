@@ -629,7 +629,11 @@ impl VolumeIndex {
         let n = self.records.len();
         let mut set = term.anchored.then(|| {
             let mut root = FixedBitSet::with_capacity(n);
-            root.set(ROOT_RECORD as usize, (ROOT_RECORD as usize) < n);
+            // Not there while the volume is still being indexed. `set` checks the bounds even
+            // when clearing.
+            if (ROOT_RECORD as usize) < n {
+                root.insert(ROOT_RECORD as usize);
+            }
             root
         });
 
@@ -902,6 +906,22 @@ mod tests {
             find(r"+C:\ !C:\code\ main.rs"),
             [r"My Projects\main.rs", r"other\main.rs"]
         );
+    }
+
+    /// A volume that is still being indexed has no records, not even its root
+    #[test]
+    fn anchored_on_empty_volume() {
+        let index = VolumeIndex::empty(crate::ntfs::volume::Volume { id: 'C' });
+        for text in [
+            r"c:\windows\notepad",
+            r"+C:\code\ main",
+            r"+C:\ !C:\code\ x",
+            r"C:\**\x",
+        ] {
+            let query = Query::parse(text);
+            let scope = index.scope(&query.folders);
+            assert!(index.search(&query, &scope).is_empty(), "{}", text);
+        }
     }
 
     #[test]
