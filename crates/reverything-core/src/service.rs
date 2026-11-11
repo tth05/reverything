@@ -1180,6 +1180,8 @@ pub struct JournalFollower {
     /// Overlapped handle for fetching records while the reader blocks on its own handle
     handle: Handle,
     record_size: usize,
+    /// For reading attribute lists stored outside of their record
+    cluster_size: u64,
 }
 
 impl JournalFollower {
@@ -1197,9 +1199,11 @@ impl JournalFollower {
 
     /// Follows the journal from `next_usn` without an index.
     pub fn open(volume: Volume, journal_id: u64, next_usn: i64, record_size: u32) -> Result<Self> {
+        let handle = volume.open(true, false)?;
         Ok(Self {
             reader: JournalReader::open(volume, journal_id, next_usn)?,
-            handle: volume.open(true, false)?,
+            cluster_size: volume_data(&handle)?.BytesPerCluster as u64,
+            handle,
             record_size: record_size as usize,
         })
     }
@@ -1235,7 +1239,7 @@ impl JournalFollower {
         records
             .par_iter()
             .with_min_len(64)
-            .filter_map(|&r| fetch_update(&self.handle, r, self.record_size))
+            .filter_map(|&r| fetch_update(&self.handle, r, self.record_size, self.cluster_size))
             .collect()
     }
 }

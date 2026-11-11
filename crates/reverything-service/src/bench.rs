@@ -470,22 +470,24 @@ fn journal_selftest(index: &mut VolumeIndex) -> Result<()> {
         ok &= cond;
     };
 
-    // Create, write, rename
+    // Create, write, rename. Files of a few KB, smaller ones are stored in the MFT and left out
+    // of folder sizes like tiny.txt.
     std::fs::create_dir(&dir)?;
-    std::fs::write(dir.join("alpha.txt"), vec![b'a'; 100])?;
-    std::fs::write(dir.join("beta.txt"), b"beta")?;
+    std::fs::write(dir.join("alpha.txt"), vec![b'a'; 3000])?;
+    std::fs::write(dir.join("beta.txt"), vec![b'b'; 5000])?;
+    std::fs::write(dir.join("tiny.txt"), b"tiny")?;
     std::fs::rename(dir.join("beta.txt"), dir.join("gamma.txt"))?;
     std::fs::OpenOptions::new()
         .append(true)
         .open(dir.join("alpha.txt"))?
-        .write_all(&[b'b'; 200])?;
+        .write_all(&[b'b'; 5000])?;
     sync(index)?;
 
     let alpha = find(index, "alpha.txt");
     check("alpha.txt indexed", alpha.len() == 1);
     check(
-        "alpha.txt has size 300",
-        alpha.first().is_some_and(|&id| index.size(id) == 300),
+        "alpha.txt has size 8000",
+        alpha.first().is_some_and(|&id| index.size(id) == 8000),
     );
     check(
         "beta.txt gone after rename",
@@ -498,8 +500,8 @@ fn journal_selftest(index: &mut VolumeIndex) -> Result<()> {
         .copied()
         .find(|&id| index.name(id) == dir_name.as_bytes());
     check(
-        "folder size is 304",
-        dir_id.is_some_and(|id| index.size(id) == 304),
+        "folder size is 13000, without tiny.txt",
+        dir_id.is_some_and(|id| index.size(id) == 13000),
     );
 
     // Hard links show up as their own entries and count towards folder sizes
@@ -515,7 +517,7 @@ fn journal_selftest(index: &mut VolumeIndex) -> Result<()> {
     );
     check(
         "folder size counts the link",
-        dir_id.is_some_and(|id| index.size(id) == 604),
+        dir_id.is_some_and(|id| index.size(id) == 21000),
     );
     std::fs::remove_file(dir.join("alpha-link.txt"))?;
     sync(index)?;
@@ -547,7 +549,7 @@ fn journal_selftest(index: &mut VolumeIndex) -> Result<()> {
     );
     check(
         "folder size follows move and delete",
-        dir_id.is_some_and(|id| index.size(id) == 4),
+        dir_id.is_some_and(|id| index.size(id) == 5000),
     );
     let delta = index
         .sorted

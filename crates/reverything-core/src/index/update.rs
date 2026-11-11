@@ -14,9 +14,10 @@ use crate::index::{
     FLAG_IN_USE, FLAG_RESIDENT, FLAG_SIZE_GUESSED, NO_RECORD,
 };
 use crate::ntfs::io::Handle;
+use crate::ntfs::layout::read_runs;
 use crate::ntfs::record::{
-    attribute_list_records, filetime_to_unix, fixup_if_needed, parse_record, primary_name,
-    push_utf16le, ParsedRecord, ATTR_DATA, ATTR_FILE_NAME,
+    attribute_list_records, attribute_list_value, filetime_to_unix, fixup_if_needed, parse_record,
+    primary_name, push_utf16le, ParsedRecord, ATTR_DATA, ATTR_FILE_NAME,
 };
 use crate::ntfs::usn::read_file_record;
 use crate::ntfs::ROOT_RECORD;
@@ -41,7 +42,12 @@ pub struct RecordState {
 
 /// Reads the current state of a record (and its extension records) from NTFS. Returns `None` if
 /// it could not be read.
-pub fn fetch_update(handle: &Handle, record: u32, record_size: usize) -> Option<RecordUpdate> {
+pub fn fetch_update(
+    handle: &Handle,
+    record: u32,
+    record_size: usize,
+    cluster_size: u64,
+) -> Option<RecordUpdate> {
     let deleted = Some(RecordUpdate {
         record,
         state: None,
@@ -83,26 +89,41 @@ pub fn fetch_update(handle: &Handle, record: u32, record_size: usize) -> Option<
     let fn_size = refs.first().map_or(0, |n| n.size);
 
     // Names and the data size may live in extension records
-    if let Some((start, end)) = parsed.attribute_list {
-        let list = rec[start..end].to_vec();
+    let mut all_names = true;
+    if parsed.has_attribute_list {
+        let list = attribute_list_value(&rec, |runs, size| {
+            read_runs(handle, runs, size, cluster_size).ok()
+        });
+        all_names = list.is_some();
+        let list = list.unwrap_or_default();
         for ext in attribute_list_records(&list, &[ATTR_FILE_NAME, ATTR_DATA], record as u64) {
+            let mut ext_parsed = ParsedRecord::default();
             let Ok(Some(mut ext_rec)) = read_file_record(handle, ext as u32, record_size) else {
+                all_names = false;
                 continue;
             };
-            let mut ext_parsed = ParsedRecord::default();
-            if fixup_if_needed(&mut ext_rec) && parse_record(&ext_rec, &mut ext_parsed, &mut refs) {
-                decode(&ext_rec, &refs, &mut names);
-                if parsed.data_size.is_none() {
-                    parsed.data_size = ext_parsed.data_size;
-                    parsed.data_resident = ext_parsed.data_resident;
-                }
-                parsed.wof_size = parsed.wof_size.or(ext_parsed.wof_size);
+            if !fixup_if_needed(&mut ext_rec) || !parse_record(&ext_rec, &mut ext_parsed, &mut refs)
+            {
+                all_names = false;
+                continue;
             }
+            decode(&ext_rec, &refs, &mut names);
+            if parsed.data_size.is_none() {
+                parsed.data_size = ext_parsed.data_size;
+                parsed.data_resident = ext_parsed.data_resident;
+            }
+            parsed.wof_size = parsed.wof_size.or(ext_parsed.wof_size);
         }
+    }
+    if !all_names {
+        // Applying only some names would drop the others, keep the indexed ones. A new file is
+        // left out until the next scan.
+        names.clear();
     }
 
     let (flags, size) = flags_and_size(&parsed, fn_size);
-    // A non-resident attribute list could hide the $DATA attribute, keep the old size then
+    // An unreadable attribute list or extension record can hide the $DATA attribute, keep the
+    // old size then
     let size_known =
         !parsed.is_directory && (flags & FLAG_SIZE_GUESSED == 0 || !parsed.has_attribute_list);
 

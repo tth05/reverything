@@ -283,8 +283,6 @@ pub struct ParsedRecord {
     pub data_resident: bool,
     /// Size of the [`WOF_STREAM`] of a file compressed by Windows
     pub wof_size: Option<u64>,
-    /// Byte range of a resident $ATTRIBUTE_LIST value inside the record
-    pub attribute_list: Option<(usize, usize)>,
 }
 
 /// Position of a $FILE_NAME inside the record. The name is `units` UTF-16 code units at `start`.
@@ -329,13 +327,7 @@ pub fn parse_record(rec: &[u8], out: &mut ParsedRecord, names: &mut Vec<NameRef>
                     }
                 }
             }
-            ATTR_ATTRIBUTE_LIST => {
-                out.has_attribute_list = true;
-                if let Some(v) = attr.value() {
-                    let start = v.as_ptr() as usize - rec.as_ptr() as usize;
-                    out.attribute_list = Some((start, start + v.len()));
-                }
-            }
+            ATTR_ATTRIBUTE_LIST => out.has_attribute_list = true,
             ATTR_FILE_NAME => {
                 let Some(v) = attr.value() else { continue };
                 if v.len() < 66 {
@@ -423,6 +415,29 @@ pub fn filetime_to_unix(ft: u64) -> u32 {
         .min(u32::MAX as u64) as u32
 }
 
+/// An attribute list is at most 256 KB, larger sizes are corrupt.
+const MAX_ATTRIBUTE_LIST: u64 = 256 << 10;
+
+/// The value of the record's $ATTRIBUTE_LIST. Files with very many fragments or names keep it
+/// outside the record, `read` reads such a list from its runs and size. `None` if the record has
+/// none or it could not be read.
+pub fn attribute_list_value(
+    rec: &[u8],
+    read: impl FnOnce(&[Run], u64) -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let attr = attributes(rec).find(|a| a.kind == ATTR_ATTRIBUTE_LIST)?;
+    if !attr.non_resident() {
+        return attr.value().map(<[u8]>::to_vec);
+    }
+    let runs = attr.runs()?;
+    // Runs of single clusters of at least 512 bytes
+    let clusters = runs.iter().map(|r| r.clusters).sum::<u64>();
+    if attr.real_size() > MAX_ATTRIBUTE_LIST || clusters > MAX_ATTRIBUTE_LIST / 512 {
+        return None;
+    }
+    read(&runs, attr.real_size())
+}
+
 /// Records referenced by an $ATTRIBUTE_LIST that hold attributes of the given kinds, excluding
 /// `own_record`.
 pub fn attribute_list_records(list: &[u8], kinds: &[u32], own_record: u64) -> Vec<u64> {
@@ -441,4 +456,107 @@ pub fn attribute_list_records(list: &[u8], kinds: &[u32], own_record: u64) -> Ve
         off += len;
     }
     records
+}
+
+/// Builds records for tests. They have no header besides the attribute offset and used size.
+#[cfg(test)]
+pub(crate) mod testing {
+    /// An unnamed non-resident attribute piece starting at `vcn`, with the single run
+    /// `(clusters, lcn)`. Only the first piece has the real `size`.
+    pub fn non_resident(kind: u32, vcn: u64, size: u64, (clusters, lcn): (u8, u8)) -> Vec<u8> {
+        let mut a = vec![0u8; 72];
+        a[0..4].copy_from_slice(&kind.to_le_bytes());
+        a[4..8].copy_from_slice(&72u32.to_le_bytes());
+        a[8] = 1;
+        a[10..12].copy_from_slice(&64u16.to_le_bytes());
+        a[16..24].copy_from_slice(&vcn.to_le_bytes());
+        a[32..34].copy_from_slice(&64u16.to_le_bytes());
+        a[48..56].copy_from_slice(&size.to_le_bytes());
+        a[64..68].copy_from_slice(&[0x11, clusters, lcn, 0]);
+        a
+    }
+
+    pub fn resident(kind: u32, value: &[u8]) -> Vec<u8> {
+        let len = (24 + value.len()).next_multiple_of(8);
+        let mut a = vec![0u8; len];
+        a[0..4].copy_from_slice(&kind.to_le_bytes());
+        a[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+        a[10..12].copy_from_slice(&24u16.to_le_bytes());
+        a[16..20].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        a[20..22].copy_from_slice(&24u16.to_le_bytes());
+        a[24..24 + value.len()].copy_from_slice(value);
+        a
+    }
+
+    /// A record of `attrs`, the first one at offset 56
+    pub fn record(attrs: &[Vec<u8>]) -> Vec<u8> {
+        let mut rec = vec![0u8; 1024];
+        let mut off = 56;
+        rec[20..22].copy_from_slice(&(off as u16).to_le_bytes());
+        for a in attrs {
+            rec[off..off + a.len()].copy_from_slice(a);
+            off += a.len();
+        }
+        rec[off..off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        rec[24..28].copy_from_slice(&(off as u32 + 8).to_le_bytes());
+        rec
+    }
+
+    /// An $ATTRIBUTE_LIST value with an entry per `(kind, record)`
+    pub fn list(entries: &[(u32, u64)]) -> Vec<u8> {
+        let mut list = Vec::new();
+        for &(kind, record) in entries {
+            let mut e = [0u8; 32];
+            e[0..4].copy_from_slice(&kind.to_le_bytes());
+            e[4..6].copy_from_slice(&32u16.to_le_bytes());
+            e[16..24].copy_from_slice(&record.to_le_bytes());
+            list.extend_from_slice(&e);
+        }
+        list
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+
+    /// Files with very many fragments or hard links keep their attribute list outside the record.
+    /// Their names and size are in the records it lists.
+    #[test]
+    fn attribute_lists() {
+        let entries = list(&[
+            (ATTR_STANDARD_INFORMATION, 7),
+            (ATTR_FILE_NAME, 30),
+            (ATTR_FILE_NAME, 31),
+            (ATTR_DATA, 31),
+            (ATTR_DATA, 32),
+        ]);
+        let extensions =
+            |list: &[u8]| attribute_list_records(list, &[ATTR_FILE_NAME, ATTR_DATA], 7);
+
+        let rec = record(&[resident(ATTR_ATTRIBUTE_LIST, &entries)]);
+        let value = attribute_list_value(&rec, |_, _| panic!("resident lists are not read"));
+        assert_eq!(extensions(&value.unwrap()), [30, 31, 32]);
+
+        let rec = record(&[non_resident(
+            ATTR_ATTRIBUTE_LIST,
+            0,
+            entries.len() as u64,
+            (1, 40),
+        )]);
+        let value = attribute_list_value(&rec, |runs, size| {
+            assert_eq!((runs[0].lcn, runs[0].clusters), (Some(40), 1));
+            assert_eq!(size, entries.len() as u64);
+            Some(entries.clone())
+        });
+        assert_eq!(extensions(&value.unwrap()), [30, 31, 32]);
+
+        // Failed reads, corrupt sizes and records without a list
+        assert!(attribute_list_value(&rec, |_, _| None).is_none());
+        let huge = record(&[non_resident(ATTR_ATTRIBUTE_LIST, 0, 1 << 30, (1, 40))]);
+        assert!(attribute_list_value(&huge, |_, _| panic!("too large to read")).is_none());
+        let none = record(&[resident(ATTR_STANDARD_INFORMATION, &[0; 48])]);
+        assert!(attribute_list_value(&none, |_, _| panic!("there is no list")).is_none());
+    }
 }

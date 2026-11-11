@@ -141,7 +141,7 @@ impl MftLayout {
         let bitmap = match &attrs.bitmap_resident {
             Some(value) => value.clone(),
             None => match attrs.bitmap_runs()? {
-                Some((runs, size)) => read_runs(handle, self, &runs, size)?,
+                Some((runs, size)) => read_runs(handle, &runs, size, self.cluster_size)?,
                 None => return Ok(None),
             },
         };
@@ -415,7 +415,7 @@ fn read_attribute_value(handle: &Handle, layout: &MftLayout, attr: &Attr) -> Res
         return Ok(attr.value().unwrap_or_default().to_vec());
     }
     let runs = attr.runs().ok_or_else(|| eyre!("Invalid data runs"))?;
-    read_runs(handle, layout, &runs, attr.real_size())
+    read_runs(handle, &runs, attr.real_size(), layout.cluster_size)
 }
 
 /// The runs of an attribute's pieces in VCN order, which must follow each other without gaps.
@@ -457,14 +457,15 @@ fn build_extents(pieces: &[(u64, Vec<Run>)], cluster_size: u64) -> Result<Vec<Ex
     Ok(extents)
 }
 
-fn read_runs(handle: &Handle, layout: &MftLayout, runs: &[Run], size: u64) -> Result<Vec<u8>> {
-    let total = runs.iter().map(|r| r.clusters).sum::<u64>() * layout.cluster_size;
-    let mut buf = AlignedBuf::new((total as usize).max(layout.sector_size))?;
+/// Reads the first `size` bytes of a non-resident attribute. Sparse runs read as zeros.
+pub fn read_runs(handle: &Handle, runs: &[Run], size: u64, cluster_size: u64) -> Result<Vec<u8>> {
+    let total = runs.iter().map(|r| r.clusters).sum::<u64>() * cluster_size;
+    let mut buf = AlignedBuf::new((total as usize).max(cluster_size as usize))?;
     let mut off = 0usize;
     for run in runs {
-        let len = (run.clusters * layout.cluster_size) as usize;
+        let len = (run.clusters * cluster_size) as usize;
         match run.lcn {
-            Some(lcn) => read_at(handle, lcn * layout.cluster_size, &mut buf[off..off + len])
+            Some(lcn) => read_at(handle, lcn * cluster_size, &mut buf[off..off + len])
                 .with_context(|| "Failed to read non-resident attribute")?,
             None => buf[off..off + len].fill(0),
         }
@@ -480,24 +481,13 @@ mod tests {
     /// A record with unnamed non-resident attributes of `(kind, starting vcn, real size, run)`,
     /// each with the single run `(clusters, lcn)`.
     fn record(attrs: &[(u32, u64, u64, (u8, u8))]) -> Vec<u8> {
-        let mut rec = vec![0u8; 1024];
-        let mut off = 56;
-        rec[20..22].copy_from_slice(&(off as u16).to_le_bytes());
-        for &(kind, vcn, size, (clusters, lcn)) in attrs {
-            let a = &mut rec[off..off + 72];
-            a[0..4].copy_from_slice(&kind.to_le_bytes());
-            a[4..8].copy_from_slice(&72u32.to_le_bytes());
-            a[8] = 1;
-            a[10..12].copy_from_slice(&64u16.to_le_bytes());
-            a[16..24].copy_from_slice(&vcn.to_le_bytes());
-            a[32..34].copy_from_slice(&64u16.to_le_bytes());
-            a[48..56].copy_from_slice(&size.to_le_bytes());
-            a[64..68].copy_from_slice(&[0x11, clusters, lcn, 0]);
-            off += 72;
-        }
-        rec[off..off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        rec[24..28].copy_from_slice(&(off as u32 + 8).to_le_bytes());
-        rec
+        use crate::ntfs::record::testing::{non_resident, record};
+        record(
+            &attrs
+                .iter()
+                .map(|&(kind, vcn, size, run)| non_resident(kind, vcn, size, run))
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn clusters(runs: &[Run]) -> Vec<(Option<u64>, u64)> {
